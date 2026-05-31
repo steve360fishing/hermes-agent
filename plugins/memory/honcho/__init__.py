@@ -448,7 +448,7 @@ class HonchoMemoryProvider(MemoryProvider):
             return True
         if self._cron_skipped:
             return False
-        if not self._config or not self._lazy_init_kwargs:
+        if not self._config or self._lazy_init_kwargs is None:
             return False
 
         try:

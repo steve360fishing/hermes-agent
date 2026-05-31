@@ -638,6 +638,40 @@ class TestToolsModeInitBehavior:
         )
         assert provider.prefetch("test query") == ""
 
+    def test_tools_lazy_handle_tool_call_accepts_empty_init_kwargs(self):
+        """tools lazy init treats empty kwargs as present and initializes on first tool call."""
+        import json
+        from unittest.mock import MagicMock, patch
+        from plugins.memory.honcho.client import HonchoClientConfig
+
+        cfg = HonchoClientConfig(
+            api_key="test-key",
+            enabled=True,
+            recall_mode="tools",
+            init_on_session_start=False,
+        )
+        provider = HonchoMemoryProvider()
+
+        mock_manager = MagicMock()
+        mock_session = MagicMock()
+        mock_session.messages = []
+        mock_manager.get_or_create.return_value = mock_session
+        mock_manager.get_peer_card.return_value = ["Steve prefers concise plans."]
+
+        with patch("plugins.memory.honcho.client.HonchoClientConfig.from_global_config", return_value=cfg), \
+             patch("plugins.memory.honcho.client.get_honcho_client", return_value=MagicMock()), \
+             patch("plugins.memory.honcho.session.HonchoSessionManager", return_value=mock_manager), \
+             patch("hermes_constants.get_hermes_home", return_value=MagicMock()):
+            provider.initialize(session_id="test-session-001")
+            assert provider._lazy_init_kwargs == {}
+
+            payload = json.loads(provider.handle_tool_call("honcho_profile", {}))
+
+        assert payload == {"result": ["Steve prefers concise plans."]}
+        mock_manager.get_or_create.assert_called_once_with(provider._session_key)
+        mock_manager.get_peer_card.assert_called_once_with(provider._session_key, peer="user")
+        assert provider._lazy_init_kwargs is None
+
     def test_explicit_peer_name_not_overridden_by_user_id(self):
         """Explicit peerName in config must not be replaced by gateway user_id."""
         _, cfg, _ = self._make_provider_with_config(
