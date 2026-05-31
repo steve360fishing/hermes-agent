@@ -308,6 +308,17 @@ export function getToolsets(): Promise<ToolsetInfo[]> {
   })
 }
 
+export function toggleToolset(
+  name: string,
+  enabled: boolean
+): Promise<{ ok: boolean; name: string; enabled: boolean }> {
+  return window.hermesDesktop.api<{ ok: boolean; name: string; enabled: boolean }>({
+    path: `/api/tools/toolsets/${encodeURIComponent(name)}`,
+    method: 'PUT',
+    body: { enabled }
+  })
+}
+
 export function getMessagingPlatforms(): Promise<MessagingPlatformsResponse> {
   return window.hermesDesktop.api<MessagingPlatformsResponse>({
     path: '/api/messaging/platforms'
