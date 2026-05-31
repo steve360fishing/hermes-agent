@@ -1229,6 +1229,8 @@ class HonchoSessionManager:
                 self._record_last_error(f"Could not resolve peer '{peer}'.")
                 return None
             existing_card = self._fetch_peer_card(observer_peer_id, target=target_peer_id)
+            if not existing_card and target_peer_id is not None:
+                existing_card = self._fetch_peer_card(target_peer_id)
             merged_card = self._merge_card(existing_card, clean_card)
             peer_obj = self._get_or_create_peer(observer_peer_id)
             if target_peer_id is not None:

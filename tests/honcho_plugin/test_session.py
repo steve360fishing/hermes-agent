@@ -403,6 +403,24 @@ class TestPeerLookupHelpers:
             target=session.user_peer_id,
         )
 
+    def test_set_peer_card_preserves_direct_target_card_fallback(self):
+        mgr, session = self._make_cached_manager()
+        assistant_peer = MagicMock()
+        assistant_peer.set_card.return_value = ["Direct target fact", "New fact"]
+        mgr._get_or_create_peer = MagicMock(return_value=assistant_peer)
+        mgr._fetch_peer_card = MagicMock(side_effect=[[], ["Direct target fact"]])
+
+        result = mgr.set_peer_card(session.key, ["New fact"], peer="user")
+
+        assert result == ["Direct target fact", "New fact"]
+        assert mgr._fetch_peer_card.call_args_list[0].args == (session.assistant_peer_id,)
+        assert mgr._fetch_peer_card.call_args_list[0].kwargs == {"target": session.user_peer_id}
+        assert mgr._fetch_peer_card.call_args_list[1].args == (session.user_peer_id,)
+        assistant_peer.set_card.assert_called_once_with(
+            ["Direct target fact", "New fact"],
+            target=session.user_peer_id,
+        )
+
 
 class TestConcludeToolDispatch:
     def test_conclude_schema_has_no_anyof(self):
