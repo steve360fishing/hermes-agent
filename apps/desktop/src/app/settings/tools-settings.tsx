@@ -1,7 +1,7 @@
 import { useEffect, useMemo, useState } from 'react'
 
 import { Switch } from '@/components/ui/switch'
-import { getSkills, getToolsets, toggleSkill } from '@/hermes'
+import { getSkills, getToolsets, toggleSkill, toggleToolset } from '@/hermes'
 import { Brain, Wrench } from '@/lib/icons'
 import { notify, notifyError } from '@/store/notifications'
 import type { SkillInfo, ToolsetInfo } from '@/types/hermes'
@@ -14,6 +14,7 @@ export function ToolsSettings({ query }: SearchProps) {
   const [skills, setSkills] = useState<SkillInfo[] | null>(null)
   const [toolsets, setToolsets] = useState<ToolsetInfo[] | null>(null)
   const [savingSkill, setSavingSkill] = useState<string | null>(null)
+  const [savingToolset, setSavingToolset] = useState<string | null>(null)
 
   useEffect(() => {
     let cancelled = false
@@ -97,6 +98,24 @@ export function ToolsSettings({ query }: SearchProps) {
     }
   }
 
+  async function handleToggleToolset(toolset: ToolsetInfo, enabled: boolean) {
+    setSavingToolset(toolset.name)
+
+    try {
+      await toggleToolset(toolset.name, enabled)
+      setToolsets(c => c?.map(t => (t.name === toolset.name ? { ...t, enabled, available: enabled } : t)) ?? c)
+      notify({
+        kind: 'success',
+        title: enabled ? 'Toolset enabled' : 'Toolset disabled',
+        message: `${asText(toolset.label || toolset.name)} applies to new sessions.`
+      })
+    } catch (err) {
+      notifyError(err, `Failed to update ${asText(toolset.label || toolset.name)}`)
+    } finally {
+      setSavingToolset(null)
+    }
+  }
+
   if (!skills || !toolsets) {
     return <LoadingState label="Loading skills and toolsets..." />
   }
@@ -145,10 +164,15 @@ export function ToolsSettings({ query }: SearchProps) {
               <ListRow
                 action={
                   <div className="flex shrink-0 items-center gap-1.5">
-                    <Pill tone={toolset.enabled ? 'primary' : 'muted'}>{toolset.enabled ? 'Enabled' : 'Disabled'}</Pill>
                     <Pill tone={toolset.configured ? 'primary' : 'muted'}>
                       {toolset.configured ? 'Configured' : 'Needs keys'}
                     </Pill>
+                    <Switch
+                      aria-label={`Toggle ${label} toolset`}
+                      checked={toolset.enabled}
+                      disabled={savingToolset === toolset.name}
+                      onCheckedChange={c => void handleToggleToolset(toolset, c)}
+                    />
                   </div>
                 }
                 below={
