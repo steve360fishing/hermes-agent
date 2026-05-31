@@ -927,6 +927,132 @@ async def transcribe_audio_upload(payload: AudioTranscriptionRequest):
     }
 
 
+class TTSSpeakRequest(BaseModel):
+    text: str
+
+
+def _elevenlabs_voice_label(voice: Dict[str, Any]) -> str:
+    name = str(voice.get("name") or voice.get("voice_id") or "Voice").strip()
+    category = str(voice.get("category") or "").strip()
+
+    return f"{name} ({category})" if category else name
+
+
+@app.get("/api/audio/elevenlabs/voices")
+async def get_elevenlabs_voices():
+    """Return ElevenLabs voices when an API key is configured.
+
+    The desktop UI uses this for the ``tts.elevenlabs.voice_id`` dropdown.
+    Only non-secret voice metadata is returned; the API key stays server-side.
+    """
+    api_key = (load_env().get("ELEVENLABS_API_KEY") or os.environ.get("ELEVENLABS_API_KEY") or "").strip()
+    if not api_key:
+        return {"available": False, "voices": []}
+
+    request = urllib.request.Request(
+        "https://api.elevenlabs.io/v1/voices",
+        headers={
+            "Accept": "application/json",
+            "xi-api-key": api_key,
+        },
+    )
+
+    try:
+        loop = asyncio.get_running_loop()
+
+        def _fetch() -> Dict[str, Any]:
+            with urllib.request.urlopen(request, timeout=10) as response:
+                return json.loads(response.read().decode("utf-8"))
+
+        payload = await loop.run_in_executor(None, _fetch)
+    except Exception as exc:
+        _log.warning("ElevenLabs voice list failed: %s", exc)
+        raise HTTPException(status_code=502, detail="Could not load ElevenLabs voices")
+
+    voices = []
+    for voice in payload.get("voices") or []:
+        if not isinstance(voice, dict):
+            continue
+
+        voice_id = str(voice.get("voice_id") or "").strip()
+        if not voice_id:
+            continue
+
+        voices.append({
+            "voice_id": voice_id,
+            "name": str(voice.get("name") or voice_id),
+            "label": _elevenlabs_voice_label(voice),
+        })
+
+    voices.sort(key=lambda item: str(item.get("label") or "").lower())
+    return {"available": True, "voices": voices}
+
+
+@app.post("/api/audio/speak")
+async def speak_text(payload: TTSSpeakRequest):
+    """Synthesize speech and return audio as base64 data URL.
+
+    Used by the desktop voice-conversation mode to play back assistant
+    responses without exposing the on-disk file path. Reuses the
+    existing TTS provider chain (Edge / OpenAI / ElevenLabs / etc.)
+    configured in ``~/.hermes/config.yaml`` under ``tts.``.
+    """
+    text = (payload.text or "").strip()
+    if not text:
+        raise HTTPException(status_code=400, detail="Text is required")
+
+    try:
+        from tools.tts_tool import text_to_speech_tool
+        loop = asyncio.get_running_loop()
+        result_json = await loop.run_in_executor(None, text_to_speech_tool, text)
+    except Exception as exc:
+        _log.exception("Desktop voice TTS failed")
+        raise HTTPException(status_code=500, detail=f"Speech synthesis failed: {exc}")
+
+    try:
+        result = json.loads(result_json) if isinstance(result_json, str) else result_json
+    except Exception:
+        raise HTTPException(status_code=500, detail="Invalid TTS response")
+
+    if not result.get("success"):
+        raise HTTPException(
+            status_code=400,
+            detail=result.get("error") or "Speech synthesis failed",
+        )
+
+    file_path = result.get("file_path")
+    if not file_path or not os.path.isfile(file_path):
+        raise HTTPException(status_code=500, detail="Audio file missing")
+
+    ext = os.path.splitext(file_path)[1].lower()
+    mime_type = {
+        ".mp3": "audio/mpeg",
+        ".ogg": "audio/ogg",
+        ".opus": "audio/ogg",
+        ".wav": "audio/wav",
+        ".flac": "audio/flac",
+    }.get(ext, "audio/mpeg")
+
+    try:
+        with open(file_path, "rb") as fh:
+            audio_bytes = fh.read()
+    except OSError as exc:
+        raise HTTPException(status_code=500, detail=f"Could not read audio: {exc}")
+    finally:
+        try:
+            os.unlink(file_path)
+        except OSError:
+            pass
+
+    encoded = base64.b64encode(audio_bytes).decode("ascii")
+    return {
+        "ok": True,
+        "data_url": f"data:{mime_type};base64,{encoded}",
+        "mime_type": mime_type,
+        "provider": result.get("provider"),
+    }
+
+
 @app.get("/api/actions/{name}/status")
 async def get_action_status(name: str, lines: int = 200):
     """Tail an action log and report whether the process is still running."""
@@ -957,13 +1083,16 @@ async def get_action_status(name: str, lines: int = 200):
 
 
 @app.get("/api/sessions")
-async def get_sessions(limit: int = 20, offset: int = 0):
+async def get_sessions(limit: int = 20, offset: int = 0, min_messages: int = 0):
     try:
         from hermes_state import SessionDB
         db = SessionDB()
         try:
-            sessions = db.list_sessions_rich(limit=limit, offset=offset)
-            total = db.session_count()
+            min_message_count = max(0, min_messages)
+            sessions = db.list_sessions_rich(
+                limit=limit, offset=offset, min_message_count=min_message_count
+            )
+            total = db.session_count(min_message_count=min_message_count)
             now = time.time()
             for s in sessions:
                 s["is_active"] = (
