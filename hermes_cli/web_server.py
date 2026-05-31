@@ -1317,6 +1317,78 @@ def get_model_options():
         raise HTTPException(status_code=500, detail="Failed to list model options")
 
 
+@app.get("/api/model/recommended-default")
+def get_recommended_default_model(provider: str = ""):
+    """Return the recommended default model for a freshly-authenticated provider.
+
+    Mirrors the model-curation `hermes model` does so GUI onboarding lands on a
+    sensible default instead of blindly taking the first curated entry. For
+    Nous this honors the user's free/paid tier: free users get a free model,
+    paid users get the full curated default. For any other provider it falls
+    back to the first curated model (same as before).
+
+    Response: {"provider": str, "model": str, "free_tier": bool | None}
+    where free_tier is True/False for Nous and None otherwise. `model` may be
+    empty if nothing could be resolved (caller degrades gracefully).
+    """
+    slug = (provider or "").strip().lower()
+
+    if slug == "nous":
+        try:
+            from hermes_cli.models import (
+                get_curated_nous_model_ids,
+                get_pricing_for_provider,
+                check_nous_free_tier,
+                partition_nous_models_by_tier,
+                union_with_portal_free_recommendations,
+                union_with_portal_paid_recommendations,
+            )
+            from hermes_cli.auth import get_provider_auth_state
+
+            model_ids = get_curated_nous_model_ids()
+            pricing = get_pricing_for_provider("nous") or {}
+            free_tier = check_nous_free_tier(force_fresh=True)
+
+            portal_url = ""
+            try:
+                state = get_provider_auth_state("nous") or {}
+                portal_url = state.get("portal_base_url", "") or ""
+            except Exception:
+                portal_url = ""
+
+            if free_tier:
+                model_ids, pricing = union_with_portal_free_recommendations(
+                    model_ids, pricing, portal_url
+                )
+                model_ids, _unavailable = partition_nous_models_by_tier(
+                    model_ids, pricing, free_tier=True
+                )
+            else:
+                model_ids, pricing = union_with_portal_paid_recommendations(
+                    model_ids, pricing, portal_url
+                )
+
+            model = model_ids[0] if model_ids else ""
+            return {"provider": "nous", "model": model, "free_tier": bool(free_tier)}
+        except Exception:
+            _log.exception("GET /api/model/recommended-default (nous) failed")
+            return {"provider": "nous", "model": "", "free_tier": None}
+
+    # Non-Nous: first curated model for the provider, matching prior behaviour.
+    try:
+        from hermes_cli.inventory import build_models_payload, load_picker_context
+
+        payload = build_models_payload(load_picker_context(), max_models=50)
+        for row in payload.get("providers", []):
+            if str(row.get("slug", "")).lower() == slug:
+                models = row.get("models") or []
+                return {"provider": slug, "model": models[0] if models else "", "free_tier": None}
+        return {"provider": slug, "model": "", "free_tier": None}
+    except Exception:
+        _log.exception("GET /api/model/recommended-default failed")
+        return {"provider": slug, "model": "", "free_tier": None}
+
+
 @app.get("/api/model/auxiliary")
 def get_auxiliary_models():
     """Return current auxiliary task assignments.

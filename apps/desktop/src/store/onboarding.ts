@@ -3,6 +3,7 @@ import { atom } from 'nanostores'
 import {
   cancelOAuthSession,
   getGlobalModelOptions,
+  getRecommendedDefaultModel,
   listOAuthProviders,
   pollOAuthSession,
   setEnvVar,
@@ -204,9 +205,28 @@ async function fetchProviderDefaultModel(
     return null
   }
 
+  // Prefer the backend's recommended default — it mirrors the curation
+  // `hermes model` does (for Nous it honors the user's free/paid tier, so a
+  // free user gets a free model rather than a paid default like opus). Fall
+  // back to the first curated model if the endpoint can't resolve one.
+  let defaultModel = String(models[0])
+  try {
+    const recommended = await getRecommendedDefaultModel(String(matched.slug))
+    if (recommended.model && models.map(String).includes(recommended.model)) {
+      defaultModel = recommended.model
+    } else if (recommended.model) {
+      // Recommended model isn't in the curated options list (e.g. a Portal
+      // free-recommendation the picker list didn't include); trust it anyway.
+      defaultModel = recommended.model
+    }
+  } catch {
+    // Endpoint unavailable — keep models[0]. Non-fatal: the confirm card still
+    // shows and the user can change it.
+  }
+
   return {
     providerSlug: String(matched.slug),
-    defaultModel: String(models[0])
+    defaultModel
   }
 }
 
