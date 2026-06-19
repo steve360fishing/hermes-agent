@@ -358,6 +358,53 @@ def test_resolve_runtime_provider_openrouter_explicit(monkeypatch):
     assert resolved["source"] == "explicit"
 
 
+def test_openrouter_gpt5_without_api_mode_uses_responses(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openrouter",
+            "default": "openai/gpt-5.5",
+            "api_mode": "",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+
+    resolved = rp.resolve_runtime_provider(requested="openrouter")
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["base_url"] == rp.OPENROUTER_BASE_URL
+    assert resolved["api_mode"] == "codex_responses"
+
+
+def test_openrouter_gpt5_explicit_chat_mode_is_honored(monkeypatch):
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openrouter",
+            "default": "openai/gpt-5.5",
+            "api_mode": "chat_completions",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: None)
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.setenv("OPENROUTER_API_KEY", "test-or-key")
+
+    resolved = rp.resolve_runtime_provider(requested="openrouter")
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_mode"] == "chat_completions"
+
+
 def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
     class _Entry:
         access_token = "pool-key"
@@ -384,6 +431,42 @@ def test_resolve_runtime_provider_auto_uses_openrouter_pool(monkeypatch):
     assert resolved["provider"] == "openrouter"
     assert resolved["api_key"] == "pool-key"
     assert resolved["base_url"] == "https://openrouter.ai/api/v1"
+    assert resolved["source"] == "manual"
+    assert resolved.get("credential_pool") is not None
+
+
+def test_openrouter_pool_gpt5_without_api_mode_uses_responses(monkeypatch):
+    class _Entry:
+        access_token = "pool-key"
+        source = "manual"
+        base_url = "https://openrouter.ai/api/v1"
+
+    class _Pool:
+        def has_credentials(self):
+            return True
+
+        def select(self):
+            return _Entry()
+
+    monkeypatch.setattr(rp, "resolve_provider", lambda *a, **k: "openrouter")
+    monkeypatch.setattr(
+        rp,
+        "_get_model_config",
+        lambda: {
+            "provider": "openrouter",
+            "default": "openai/gpt-5.5",
+        },
+    )
+    monkeypatch.setattr(rp, "load_pool", lambda provider: _Pool())
+    monkeypatch.delenv("OPENAI_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENROUTER_BASE_URL", raising=False)
+    monkeypatch.delenv("OPENAI_API_KEY", raising=False)
+    monkeypatch.delenv("OPENROUTER_API_KEY", raising=False)
+
+    resolved = rp.resolve_runtime_provider(requested="auto")
+
+    assert resolved["provider"] == "openrouter"
+    assert resolved["api_mode"] == "codex_responses"
     assert resolved["source"] == "manual"
     assert resolved.get("credential_pool") is not None
 

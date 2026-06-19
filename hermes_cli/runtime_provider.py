@@ -260,6 +260,36 @@ def _parse_api_mode(raw: Any) -> Optional[str]:
     return None
 
 
+def _openai_family_responses_api_mode(model_name: Optional[str]) -> Optional[str]:
+    """Infer Responses API mode for OpenAI GPT-5/codex/o-series model names."""
+    try:
+        from hermes_cli.models import azure_foundry_model_api_mode
+
+        return azure_foundry_model_api_mode(model_name)
+    except Exception:
+        return None
+
+
+def _openrouter_api_mode(
+    *,
+    model_cfg: Dict[str, Any],
+    base_url: str,
+    target_model: Optional[str] = None,
+) -> str:
+    configured_provider = str(model_cfg.get("provider") or "").strip().lower()
+    configured_mode = _parse_api_mode(model_cfg.get("api_mode"))
+    if configured_mode and _provider_supports_explicit_api_mode("openrouter", configured_provider):
+        return configured_mode
+
+    if base_url_host_matches(base_url, "openrouter.ai"):
+        effective_model = str(target_model or model_cfg.get("default") or "").strip()
+        inferred = _openai_family_responses_api_mode(effective_model)
+        if inferred:
+            return inferred
+
+    return _detect_api_mode_for_url(base_url) or "chat_completions"
+
+
 def _maybe_apply_codex_app_server_runtime(
     *,
     provider: str,
@@ -335,6 +365,11 @@ def _resolve_runtime_from_pool_entry(
         base_url = cfg_base_url or base_url or "https://api.anthropic.com"
     elif provider == "openrouter":
         base_url = base_url or OPENROUTER_BASE_URL
+        api_mode = _openrouter_api_mode(
+            model_cfg=model_cfg,
+            base_url=base_url,
+            target_model=target_model,
+        )
     elif provider == "xai":
         api_mode = "codex_responses"
     elif provider == "nous":
@@ -769,6 +804,7 @@ def _resolve_openrouter_runtime(
     requested_provider: str,
     explicit_api_key: Optional[str] = None,
     explicit_base_url: Optional[str] = None,
+    target_model: Optional[str] = None,
 ) -> Dict[str, Any]:
     model_cfg = _get_model_config()
     cfg_base_url = model_cfg.get("base_url") if isinstance(model_cfg.get("base_url"), str) else ""
@@ -893,11 +929,21 @@ def _resolve_openrouter_runtime(
     if effective_provider == "custom" and not api_key and not _is_openrouter_url:
         api_key = "no-key-required"
 
+    api_mode = (
+        _openrouter_api_mode(
+            model_cfg=model_cfg,
+            base_url=base_url,
+            target_model=target_model,
+        )
+        if effective_provider == "openrouter"
+        else _parse_api_mode(model_cfg.get("api_mode"))
+        or _detect_api_mode_for_url(base_url)
+        or "chat_completions"
+    )
+
     return {
         "provider": effective_provider,
-        "api_mode": _parse_api_mode(model_cfg.get("api_mode"))
-        or _detect_api_mode_for_url(base_url)
-        or "chat_completions",
+        "api_mode": api_mode,
         "base_url": base_url,
         "api_key": api_key,
         "source": source,
@@ -1683,6 +1729,7 @@ def resolve_runtime_provider(
         requested_provider=requested_provider,
         explicit_api_key=explicit_api_key,
         explicit_base_url=explicit_base_url,
+        target_model=target_model,
     )
     runtime["requested_provider"] = requested_provider
     return runtime
