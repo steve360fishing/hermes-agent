@@ -282,33 +282,42 @@ def _is_arcee_trinity_thinking(model: Optional[str]) -> bool:
     return bare == "trinity-large-thinking"
 
 
-# Context window enforced by ChatGPT's Codex OAuth backend for gpt-5.5.
-# The raw OpenAI API and OpenRouter expose 1.05M for the same slug, but the
+# Context window enforced by ChatGPT's Codex OAuth backend for the gpt-5.5
+# and gpt-5.6 families. The raw OpenAI API and OpenRouter expose 1.05M for
+# the same slugs, but the
 # Codex backend hard-caps at 272K (verified live: a ~330K-token request to
 # chatgpt.com/backend-api/codex/responses is rejected with
 # ``context_length_exceeded`` while ~250K succeeds). With a 272K ceiling the
 # default 50% compaction trigger fires at ~136K — wasteful, since the model
 # can hold far more raw context before summarization actually buys anything.
 # We raise the trigger to 85% (~231K) on this exact route so Codex gpt-5.5
-# sessions use the window they actually have.
+# and gpt-5.6 sessions use the window they actually have.
 _CODEX_GPT55_COMPACTION_THRESHOLD = 0.85
 
 
 def _is_codex_gpt55(model: Optional[str], provider: Optional[str] = None) -> bool:
-    """True for gpt-5.5 accessed through the ChatGPT Codex OAuth backend.
+    """True for gpt-5.5/5.6 accessed through the ChatGPT Codex OAuth backend.
 
     Matches only the Codex OAuth route (provider ``openai-codex``), not the
     direct OpenAI API, OpenRouter, or GitHub Copilot paths — those expose a
     larger context window for the same slug and must keep the user's default
-    compaction threshold. ``gpt-5.5-pro`` and dated snapshots
-    (``gpt-5.5-2026-04-23``) are matched via prefix so the override tracks the
-    family without re-listing every variant.
+    compaction threshold. ``-pro`` variants and dated snapshots are matched
+    via prefix so the override tracks both 272K-capped families without
+    re-listing every variant. The historical function name is retained for
+    compatibility with v0.18 callers and tests.
     """
     prov = (provider or "").strip().lower()
     if prov != "openai-codex":
         return False
     bare = (model or "").strip().lower().rsplit("/", 1)[-1]
-    return bare == "gpt-5.5" or bare.startswith("gpt-5.5-") or bare.startswith("gpt-5.5.")
+    return (
+        bare == "gpt-5.5"
+        or bare.startswith("gpt-5.5-")
+        or bare.startswith("gpt-5.5.")
+        or bare == "gpt-5.6"
+        or bare.startswith("gpt-5.6-")
+        or bare.startswith("gpt-5.6.")
+    )
 
 
 def _fixed_temperature_for_model(
@@ -347,10 +356,11 @@ def _compression_threshold_for_model(
 
     Per-model/route overrides:
       - Arcee Trinity Large Thinking → 0.75 (preserve reasoning context).
-      - gpt-5.5 on the Codex OAuth route → 0.85, because Codex caps the window
-        at 272K and the default 50% trigger would compact at ~136K. Gated by
-        ``allow_codex_gpt55_autoraise`` so the user can opt back down to the
-        global default (the caller passes the config flag through here).
+      - gpt-5.5 / gpt-5.6 on the Codex OAuth route → 0.85, because Codex
+        caps both families at 272K and the default 50% trigger would compact
+        at ~136K. Gated by ``allow_codex_gpt55_autoraise`` so the user can opt
+        back down to the global default (the caller passes the config flag
+        through here).
 
     Returns a float in (0, 1] to override the global ``compression.threshold``
     config value, or ``None`` to leave the user's config value unchanged.
