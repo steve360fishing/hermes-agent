@@ -2110,8 +2110,9 @@ DEFAULT_CONFIG = {
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
                                      # (floor 30s) to enforce a hard cap.
-        "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
-                                 # "low", "minimal", "none" (empty = inherit parent's level)
+        "reasoning_effort": "",  # reasoning effort for subagents: "ultra", "max", "xhigh",
+                                 # "high", "medium", "low", "minimal", "none"
+                                 # (empty = inherit parent's level)
         "max_concurrent_children": 3,  # max parallel children per batch; floor of 1 enforced, no ceiling
         "max_async_children": 3,  # max concurrent background (background=true) subagents; new dispatches rejected at capacity
         # Orchestrator role controls (see tools/delegate_tool.py:_get_max_spawn_depth
