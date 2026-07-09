@@ -38,12 +38,23 @@ class TestGpt56SortInvariants:
         assert models[0] == "openai/gpt-5.6-sol"
 
 
-    def test_base_sol_outranks_sol_pro_for_alias_default(self):
-        # "-pro" high-effort variants parse as suffix "sol-pro" (rank 1), so
-        # `/model gpt` defaults to base Sol rather than the high-effort mode.
-        models = ["gpt-5.6-sol-pro", "gpt-5.6-sol"]
-        models.sort(key=lambda m: _model_sort_key(m, "gpt"))
-        assert models[0] == "gpt-5.6-sol"
+    def test_unsupported_pro_aliases_are_not_synthesized(self):
+        from hermes_cli.codex_models import DEFAULT_CODEX_MODELS
+        from hermes_cli.models import OPENROUTER_MODELS, _PROVIDER_MODELS
+
+        every_model = set(DEFAULT_CODEX_MODELS)
+        every_model.update(model for model, _ in OPENROUTER_MODELS)
+        for values in _PROVIDER_MODELS.values():
+            every_model.update(values)
+
+        assert not any(model.startswith("gpt-5.6-") and model.endswith("-pro") for model in every_model)
+        assert not any(model.startswith("openai/gpt-5.6-") and model.endswith("-pro") for model in every_model)
+
+    def test_preview_models_are_not_synthesized_from_legacy_templates(self):
+        from hermes_cli.codex_models import _add_forward_compat_models
+
+        resolved = _add_forward_compat_models(["gpt-5.5", "gpt-5.4"])
+        assert not any(model.startswith("gpt-5.6-") for model in resolved)
 
 
 class TestGpt56PricingRoute:
@@ -73,14 +84,9 @@ class TestGpt56PricingRoute:
                 entry.input_cost_per_million * Decimal("0.10")
             ), slug
 
-    def test_pro_variants_alias_to_base_tier_pricing(self):
-        # -pro high-effort modes bill at the same per-token rates as their
-        # base tiers; the snapshot aliases them rather than duplicating rows.
+    def test_unsupported_pro_aliases_have_no_pricing_entry(self):
         for base in ("gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna"):
-            assert (
-                _OFFICIAL_DOCS_PRICING[("openai", f"{base}-pro")]
-                is _OFFICIAL_DOCS_PRICING[("openai", base)]
-            ), base
+            assert ("openai", f"{base}-pro") not in _OFFICIAL_DOCS_PRICING
 
 
 class TestGpt56CodexCompaction:
@@ -93,11 +99,8 @@ class TestGpt56CodexCompaction:
 
         for slug in (
             "gpt-5.6-sol",
-            "gpt-5.6-sol-pro",
             "gpt-5.6-terra",
-            "gpt-5.6-terra-pro",
             "gpt-5.6-luna",
-            "gpt-5.6-luna-pro",
         ):
             assert (
                 _compression_threshold_for_model(slug, provider="openai-codex")
