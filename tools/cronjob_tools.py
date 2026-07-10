@@ -12,7 +12,7 @@ import sys
 from pathlib import Path
 from typing import Any, Dict, List, Optional, Union
 
-from hermes_constants import display_hermes_home
+from hermes_constants import VALID_REASONING_EFFORTS, display_hermes_home
 
 logger = logging.getLogger(__name__)
 
@@ -592,6 +592,8 @@ def _format_job(job: Dict[str, Any]) -> Dict[str, Any]:
     }
     if job.get("script"):
         result["script"] = job["script"]
+    if job.get("reasoning_effort"):
+        result["reasoning_effort"] = job["reasoning_effort"]
     if job.get("no_agent"):
         result["no_agent"] = True
     if job.get("enabled_toolsets"):
@@ -668,6 +670,7 @@ def cronjob(
     no_agent: Optional[bool] = None,
     attach_to_session: Optional[bool] = None,
     task_id: str = None,
+    reasoning_effort: Optional[str] = None,
 ) -> str:
     """Unified cron job management tool."""
     del task_id  # unused but kept for handler signature compatibility
@@ -733,6 +736,7 @@ def cronjob(
                 skills=canonical_skills,
                 model=_normalize_optional_job_value(model),
                 provider=_normalize_optional_job_value(provider),
+                reasoning_effort=reasoning_effort,
                 base_url=_normalize_optional_job_value(base_url, strip_trailing_slash=True),
                 script=_normalize_optional_job_value(script),
                 context_from=context_from,
@@ -863,6 +867,10 @@ def cronjob(
                 updates["model"] = _normalize_optional_job_value(model)
             if provider is not None:
                 updates["provider"] = _normalize_optional_job_value(provider)
+            if reasoning_effort is not None:
+                # Empty string clears the override and restores global
+                # inheritance; the data layer owns canonical validation.
+                updates["reasoning_effort"] = reasoning_effort
             if base_url is not None:
                 updates["base_url"] = _normalize_optional_job_value(base_url, strip_trailing_slash=True)
             # Re-validate the EFFECTIVE provider/base_url on EVERY update, not
@@ -1027,6 +1035,18 @@ Important safety rule: cron-run sessions should not recursively schedule more cr
                 },
                 "required": ["model"]
             },
+            "reasoning_effort": {
+                "type": "string",
+                "enum": ["", "none", *VALID_REASONING_EFFORTS],
+                "description": (
+                    "Optional per-job reasoning effort override. Omit to inherit "
+                    "the global agent setting; on update, pass an empty string to "
+                    "clear the override. Valid values are none, minimal, low, "
+                    "medium, high, xhigh, max, and ultra. Provider/model capability "
+                    "validation still applies. Ignored when no_agent=True because "
+                    "script-only jobs never invoke a model or reasoning parser."
+                ),
+            },
             "script": {
                 "type": "string",
                 "description": f"Optional path to a script that runs each tick. In the default mode its stdout is injected into the agent's prompt as context (data-collection / change-detection pattern). With no_agent=True, the script IS the job and its stdout is delivered verbatim (classic watchdog pattern). Relative paths resolve under {display_hermes_home()}/scripts/. ``.sh``/``.bash`` extensions run via bash, everything else via Python. On update, pass empty string to clear."
@@ -1123,6 +1143,7 @@ registry.register(
         skills=args.get("skills"),
         model=_mo[1],
         provider=_mo[0] or args.get("provider"),
+        reasoning_effort=args.get("reasoning_effort"),
         base_url=args.get("base_url"),
         reason=args.get("reason"),
         script=args.get("script"),

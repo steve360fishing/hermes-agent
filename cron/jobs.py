@@ -260,6 +260,22 @@ def _normalize_job_record(job: Dict[str, Any]) -> Dict[str, Any]:
         state = "scheduled" if normalized.get("enabled", True) else "paused"
     normalized["state"] = state
 
+    # Legacy records have no per-job effort. Canonicalize valid hand-edited
+    # values for readers while leaving invalid values visible so the operator
+    # can list and repair them; scheduler execution validates and fails closed.
+    if "reasoning_effort" in normalized:
+        try:
+            reasoning_effort = normalize_job_reasoning_effort(
+                normalized.get("reasoning_effort")
+            )
+        except ValueError:
+            pass
+        else:
+            if reasoning_effort is None:
+                normalized.pop("reasoning_effort", None)
+            else:
+                normalized["reasoning_effort"] = reasoning_effort
+
     return normalized
 
 
@@ -638,6 +654,24 @@ def get_ticker_success_age() -> Optional[float]:
 # Job CRUD Operations
 # =============================================================================
 
+def _canonicalize_loaded_reasoning_efforts(
+    jobs: List[Dict[str, Any]],
+) -> List[Dict[str, Any]]:
+    """Canonicalize valid stored effort values without hiding invalid ones."""
+    for job in jobs:
+        if not isinstance(job, dict) or "reasoning_effort" not in job:
+            continue
+        try:
+            effort = normalize_job_reasoning_effort(job.get("reasoning_effort"))
+        except ValueError:
+            continue
+        if effort is None:
+            job.pop("reasoning_effort", None)
+        else:
+            job["reasoning_effort"] = effort
+    return jobs
+
+
 def load_jobs() -> List[Dict[str, Any]]:
     """Load all jobs from storage."""
     ensure_dirs()
@@ -672,14 +706,14 @@ def load_jobs() -> List[Dict[str, Any]]:
             # Hit control-character corruption — rewrite with proper escaping.
             save_jobs(jobs)
             logger.warning("Auto-repaired jobs.json (had invalid control characters)")
-        return jobs
+        return _canonicalize_loaded_reasoning_efforts(jobs)
     if isinstance(data, list):
         # Bare array — likely saved/edited outside save_jobs(). Wrap it back
         # into the expected {"jobs": [...]} structure.
         if data:
             save_jobs(data)
             logger.warning("Auto-repaired jobs.json (bare list wrapped as dict)")
-        return data
+        return _canonicalize_loaded_reasoning_efforts(data)
 
     raise RuntimeError(
         f"Cron database corrupted: expected {{'jobs': [...]}}, got {type(data).__name__}"
@@ -792,6 +826,33 @@ def _normalize_job_optional_text(value: Any, *, strip_trailing_slash: bool = Fal
     return text or None
 
 
+def normalize_job_reasoning_effort(value: Any) -> Optional[str]:
+    """Return a canonical optional per-job reasoning effort.
+
+    Cron uses the main agent's parser as its source of truth so accepted
+    values cannot drift. ``None`` and blank strings mean "inherit the global
+    setting". Unknown values fail loudly rather than silently changing cost or
+    reasoning behavior.
+    """
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        raise ValueError("Invalid reasoning_effort: expected a string or null.")
+
+    normalized = value.strip().lower()
+    if not normalized:
+        return None
+
+    from hermes_constants import VALID_REASONING_EFFORTS, parse_reasoning_effort
+
+    if parse_reasoning_effort(normalized) is None:
+        valid = ", ".join(("none", *VALID_REASONING_EFFORTS))
+        raise ValueError(
+            f"Invalid reasoning_effort {value!r}. Expected one of: {valid}."
+        )
+    return normalized
+
+
 def _compute_provider_model_snapshots(
     *,
     provider: Any,
@@ -865,6 +926,7 @@ def create_job(
     workdir: Optional[str] = None,
     no_agent: bool = False,
     attach_to_session: Optional[bool] = None,
+    reasoning_effort: Optional[str] = None,
 ) -> Dict[str, Any]:
     """
     Create a new cron job.
@@ -881,6 +943,8 @@ def create_job(
         skills: Optional ordered list of skills to load before running the prompt
         model: Optional per-job model override
         provider: Optional per-job provider override
+        reasoning_effort: Optional per-job reasoning effort override. Blank or
+                          None inherits the global agent setting.
         base_url: Optional per-job base URL override
         script: Optional path to a script whose stdout feeds the job. With
                 ``no_agent=True`` the script IS the job — its stdout is
@@ -933,6 +997,7 @@ def create_job(
     normalized_skills = _normalize_skill_list(skill, skills)
     normalized_model = _normalize_job_optional_text(model)
     normalized_provider = _normalize_job_optional_text(provider)
+    normalized_reasoning_effort = normalize_job_reasoning_effort(reasoning_effort)
     normalized_base_url = _normalize_job_optional_text(base_url, strip_trailing_slash=True)
     normalized_script = str(script).strip() if isinstance(script, str) else None
     normalized_script = normalized_script or None
@@ -1017,6 +1082,10 @@ def create_job(
         "enabled_toolsets": normalized_toolsets,
         "workdir": normalized_workdir,
     }
+    # Omit inherited values so existing jobs and serialized stores retain the
+    # legacy shape until an explicit override is selected.
+    if normalized_reasoning_effort is not None:
+        job["reasoning_effort"] = normalized_reasoning_effort
     # Only persist attach_to_session when explicitly set, so existing jobs and
     # the common case stay byte-identical (absent key => fall back to the
     # global cron.mirror_delivery config, default off).
@@ -1112,8 +1181,15 @@ def update_job(job_id: str, updates: Dict[str, Any]) -> Optional[Dict[str, Any]]
                 else:
                     updates["workdir"] = _normalize_workdir(_wd)
 
+            if "reasoning_effort" in updates:
+                updates["reasoning_effort"] = normalize_job_reasoning_effort(
+                    updates.get("reasoning_effort")
+                )
+
             previous_inference_axes = _normalized_inference_axes(job)
             updated = _apply_skill_fields({**job, **updates})
+            if updated.get("reasoning_effort") is None:
+                updated.pop("reasoning_effort", None)
             schedule_changed = "schedule" in updates
             inference_fields_changed = bool(
                 {"provider", "model", "base_url", "no_agent"}.intersection(updates)
