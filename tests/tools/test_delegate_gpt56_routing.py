@@ -4,6 +4,7 @@ import json
 import threading
 import time
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -28,6 +29,27 @@ def _enabled_config(**overrides):
     }
     config.update(overrides)
     return config
+
+
+def _parent_agent(**overrides):
+    values = {
+        "_delegate_depth": 0,
+        "_active_children": [],
+        "_active_children_lock": None,
+        "_interrupt_requested": False,
+        "_memory_manager": None,
+        "_session_db": None,
+        "session_id": "parent",
+        "session_estimated_cost_usd": 0.0,
+        "session_cost_source": "none",
+        "session_cost_status": "unknown",
+        "model": "gpt-5.6-sol",
+        "provider": "openai-codex",
+        "base_url": "https://chatgpt.com/backend-api/codex",
+        "api_key": "parent-token-must-not-leak",
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
 
 
 def test_enabled_policy_hard_caps_parallelism_and_depth(monkeypatch) -> None:
@@ -188,6 +210,72 @@ def test_delegate_schema_exposes_per_task_routes_and_ultra_mode() -> None:
     assert "independent" in task_properties
 
 
+def test_live_dispatch_forwards_route_reason_mode_and_batch_defaults(monkeypatch) -> None:
+    """The real AIAgent dispatch shim must not discard GPT-5.6 controls."""
+    import run_agent
+
+    captured = {}
+
+    def fake_delegate(**kwargs):
+        captured.update(kwargs)
+        return "{}"
+
+    monkeypatch.setattr(delegation, "delegate_task", fake_delegate)
+    parent = _parent_agent()
+    tasks = [
+        {"goal": "inventory", "independent": True},
+        {"goal": "review", "independent": True},
+    ]
+
+    run_agent.AIAgent._dispatch_delegate_task(
+        parent,
+        {
+            "tasks": tasks,
+            "context": "shared batch context",
+            "role": "leaf",
+            "route": "reviewer",
+            "reason": "independent QA workstreams",
+            "mode": "ultra",
+        },
+    )
+
+    assert captured["tasks"] == tasks
+    assert captured["context"] == "shared batch context"
+    assert captured["role"] == "leaf"
+    assert captured["route"] == "reviewer"
+    assert captured["reason"] == "independent QA workstreams"
+    assert captured["mode"] == "ultra"
+    assert captured["background"] is True
+
+
+def test_live_dispatch_reaches_ultra_validation(monkeypatch) -> None:
+    """An invalid Ultra batch must fail before credentials or children exist."""
+    import run_agent
+
+    monkeypatch.setattr(delegation, "_load_config", lambda: _enabled_config())
+
+    def fail_if_credentials_are_resolved(*_args, **_kwargs):
+        pytest.fail("Ultra validation was bypassed by the live dispatch path")
+
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        fail_if_credentials_are_resolved,
+    )
+    result = run_agent.AIAgent._dispatch_delegate_task(
+        _parent_agent(),
+        {
+            "tasks": [
+                {"goal": "inventory", "route": "explorer", "reason": "mechanical"},
+                {"goal": "review", "route": "reviewer", "reason": "QA"},
+            ],
+            "mode": "ultra",
+        },
+    )
+
+    assert "must declare independent=true" in result
+
+
 def test_delegate_task_builds_each_child_with_its_own_model_and_effort(monkeypatch) -> None:
     cfg = _enabled_config()
     monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
@@ -199,8 +287,8 @@ def test_delegate_task_builds_each_child_with_its_own_model_and_effort(monkeypat
         return {
             "model": task_cfg.get("model"),
             "provider": task_cfg.get("provider"),
-            "base_url": None,
-            "api_key": None,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
             "api_mode": "codex_responses",
             "command": None,
             "args": None,
@@ -269,6 +357,295 @@ def test_delegate_task_builds_each_child_with_its_own_model_and_effort(monkeypat
     assert [item["routing"]["route_id"] for item in payload["results"]] == ["explorer", "reviewer"]
 
 
+def test_batch_tasks_inherit_top_level_context_and_routing_defaults(monkeypatch) -> None:
+    cfg = _enabled_config()
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    built = []
+
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        lambda task_cfg, _parent: {
+            "model": task_cfg.get("model"),
+            "provider": task_cfg.get("provider"),
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": None,
+        },
+    )
+
+    def fake_build(**kwargs):
+        built.append(kwargs)
+        spec = kwargs["routing_spec"]
+        return SimpleNamespace(
+            model=kwargs["model"],
+            provider=kwargs["override_provider"],
+            _delegate_role="leaf",
+            _gpt56_route_metadata=spec.as_contract(),
+            _fallback_activated=False,
+            session_id=f"child-{kwargs['task_index']}",
+            session_estimated_cost_usd=0.0,
+        )
+
+    monkeypatch.setattr(delegation, "_build_child_agent", fake_build)
+    monkeypatch.setattr(
+        delegation,
+        "_run_single_child",
+        lambda task_index, goal, child, parent_agent: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0,
+            "routing": delegation._child_routing_contract(child),
+            "_child_role": "leaf",
+        },
+    )
+    monkeypatch.setattr(delegation, "_apply_summary_budget", lambda *_: None)
+
+    delegation.delegate_task(
+        tasks=[
+            {"goal": "one"},
+            {"goal": "two", "context": "task-specific context"},
+        ],
+        context="shared batch context",
+        role="leaf",
+        route="worker",
+        reason="bounded implementation",
+        background=False,
+        parent_agent=_parent_agent(),
+    )
+
+    assert [item["context"] for item in built] == [
+        "shared batch context",
+        "task-specific context",
+    ]
+    assert [item["routing_spec"].route_id for item in built] == ["worker", "worker"]
+
+
+def test_routed_delegation_ignores_stale_custom_endpoint_and_credentials(monkeypatch) -> None:
+    """Canonical GPT routes resolve fresh Codex auth, never stale delegation auth."""
+    cfg = _enabled_config(
+        base_url="https://stale-proxy.example/v1",
+        api_key="stale-proxy-key",
+        api_mode="chat_completions",
+    )
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    built = []
+    runtime_calls = []
+
+    def fake_runtime_provider(**kwargs):
+        runtime_calls.append(kwargs)
+        return {
+            "model": kwargs.get("target_model"),
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "fresh-codex-token",
+            "api_mode": "codex_responses",
+        }
+
+    monkeypatch.setattr(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        fake_runtime_provider,
+    )
+
+    def fake_build(**kwargs):
+        built.append(kwargs)
+        spec = kwargs["routing_spec"]
+        return SimpleNamespace(
+            model=kwargs["model"],
+            provider=kwargs["override_provider"],
+            _delegate_role="leaf",
+            _gpt56_route_metadata=spec.as_contract(),
+            _fallback_activated=False,
+            session_id="child",
+            session_estimated_cost_usd=0.0,
+        )
+
+    monkeypatch.setattr(delegation, "_build_child_agent", fake_build)
+    monkeypatch.setattr(
+        delegation,
+        "_run_single_child",
+        lambda task_index, goal, child, parent_agent: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0,
+            "routing": delegation._child_routing_contract(child),
+            "_child_role": "leaf",
+        },
+    )
+    monkeypatch.setattr(delegation, "_apply_summary_budget", lambda *_: None)
+
+    delegation.delegate_task(
+        goal="bounded implementation",
+        route="worker",
+        reason="routine code change",
+        background=False,
+        parent_agent=_parent_agent(
+            provider="custom",
+            base_url="https://parent-proxy.example/v1",
+            api_key="parent-secret",
+        ),
+    )
+
+    assert runtime_calls == [
+        {"requested": "openai-codex", "target_model": "gpt-5.6-terra"}
+    ]
+    assert built[0]["override_provider"] == "openai-codex"
+    assert built[0]["override_base_url"] == "https://chatgpt.com/backend-api/codex"
+    assert built[0]["override_api_key"] == "fresh-codex-token"
+    assert built[0]["override_api_mode"] == "codex_responses"
+    assert built[0]["override_api_key"] not in {"stale-proxy-key", "parent-secret"}
+
+
+@pytest.mark.parametrize(
+    "base_url",
+    [
+        "",
+        "https://parent-proxy.example/v1",
+        "https://chatgpt.com:444/backend-api/codex",
+        "https://chatgpt.com/backend-api/codex?upstream=custom",
+    ],
+)
+def test_routed_credentials_reject_missing_or_noncanonical_endpoint(base_url) -> None:
+    with pytest.raises(ValueError, match="credential resolution failed closed"):
+        delegation._validate_routed_credentials(
+            {
+                "model": "gpt-5.6-terra",
+                "provider": "openai-codex",
+                "base_url": base_url,
+                "api_key": "resolved-token",
+                "api_mode": "codex_responses",
+            },
+            route_spec("worker", reason="bounded work"),
+        )
+
+
+def test_routed_capacity_rejection_never_runs_children_synchronously(monkeypatch) -> None:
+    cfg = _enabled_config()
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    child = MagicMock()
+    child.model = "gpt-5.6-terra"
+    child.provider = "openai-codex"
+    child.session_id = "not-started-child"
+    child._delegate_role = "leaf"
+    child._gpt56_route_metadata = route_spec("worker", reason="bounded work").as_contract()
+    child._fallback_activated = False
+    child.session_estimated_cost_usd = 0.0
+
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(delegation, "_build_child_agent", lambda **_kwargs: child)
+
+    def fail_if_child_runs(*_args, **_kwargs):
+        pytest.fail("capacity-rejected routed child ran synchronously")
+
+    monkeypatch.setattr(delegation, "_run_single_child", fail_if_child_runs)
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: {"status": "rejected", "error": "capacity reached"},
+    )
+
+    payload = json.loads(
+        delegation.delegate_task(
+            goal="bounded work",
+            route="worker",
+            reason="routine implementation",
+            background=True,
+            parent_agent=_parent_agent(),
+        )
+    )
+
+    assert payload["status"] == "rejected"
+    assert "capacity reached" in payload["error"]
+    child.close.assert_called_once()
+
+
+def test_legacy_capacity_rejection_preserves_synchronous_fallback(monkeypatch) -> None:
+    """The new hard ceiling applies only to canonical routed delegation."""
+    cfg = {
+        "max_concurrent_children": 3,
+        "max_iterations": 4,
+        "gpt56_routing": {"enabled": False},
+    }
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    child = MagicMock()
+    child.model = "legacy-model"
+    child.provider = "legacy-provider"
+    child.session_id = "legacy-child"
+    child._delegate_role = "leaf"
+    child.session_estimated_cost_usd = 0.0
+    calls = []
+
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": None,
+            "provider": None,
+            "base_url": None,
+            "api_key": None,
+            "api_mode": None,
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(delegation, "_build_child_agent", lambda **_kwargs: child)
+
+    def fake_run(task_index, goal, child, parent_agent):
+        calls.append(goal)
+        return {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "legacy result",
+            "api_calls": 1,
+            "duration_seconds": 0,
+            "_child_role": "leaf",
+        }
+
+    monkeypatch.setattr(delegation, "_run_single_child", fake_run)
+    monkeypatch.setattr(delegation, "_apply_summary_budget", lambda *_: None)
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported",
+        lambda: True,
+    )
+    monkeypatch.setattr(
+        "tools.async_delegation.dispatch_async_delegation_batch",
+        lambda **_kwargs: {"status": "rejected", "error": "capacity reached"},
+    )
+
+    payload = json.loads(
+        delegation.delegate_task(
+            goal="legacy work",
+            background=True,
+            parent_agent=_parent_agent(model="legacy-model", provider="legacy-provider"),
+        )
+    )
+
+    assert calls == ["legacy work"]
+    assert payload["results"][0]["summary"] == "legacy result"
+    assert "SYNCHRONOUSLY" in payload["note"]
+
+
 @pytest.mark.parametrize("interrupt", [False, True])
 def test_synthetic_batch_results_keep_each_child_routing_metadata(
     monkeypatch, interrupt: bool
@@ -280,8 +657,8 @@ def test_synthetic_batch_results_keep_each_child_routing_metadata(
         return {
             "model": task_cfg.get("model"),
             "provider": task_cfg.get("provider"),
-            "base_url": None,
-            "api_key": None,
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
             "api_mode": "codex_responses",
             "command": None,
             "args": None,

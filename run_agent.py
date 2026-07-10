@@ -5709,6 +5709,9 @@ class AIAgent:
             tasks=_strip_model_hidden_task_fields(function_args.get("tasks")),
             max_iterations=function_args.get("max_iterations"),
             role=function_args.get("role"),
+            route=function_args.get("route"),
+            reason=function_args.get("reason"),
+            mode=function_args.get("mode"),
             background=(not _is_subagent),
             parent_agent=self,
         )

@@ -1216,13 +1216,37 @@ def _build_child_agent(
 
         child_thinking_cb = _child_thinking
 
-    # Resolve effective credentials: config override > parent inherit
-    effective_model = model or parent_agent.model
-    effective_provider = override_provider or getattr(parent_agent, "provider", None)
-    effective_base_url = override_base_url or parent_agent.base_url
-    if not override_base_url:
-        effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
-    effective_api_key = override_api_key or parent_api_key
+    # Resolve effective credentials: canonical GPT routes are fully explicit
+    # and may never inherit parent auth or endpoints. Legacy delegation keeps
+    # its historical config-override > parent-inherit behavior.
+    if routing_spec is not None:
+        missing = [
+            name
+            for name, value in (
+                ("model", model),
+                ("provider", override_provider),
+                ("base_url", override_base_url),
+                ("api_key", override_api_key),
+                ("api_mode", override_api_mode),
+            )
+            if not value
+        ]
+        if missing:
+            raise ValueError(
+                "Canonical GPT-5.6 child credentials must be explicit; "
+                f"missing {', '.join(missing)}"
+            )
+        effective_model = model
+        effective_provider = override_provider
+        effective_base_url = override_base_url
+        effective_api_key = override_api_key
+    else:
+        effective_model = model or parent_agent.model
+        effective_provider = override_provider or getattr(parent_agent, "provider", None)
+        effective_base_url = override_base_url or parent_agent.base_url
+        if not override_base_url:
+            effective_base_url = _inherit_parent_base_url(parent_agent, effective_base_url)
+        effective_api_key = override_api_key or parent_api_key
     # Bug #20558 / PR #20563: api_mode must NOT be inherited when the child uses a
     # different provider than the parent — each provider has its own API surface
     # (e.g. MiniMax uses anthropic_messages, DeepSeek uses chat_completions).
@@ -2469,6 +2493,86 @@ def _resolve_task_route_specs(
         raise ValueError(str(exc)) from exc
 
 
+_ROUTED_CONFIG_CREDENTIAL_KEYS = frozenset(
+    {
+        "base_url",
+        "api_key",
+        "api_mode",
+        "command",
+        "args",
+        "acp_command",
+        "acp_args",
+    }
+)
+
+
+def _config_for_routed_task(cfg: dict, spec) -> dict:
+    """Build a credential config that cannot retain a legacy custom route.
+
+    GPT-5.6 routes are canonical operator policy, not an overlay on the old
+    ``delegation.base_url`` shortcut.  Keeping a stale endpoint or key in the
+    copied delegation config would make ``_resolve_delegation_credentials``
+    take its direct-custom branch before it ever resolves ``openai-codex``.
+    """
+    task_cfg = {
+        key: value
+        for key, value in cfg.items()
+        if key not in _ROUTED_CONFIG_CREDENTIAL_KEYS
+    }
+    task_cfg.update(
+        {
+            "model": spec.model,
+            "provider": spec.provider,
+            "reasoning_effort": spec.effort,
+        }
+    )
+    return task_cfg
+
+
+def _validate_routed_credentials(creds: dict, spec) -> None:
+    """Fail closed unless a canonical GPT route resolved explicit Codex auth."""
+    from urllib.parse import urlsplit
+
+    provider = str(creds.get("provider") or "").strip().lower()
+    model = str(creds.get("model") or "").strip().lower()
+    api_mode = str(creds.get("api_mode") or "").strip().lower()
+    base_url = str(creds.get("base_url") or "").strip()
+    api_key = creds.get("api_key")
+    parsed = urlsplit(base_url)
+    canonical_endpoint = (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "chatgpt.com"
+        and parsed.port in (None, 443)
+        and parsed.path.rstrip("/") == "/backend-api/codex"
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+    errors = []
+    if provider != spec.provider:
+        errors.append(f"provider must resolve to {spec.provider!r}")
+    if model != spec.model:
+        errors.append(f"model must resolve to {spec.model!r}")
+    if api_mode != "codex_responses":
+        errors.append("api_mode must resolve to 'codex_responses'")
+    if not canonical_endpoint:
+        errors.append(
+            "base_url must resolve to the canonical "
+            "https://chatgpt.com/backend-api/codex endpoint"
+        )
+    if not api_key:
+        errors.append("an explicit openai-codex credential is required")
+    if creds.get("command") or creds.get("args"):
+        errors.append("ACP command overrides are forbidden for canonical GPT routes")
+    if errors:
+        raise ValueError(
+            f"GPT-5.6 route {spec.route_id!r} credential resolution failed closed: "
+            + "; ".join(errors)
+        )
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2604,16 +2708,15 @@ def delegate_task(
         )
         task_creds = []
         for spec in route_specs:
-            task_cfg = dict(cfg)
+            task_cfg = (
+                _config_for_routed_task(cfg, spec)
+                if spec is not None
+                else dict(cfg)
+            )
+            creds = _resolve_delegation_credentials(task_cfg, parent_agent)
             if spec is not None:
-                task_cfg.update(
-                    {
-                        "model": spec.model,
-                        "provider": spec.provider,
-                        "reasoning_effort": spec.effort,
-                    }
-                )
-            task_creds.append(_resolve_delegation_credentials(task_cfg, parent_agent))
+                _validate_routed_credentials(creds, spec)
+            task_creds.append(creds)
     except ValueError as exc:
         return tool_error(str(exc))
 
@@ -2645,7 +2748,11 @@ def delegate_task(
             child = _build_child_agent(
                 task_index=i,
                 goal=t["goal"],
-                context=t.get("context"),
+                context=(
+                    t.get("context")
+                    if t.get("context") is not None
+                    else context
+                ),
                 # Subagents always inherit the parent's toolsets; the model
                 # cannot choose or narrow them (no model-facing toolsets arg).
                 toolsets=None,
@@ -3067,6 +3174,45 @@ def delegate_task(
                 "note": note,
             }
             return json.dumps(payload, ensure_ascii=False)
+
+        # A routed batch reserves one shared-capacity unit per child. If the
+        # atomic reservation is rejected, running those already-built children
+        # inline would bypass that exact same ceiling (for example, a live
+        # three-child batch plus another three synchronous children). Reject
+        # routed work and dispose of unstarted child resources. Legacy
+        # non-routed delegation retains its historical synchronous fallback.
+        if any(spec is not None for spec in route_specs):
+            for _child in _child_agents:
+                try:
+                    if hasattr(_child, "close"):
+                        _child.close()
+                except Exception:
+                    logger.debug(
+                        "Failed to close capacity-rejected routed child",
+                        exc_info=True,
+                    )
+            return json.dumps(
+                {
+                    "status": "rejected",
+                    "mode": "background",
+                    "count": len(_goals),
+                    "error": dispatch.get(
+                        "error",
+                        "Routed delegation could not reserve shared child capacity.",
+                    ),
+                    "goals": _goals,
+                    "routing": [
+                        spec.as_contract() if spec is not None else None
+                        for spec in route_specs
+                    ],
+                    "note": (
+                        "No routed child ran. Retry after an active delegation "
+                        "finishes; routed work never bypasses the shared "
+                        "max_concurrent_children ceiling via synchronous fallback."
+                    ),
+                },
+                ensure_ascii=False,
+            )
 
         # Pool at capacity / schedule failure — children are still attached
         # (we detach above only on the parent list, but the async unit was
