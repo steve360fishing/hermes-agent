@@ -1293,6 +1293,25 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         )
         return agent._try_activate_fallback(reason)
 
+    try:
+        from agent.openrouter_fallback_guard import openrouter_fallback_activation_allowed
+
+        allowed, guard_message = openrouter_fallback_activation_allowed(
+            agent, fb_provider, fb_model
+        )
+    except Exception as guard_error:
+        logger.warning("OpenRouter fallback guard check failed: %s", guard_error)
+        allowed, guard_message = False, "fallback guard unavailable"
+    if not allowed:
+        logger.warning(
+            "Fallback to %s/%s blocked by OpenRouter fallback guard: %s",
+            fb_provider,
+            fb_model,
+            guard_message,
+        )
+        unavailable.add(fb_key)
+        return agent._try_activate_fallback(reason)
+
     # Skip entries that resolve to the current (provider, model) — falling
     # back to the same backend that just failed loops the failure. Compare
     # base_url too so two distinct custom_providers entries pointing at the
@@ -1412,6 +1431,18 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         if hasattr(agent, "_transport_cache"):
             agent._transport_cache.clear()
         agent._fallback_activated = True
+        try:
+            from agent.openrouter_fallback_guard import record_openrouter_fallback_activation
+
+            record_openrouter_fallback_activation(
+                agent,
+                reason=getattr(reason, "value", None)
+                or str(reason or "primary_failed"),
+            )
+        except Exception as guard_error:
+            logger.warning(
+                "OpenRouter fallback activation guard failed: %s", guard_error
+            )
 
         # Rebind the credential pool to the fallback provider when the provider
         # changes.  Keeping the primary pool attached would make downstream
