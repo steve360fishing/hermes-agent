@@ -199,6 +199,27 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         )
         return None
 
+
+def _resolve_cron_reasoning_config(job: dict, cfg: dict) -> dict | None:
+    """Resolve per-job reasoning effort over the global agent default.
+
+    Explicit job values use the shared Hermes parser for canonical validation.
+    Invalid persisted overrides fail closed before provider resolution or
+    inference. Missing or blank values preserve the historical global setting.
+    """
+    from cron.jobs import normalize_job_reasoning_effort
+    from hermes_constants import parse_reasoning_effort
+
+    job_effort = normalize_job_reasoning_effort(job.get("reasoning_effort"))
+    if job_effort is not None:
+        return parse_reasoning_effort(job_effort)
+
+    agent_cfg = cfg.get("agent") or {}
+    if not isinstance(agent_cfg, dict):
+        agent_cfg = {}
+    global_effort = str(agent_cfg.get("reasoning_effort") or "").strip()
+    return parse_reasoning_effort(global_effort)
+
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.
 _KNOWN_DELIVERY_PLATFORMS = frozenset({
@@ -2862,12 +2883,10 @@ def run_job(
         except Exception:
             pass
 
-        # Reasoning config from config.yaml (raw value — a YAML boolean False
-        # means thinking disabled, see parse_reasoning_effort)
-        from hermes_constants import parse_reasoning_effort
-        reasoning_config = parse_reasoning_effort(
-            _cfg.get("agent", {}).get("reasoning_effort", "")
-        )
+        # Per-job effort overrides config.yaml. The resolver validates stored
+        # values (including max/ultra) with the canonical Hermes parser and
+        # fails before provider resolution when a hand-edited value is invalid.
+        reasoning_config = _resolve_cron_reasoning_config(job, _cfg)
 
         # Prefill messages from env or config.yaml. The top-level
         # prefill_messages_file key is canonical; agent.prefill_messages_file is
