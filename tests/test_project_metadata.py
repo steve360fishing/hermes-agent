@@ -186,6 +186,35 @@ def test_pyproject_pins_match_lazy_deps_pins():
     )
 
 
+def test_telegram_dependency_matches_supported_live_runtime():
+    """Clean images must not downgrade the supported live PTB runtime."""
+    from tools.lazy_deps import LAZY_DEPS
+
+    expected = "22.7"
+    optional_dependencies = _load_optional_dependencies()
+    pyproject_versions = {
+        pins["python-telegram-bot"]
+        for specs in optional_dependencies.values()
+        if "python-telegram-bot" in (pins := _exact_pins(specs))
+    }
+    lazy_version = _exact_pins(
+        LAZY_DEPS["platform.telegram"]
+    )["python-telegram-bot"]
+
+    lock_path = Path(__file__).resolve().parents[1] / "uv.lock"
+    with lock_path.open("rb") as handle:
+        lock_data = tomllib.load(handle)
+    lock_versions = {
+        package["version"]
+        for package in lock_data["package"]
+        if package["name"] == "python-telegram-bot"
+    }
+
+    assert pyproject_versions == {expected}
+    assert lazy_version == expected
+    assert lock_versions == {expected}
+
+
 def test_dev_extra_excluded_from_all():
     """End-user installs should not pull test/lint/debug tooling."""
     optional_dependencies = _load_optional_dependencies()
