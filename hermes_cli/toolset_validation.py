@@ -1,8 +1,8 @@
 """Validation for the ``platform_toolsets`` config section.
 
-Pure, side-effect-free helpers so the logic is unit-testable without importing
-the tool registry or launching Hermes (mirrors the decoupled-helper pattern used
-elsewhere in the CLI).
+The core validator is pure and accepts its registry predicate as an argument.
+The startup wrapper first performs enabled-plugin discovery, then delegates to
+that pure validator.
 
 Motivated by #38798: a config migration silently rewrote the valid toolset name
 ``hermes-cli`` to the non-existent ``hermes``. ``resolve_toolset('hermes')``
@@ -72,3 +72,38 @@ def validate_platform_toolsets(
             "have no tools. Run `hermes tools` to reconfigure."
         )
     return warnings
+
+
+def validate_platform_toolsets_after_plugin_discovery(
+    platform_toolsets: object,
+    known_plugin_toolsets: object = None,
+) -> List[str]:
+    """Validate against built-in and enabled plugin toolsets.
+
+    Plugin toolsets are registered dynamically, so validating before discovery
+    misclassifies enabled plugins as unknown. Discovery is opt-in aware: a
+    disabled plugin does not register its tools and therefore remains invalid.
+    """
+    from hermes_cli.plugins import discover_plugins, get_plugin_toolsets
+    from toolsets import validate_toolset
+
+    # Reconcile against current config rather than trusting an earlier
+    # in-process discovery snapshot. ``known_plugin_toolsets`` preserves plugin
+    # identity across enabled -> disabled transitions so stale registry entries
+    # cannot make a disabled plugin appear valid.
+    discover_plugins(force=True)
+    active_plugin_toolsets = {entry[0] for entry in get_plugin_toolsets()}
+    known_plugin_names: set[str] = set()
+    if isinstance(known_plugin_toolsets, dict):
+        for raw_names in known_plugin_toolsets.values():
+            names = raw_names if isinstance(raw_names, list) else [raw_names]
+            known_plugin_names.update(
+                name for name in names if isinstance(name, str) and name
+            )
+
+    def is_currently_valid(name: str) -> bool:
+        if name in known_plugin_names:
+            return name in active_plugin_toolsets
+        return validate_toolset(name)
+
+    return validate_platform_toolsets(platform_toolsets, is_currently_valid)

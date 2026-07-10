@@ -89,3 +89,95 @@ def test_real_validate_toolset_treats_hermes_cli_valid_and_hermes_invalid():
     assert validate_toolset("hermes") is False
     warnings = validate_platform_toolsets({"cli": ["hermes"]}, validate_toolset)
     assert any("did you mean 'hermes-cli'?" in w for w in warnings)
+
+
+def test_enabled_plugins_are_discovered_before_platform_toolset_validation(monkeypatch):
+    """Plugin-backed toolsets must be registered before startup validates them."""
+    from hermes_cli import plugins
+    from hermes_cli.toolset_validation import (
+        validate_platform_toolsets_after_plugin_discovery,
+    )
+    import toolsets
+
+    discovered = False
+    forced = False
+    enabled_plugin_toolsets = {
+        "apify",
+        "firecrawl",
+        "perplexity",
+        "sportfish_research",
+    }
+
+    def discover_plugins(*, force=False):
+        nonlocal discovered, forced
+        discovered = True
+        forced = force
+
+    def validate_toolset(name):
+        if name == "hermes-cli":
+            return True
+        return discovered and name in enabled_plugin_toolsets
+
+    monkeypatch.setattr(plugins, "discover_plugins", discover_plugins)
+    monkeypatch.setattr(toolsets, "validate_toolset", validate_toolset)
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_toolsets",
+        lambda: [(name, name, "test") for name in enabled_plugin_toolsets],
+    )
+
+    warnings = validate_platform_toolsets_after_plugin_discovery(
+        {
+            "cli": [
+                "hermes-cli",
+                "apify",
+                "firecrawl",
+                "perplexity",
+                "sportfish_research",
+                "disabled_plugin",
+                "genuinely_unknown",
+            ]
+        },
+        {
+            "cli": sorted(enabled_plugin_toolsets | {"disabled_plugin"}),
+        },
+    )
+
+    assert discovered is True
+    assert forced is True
+    assert not any(
+        name in warning
+        for name in enabled_plugin_toolsets
+        for warning in warnings
+    )
+    assert any("unknown toolset 'disabled_plugin'" in warning for warning in warnings)
+    assert any("unknown toolset 'genuinely_unknown'" in warning for warning in warnings)
+
+
+def test_previously_enabled_plugin_is_invalid_after_disable_rediscovery(monkeypatch):
+    """Known plugin history must not let stale registry membership pass."""
+    from hermes_cli import plugins
+    from hermes_cli.toolset_validation import (
+        validate_platform_toolsets_after_plugin_discovery,
+    )
+    import toolsets
+
+    monkeypatch.setattr(plugins, "discover_plugins", lambda *, force=False: None)
+    monkeypatch.setattr(
+        plugins,
+        "get_plugin_toolsets",
+        lambda: [("apify", "Apify", "enabled now")],
+    )
+    monkeypatch.setattr(
+        toolsets,
+        "validate_toolset",
+        lambda name: name in {"hermes-cli", "apify", "ah360_travel"},
+    )
+
+    warnings = validate_platform_toolsets_after_plugin_discovery(
+        {"cli": ["hermes-cli", "apify", "ah360_travel"]},
+        {"cli": ["apify", "ah360_travel"]},
+    )
+
+    assert not any("unknown toolset 'apify'" in warning for warning in warnings)
+    assert any("unknown toolset 'ah360_travel'" in warning for warning in warnings)
