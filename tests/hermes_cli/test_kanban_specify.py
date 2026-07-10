@@ -214,6 +214,32 @@ def test_list_triage_ids(kanban_home):
     assert ids_tenant == [b]
 
 
+def test_specifier_real_caller_receives_canonical_gpt56_effort(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="rough", triage=True)
+    content = jsonlib.dumps({"title": "Refined", "body": "Concrete scope"})
+    p, client = _patch_aux_client(content, model="gpt-5.6-terra")
+    config = {
+        "delegation": {
+            "gpt56_routing": {
+                "enabled": True,
+                "contract": "gpt56-routing-v3",
+                "provider": "openai-codex",
+                "max_children": 3,
+                "max_depth": 1,
+            }
+        }
+    }
+    with p, patch("hermes_cli.config.load_config", return_value=config):
+        outcome = spec.specify_task(tid)
+
+    assert outcome.ok, outcome.reason
+    assert client.chat.completions.create.call_args.kwargs["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "medium",
+    }
+
+
 # ---------------------------------------------------------------------------
 # CLI wiring — argparse + _cmd_specify
 # ---------------------------------------------------------------------------

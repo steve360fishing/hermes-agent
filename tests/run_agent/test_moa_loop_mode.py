@@ -64,7 +64,17 @@ moa:
 
     assert result["final_response"] == "aggregator acted"
     assert agent.base_url == "moa://local"
-    assert [(c["task"], c["provider"], c["model"]) for c in calls] == [
+    routed_calls = []
+    for call in calls:
+        decision = call.get("_route_decision")
+        routed_calls.append(
+            (
+                call["task"],
+                decision.provider if decision is not None else call["provider"],
+                decision.model if decision is not None else call["model"],
+            )
+        )
+    assert routed_calls == [
         ("moa_reference", "openai-codex", "gpt-5.5"),
         ("moa_aggregator", "openrouter", "anthropic/claude-opus-4.8"),
     ]
@@ -524,7 +534,12 @@ moa:
     assert tasks == ["moa_aggregator"]
     # Aggregator gets the unmodified user message (no MoA guidance appended).
     agg_call = calls[0]
-    assert agg_call["messages"][-1]["content"] == "question"
+    content = agg_call["messages"][-1]["content"]
+    if isinstance(content, list):
+        content = "".join(
+            block.get("text", "") for block in content if isinstance(block, dict)
+        )
+    assert content == "question"
 
 
 def test_references_run_in_parallel(monkeypatch):

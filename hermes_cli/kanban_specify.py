@@ -168,7 +168,8 @@ def specify_task(
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
 
     try:
-        client, model = get_text_auxiliary_client("triage_specifier")
+        binding = get_text_auxiliary_client("triage_specifier")
+        client, model = binding
     except Exception as exc:
         logger.debug("specify: get_text_auxiliary_client failed: %s", exc)
         return SpecifyOutcome(task_id, False, "auxiliary client unavailable")
@@ -194,7 +195,10 @@ def specify_task(
             temperature=0.3,
             max_tokens=HERMES_KANBAN_SPECIFY_MAX_TOKENS,
             timeout=timeout or 120,
-            extra_body=get_auxiliary_extra_body() or None,
+            extra_body=get_auxiliary_extra_body(
+                "triage_specifier",
+                decision=getattr(binding, "decision", None),
+            ) or None,
         )
     except Exception as exc:
         logger.info(

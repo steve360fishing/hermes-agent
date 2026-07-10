@@ -229,7 +229,7 @@ DEFAULT_CONTEXT_LENGTHS = {
     # ChatGPT Codex OAuth caps it at 272K; both paths resolve via their own
     # provider-aware branches (_resolve_codex_oauth_context_length + models.dev).
     # This hardcoded value is only reached when every probe misses.
-    # GPT-5.6 series (Sol/Terra/Luna, GA 2026-07-09) — 1.05M on the direct
+    # GPT-5.6 preview series (Sol/Terra/Luna) — 1.05M on the direct
     # OpenAI API (same as gpt-5.5). Codex OAuth caps these at 272K.
     # (Lookups length-sort keys at match time, so dict order is cosmetic.)
     "gpt-5.6-luna": 1050000,

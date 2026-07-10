@@ -28,6 +28,7 @@ through the board.
 """
 from __future__ import annotations
 
+from dataclasses import dataclass
 import json
 import logging
 import os
@@ -182,6 +183,34 @@ def _connect(board: Optional[str] = None):
 _GOAL_MODE_BLOCK_ALLOWED_KINDS = frozenset({"dependency", "needs_input"})
 
 
+@dataclass(frozen=True)
+class _GoalJudgeProbe:
+    binding: Any = None
+    available: bool = False
+    policy_required: bool = True
+    error_kind: str = ""
+
+
+def _goal_judge_probe() -> _GoalJudgeProbe:
+    """Resolve availability and policy from one immutable goal-judge binding."""
+    try:
+        from agent.auxiliary_client import get_text_auxiliary_client
+
+        binding = get_text_auxiliary_client("goal_judge")
+        client, model = binding
+    except Exception as exc:
+        # A loader/runtime failure is not proof that policy is disabled. Fail
+        # closed; only a successfully captured disabled snapshot is legacy-safe.
+        return _GoalJudgeProbe(error_kind=type(exc).__name__)
+    decision = getattr(binding, "decision", None)
+    spec = getattr(decision, "policy_spec", None)
+    return _GoalJudgeProbe(
+        binding=binding,
+        available=client is not None and bool(model),
+        policy_required=bool(spec is not None and getattr(spec, "protected", False)),
+    )
+
+
 def _goal_judge_available() -> bool:
     """True when an auxiliary client is configured for the goal judge.
 
@@ -195,12 +224,7 @@ def _goal_judge_available() -> bool:
     actually reachable. This mirrors the same client lookup ``judge_goal``
     performs internally.
     """
-    try:
-        from agent.auxiliary_client import get_text_auxiliary_client
-        client, model = get_text_auxiliary_client("goal_judge")
-    except Exception:
-        return False
-    return client is not None and bool(model)
+    return _goal_judge_probe().available
 
 
 # ---------------------------------------------------------------------------
@@ -595,20 +619,36 @@ def _handle_complete(args: dict, **kw) -> str:
             # Goal-mode pre-completion judge gate (Issue #38367).
             # Prevent workers from bypassing the auxiliary judge by
             # calling kanban_complete before acceptance criteria are met.
-            # Only enforce when a judge is actually reachable — see
-            # _goal_judge_available for why an unavailable judge fails open.
             task = kb.get_task(conn, tid)
-            if task and task.goal_mode and _goal_judge_available():
+            if task and task.goal_mode:
+                judge_probe = _goal_judge_probe()
+                if judge_probe.policy_required and not judge_probe.available:
+                    return tool_error(
+                        "Goal completion blocked: the protected GPT-5.6 goal judge "
+                        "is unavailable. Retry after restoring the canonical "
+                        "openai-codex route, or escalate the runtime failure; the "
+                        "task remains running."
+                    )
+            if task and task.goal_mode and judge_probe.available:
                 verdict = "done"
                 reason = ""
                 try:
-                    verdict, reason, _ = judge_goal(
+                    verdict, reason, _, _ = judge_goal(
                         goal=f"{task.title}\n\n{task.body or ''}".strip(),
                         last_response=(summary or result or "").strip(),
+                        _auxiliary_binding=judge_probe.binding,
                     )
                 except Exception as judge_exc:
-                    # Defensive: judge_goal swallows its own errors, but if
-                    # it ever raises, fail open rather than wedge the worker.
+                    if judge_probe.policy_required:
+                        logger.warning(
+                            "protected goal judge check failed; completion remains blocked",
+                            exc_info=True,
+                        )
+                        return tool_error(
+                            "Goal completion blocked: the protected GPT-5.6 goal judge "
+                            "failed. Retry the judge after restoring its canonical "
+                            "runtime, or escalate; the task remains running."
+                        )
                     logger.warning(
                         "goal judge check failed, allowing completion: %s",
                         judge_exc,

@@ -666,7 +666,7 @@ def _session_waiting(session_id: str) -> bool:
 _JSON_OBJECT_RE = re.compile(r"\{.*?\}", re.DOTALL)
 
 
-def _goal_judge_max_tokens() -> int:
+def _goal_judge_max_tokens(task_config: Any = None) -> int:
     """Resolve auxiliary.goal_judge.max_tokens, falling back to the default.
 
     ``load_config()`` is cached on the config file's (mtime, size), so calling
@@ -674,6 +674,12 @@ def _goal_judge_max_tokens() -> int:
     back to the default rather than crashing the goal loop.
     """
     try:
+        if task_config is not None:
+            value = task_config.get("max_tokens", DEFAULT_JUDGE_MAX_TOKENS)
+            value = int(value)
+            if value > 0:
+                return value
+            return DEFAULT_JUDGE_MAX_TOKENS
         from hermes_cli.config import load_config
 
         cfg = load_config()
@@ -841,6 +847,7 @@ def judge_goal(
     subgoals: Optional[List[str]] = None,
     background_processes: Optional[List[Dict[str, Any]]] = None,
     contract: Optional[GoalContract] = None,
+    _auxiliary_binding: Any = None,
 ) -> Tuple[str, str, bool, Optional[Dict[str, Any]]]:
     """Ask the auxiliary model whether the goal is satisfied.
 
@@ -884,7 +891,8 @@ def judge_goal(
         return "continue", "auxiliary client unavailable", False, None
 
     try:
-        client, model = get_text_auxiliary_client("goal_judge")
+        binding = _auxiliary_binding or get_text_auxiliary_client("goal_judge")
+        client, model = binding
     except Exception as exc:
         logger.debug("goal judge: get_text_auxiliary_client failed: %s", exc)
         return "continue", "auxiliary client unavailable", False, None
@@ -942,9 +950,14 @@ def judge_goal(
                 {"role": "user", "content": prompt},
             ],
             temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
+            max_tokens=_goal_judge_max_tokens(
+                getattr(getattr(binding, "decision", None), "task_config", None)
+            ),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
+            extra_body=get_auxiliary_extra_body(
+                "goal_judge",
+                decision=getattr(binding, "decision", None),
+            ) or None,
         )
     except Exception as exc:
         logger.info("goal judge: API call failed (%s) — falling through to continue", exc)
@@ -1005,7 +1018,8 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
         return None
 
     try:
-        client, model = get_text_auxiliary_client("goal_judge")
+        binding = get_text_auxiliary_client("goal_judge")
+        client, model = binding
     except Exception as exc:
         logger.debug("goal draft: get_text_auxiliary_client failed: %s", exc)
         return None
@@ -1021,9 +1035,14 @@ def draft_contract(objective: str, *, timeout: float = DEFAULT_JUDGE_TIMEOUT) ->
                 {"role": "user", "content": f"Objective:\n{_truncate(objective, 4000)}"},
             ],
             temperature=0,
-            max_tokens=_goal_judge_max_tokens(),
+            max_tokens=_goal_judge_max_tokens(
+                getattr(getattr(binding, "decision", None), "task_config", None)
+            ),
             timeout=timeout,
-            extra_body=get_auxiliary_extra_body() or None,
+            extra_body=get_auxiliary_extra_body(
+                "goal_judge",
+                decision=getattr(binding, "decision", None),
+            ) or None,
         )
     except Exception as exc:
         logger.info("goal draft: API call failed (%s)", exc)

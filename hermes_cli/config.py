@@ -2240,8 +2240,9 @@ DEFAULT_CONFIG = {
                                      # (API, tools, iteration budget), never a delegation
                                      # stopwatch. Set a positive number of seconds
                                      # (floor 30s) to enforce a hard cap.
-        "reasoning_effort": "",  # reasoning effort for subagents: "xhigh", "high", "medium",
-                                 # "low", "minimal", "none" (empty = inherit parent's level)
+        "reasoning_effort": "",  # reasoning effort for subagents: "ultra", "max", "xhigh",
+                                 # "high", "medium", "low", "minimal", "none"
+                                 # (empty = inherit parent's level)
         "max_concurrent_children": 3,  # unified concurrency cap: max parallel children per batch
                                        # AND max concurrent background (background=true)
                                        # delegation units. New async dispatches beyond the cap
@@ -2261,6 +2262,16 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Steve's fail-closed GPT-5.6 route contract. Disabled in the generic
+        # source default; a reviewed deployment overlay enables it only after
+        # Sol/Terra/Luna availability has been verified for the account.
+        "gpt56_routing": {
+            "enabled": False,
+            "contract": "gpt56-routing-v3",
+            "provider": "openai-codex",
+            "max_children": 3,
+            "max_depth": 1,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

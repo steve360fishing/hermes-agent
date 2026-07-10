@@ -51,6 +51,7 @@ class _ReviewRuntimeBinding(NamedTuple):
     model: str
     explicit_api_key: Optional[str]
     explicit_base_url: Optional[str]
+    routing_spec: Optional[Any] = None
 
 
 DEFAULT_INTERVAL_HOURS = 24 * 7  # 7 days
@@ -1753,6 +1754,32 @@ def _resolve_review_runtime(cfg: Dict[str, Any]) -> _ReviewRuntimeBinding:
     _main_provider = _main.get("provider") or "auto"
     _main_model = _main.get("default") or _main.get("model") or ""
 
+    # The operator-owned GPT-5.6 overlay is authoritative when enabled.
+    # Curator is protected because it can mutate the skill lifecycle, so it
+    # must run on canonical Sol/max and may not inherit a cheaper configured
+    # auxiliary or main-chat route.
+    _delegation = (
+        cfg.get("delegation", {})
+        if isinstance(cfg.get("delegation"), dict)
+        else {}
+    )
+    _routing = (
+        _delegation.get("gpt56_routing", {})
+        if isinstance(_delegation, dict)
+        else {}
+    )
+    from hermes_cli.gpt56_routing import auxiliary_spec, validate_operator_config
+
+    if validate_operator_config(_routing):
+        _spec = auxiliary_spec("curator")
+        return _ReviewRuntimeBinding(
+            _spec.provider,
+            _spec.model,
+            None,
+            None,
+            _spec,
+        )
+
     # 1. Canonical aux task slot
     _aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
     _cur_task = _aux.get("curator", {}) if isinstance(_aux.get("curator"), dict) else {}
@@ -1827,6 +1854,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         "provider": "",
         "tool_calls": [],
         "error": None,
+        "route_id": "",
+        "model_alias": "",
+        "effort": "",
+        "fallback_used": False,
     }
     try:
         from run_agent import AIAgent
@@ -1851,11 +1882,25 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
     _api_mode = None
     _resolved_provider = None
     _model_name = ""
+    _policy_spec = None
     try:
         from hermes_cli.config import load_config
-        from hermes_cli.runtime_provider import resolve_runtime_provider
+
         _cfg = load_config()
+    except Exception as e:
+        logger.debug("Curator config load failed: %s", e, exc_info=True)
+        result_meta["error"] = (
+            "protected curator route unavailable: config could not be read; "
+            "GPT-5.6 routing cannot be proven disabled"
+        )
+        result_meta["summary"] = result_meta["error"]
+        return result_meta
+
+    try:
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
         _binding = _resolve_review_runtime(_cfg)
+        _policy_spec = _binding.routing_spec
         _provider, _model_name = _binding.provider, _binding.model
         _rp = resolve_runtime_provider(
             requested=_provider,
@@ -1867,11 +1912,47 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         _base_url = _rp.get("base_url")
         _api_mode = _rp.get("api_mode")
         _resolved_provider = _rp.get("provider") or _provider
+        if _policy_spec is not None:
+            from hermes_cli.gpt56_routing import validate_codex_route_runtime
+
+            validate_codex_route_runtime(
+                _policy_spec,
+                provider=_resolved_provider,
+                model=_model_name,
+                api_mode=_api_mode,
+                base_url=_base_url,
+                api_key=_api_key,
+            )
     except Exception as e:
         logger.debug("Curator provider resolution failed: %s", e, exc_info=True)
+        from hermes_cli.gpt56_routing import RoutingPolicyError
+
+        if isinstance(e, RoutingPolicyError) or (
+            _policy_spec is not None and _policy_spec.protected
+        ):
+            result_meta["error"] = f"protected curator route unavailable: {e}"
+            result_meta["summary"] = result_meta["error"]
+            return result_meta
 
     result_meta["model"] = _model_name
     result_meta["provider"] = _resolved_provider or ""
+    if _policy_spec is not None:
+        result_meta.update(
+            {
+                "route_id": _policy_spec.route_id,
+                "model_alias": _policy_spec.model_alias,
+                "effort": _policy_spec.effort,
+                "fallback_used": False,
+            }
+        )
+        logger.info(
+            "GPT-5.6 auxiliary route task=curator route_id=%s model_alias=%s "
+            "effort=%s provider=%s fallback_used=false",
+            _policy_spec.route_id,
+            _policy_spec.model_alias,
+            _policy_spec.effort,
+            _resolved_provider or _policy_spec.provider,
+        )
 
     review_agent = None
     try:
@@ -1891,7 +1972,24 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
             platform="curator",
             skip_context_files=True,
             skip_memory=True,
+            reasoning_config=(
+                {"enabled": True, "effort": _policy_spec.effort}
+                if _policy_spec is not None
+                else None
+            ),
+            fallback_model=[] if _policy_spec is not None else None,
         )
+        if _policy_spec is not None:
+            from hermes_cli.gpt56_routing import validate_codex_route_runtime
+
+            validate_codex_route_runtime(
+                _policy_spec,
+                provider=getattr(review_agent, "provider", None),
+                model=getattr(review_agent, "model", None),
+                api_mode=getattr(review_agent, "api_mode", None),
+                base_url=getattr(review_agent, "base_url", None),
+                api_key=getattr(review_agent, "api_key", None),
+            )
         # Disable recursive nudges — the curator must never spawn its own review.
         review_agent._memory_nudge_interval = 0
         review_agent._skill_nudge_interval = 0
@@ -1939,6 +2037,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
                     args_raw = args_raw[:400] + "…"
                 _calls.append({"name": name, "arguments": args_raw})
         result_meta["tool_calls"] = _calls
+        _fallback_used = bool(getattr(review_agent, "_fallback_activated", False))
+        result_meta["fallback_used"] = _fallback_used
+        if _policy_spec is not None and _policy_spec.protected and _fallback_used:
+            raise RuntimeError("protected curator route attempted model fallback")
     except Exception as e:
         result_meta["error"] = f"error: {e}"
         result_meta["summary"] = result_meta["error"]

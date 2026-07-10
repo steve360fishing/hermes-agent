@@ -67,8 +67,66 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
     try:
         from hermes_cli.config import load_config
         cfg = load_config()
-    except Exception:
-        return parent
+    except Exception as exc:
+        raise RuntimeError(
+            "background-review config could not be read; protected routing "
+            "cannot be proven disabled"
+        ) from exc
+    delegation = (
+        cfg.get("delegation", {})
+        if isinstance(cfg.get("delegation"), dict)
+        else {}
+    )
+    routing = (
+        delegation.get("gpt56_routing", {})
+        if isinstance(delegation, dict)
+        else {}
+    )
+    from hermes_cli.gpt56_routing import auxiliary_spec, validate_operator_config
+
+    if validate_operator_config(routing):
+        spec = auxiliary_spec("background_review")
+        from hermes_cli.runtime_provider import resolve_runtime_provider
+
+        try:
+            rp = resolve_runtime_provider(
+                requested=spec.provider,
+                target_model=spec.model,
+                explicit_api_key=None,
+                explicit_base_url=None,
+            )
+            resolved_provider = rp.get("provider") or spec.provider
+            resolved_api_mode = rp.get("api_mode")
+            from hermes_cli.gpt56_routing import validate_codex_route_runtime
+
+            validate_codex_route_runtime(
+                spec,
+                provider=resolved_provider,
+                model=spec.model,
+                api_mode=resolved_api_mode,
+                base_url=rp.get("base_url"),
+                api_key=rp.get("api_key"),
+            )
+        except Exception as exc:
+            raise RuntimeError(
+                f"protected GPT-5.6 background_review route is unavailable: {exc}"
+            ) from exc
+        return {
+            "provider": resolved_provider,
+            "model": spec.model,
+            "api_key": rp.get("api_key"),
+            "base_url": rp.get("base_url"),
+            "api_mode": resolved_api_mode,
+            "routed": (
+                resolved_provider != (agent.provider or "")
+                or spec.model != (agent.model or "")
+            ),
+            "routing_spec": spec,
+            "route_id": spec.route_id,
+            "model_alias": spec.model_alias,
+            "effort": spec.effort,
+            "fallback_used": False,
+        }
     aux = cfg.get("auxiliary", {}) if isinstance(cfg.get("auxiliary"), dict) else {}
     task = aux.get("background_review", {}) if isinstance(aux.get("background_review"), dict) else {}
     task_provider = (str(task.get("provider", "")).strip() or None)
@@ -662,6 +720,16 @@ def _run_review_in_thread(
             # -> codex_responses downgrade is applied inside the resolver.
             _rt = _resolve_review_runtime(agent)
             _routed = bool(_rt.get("routed"))
+            _routing_spec = _rt.get("routing_spec")
+            if _routing_spec is not None:
+                logger.info(
+                    "GPT-5.6 auxiliary route task=background_review route_id=%s "
+                    "model_alias=%s effort=%s provider=%s fallback_used=false",
+                    _routing_spec.route_id,
+                    _routing_spec.model_alias,
+                    _routing_spec.effort,
+                    _rt.get("provider") or _routing_spec.provider,
+                )
             # skip_memory=True keeps the review fork from
             # touching external memory plugins (honcho, mem0,
             # supermemory, etc.).  Without it, the fork's
@@ -689,12 +757,33 @@ def _run_review_in_thread(
                 api_mode=_rt.get("api_mode"),
                 base_url=_rt.get("base_url") or None,
                 api_key=_rt.get("api_key") or None,
-                credential_pool=getattr(agent, "_credential_pool", None),
+                credential_pool=(
+                    None
+                    if _routing_spec is not None
+                    else getattr(agent, "_credential_pool", None)
+                ),
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
+                reasoning_config=(
+                    {"enabled": True, "effort": _routing_spec.effort}
+                    if _routing_spec is not None
+                    else None
+                ),
+                fallback_model=[] if _routing_spec is not None else None,
             )
+            if _routing_spec is not None:
+                from hermes_cli.gpt56_routing import validate_codex_route_runtime
+
+                validate_codex_route_runtime(
+                    _routing_spec,
+                    provider=getattr(review_agent, "provider", None),
+                    model=getattr(review_agent, "model", None),
+                    api_mode=getattr(review_agent, "api_mode", None),
+                    base_url=getattr(review_agent, "base_url", None),
+                    api_key=getattr(review_agent, "api_key", None),
+                )
             review_agent._memory_write_origin = "background_review"
             review_agent._memory_write_context = "background_review"
             # The review fork pins the parent's cached system prompt and keeps
@@ -826,6 +915,14 @@ def _run_review_in_thread(
                     ),
                     conversation_history=_review_history,
                 )
+                if (
+                    _routing_spec is not None
+                    and _routing_spec.protected
+                    and bool(getattr(review_agent, "_fallback_activated", False))
+                ):
+                    raise RuntimeError(
+                        "protected background_review route attempted model fallback"
+                    )
             finally:
                 clear_thread_tool_whitelist()
 
