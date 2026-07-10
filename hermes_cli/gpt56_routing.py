@@ -9,10 +9,42 @@ from typing import Any, Mapping, Sequence
 
 ROUTING_CONTRACT = "gpt56-routing-v3"
 PRIMARY_PROVIDER = "openai-codex"
+MAX_CHILDREN = 3
+MAX_DEPTH = 1
 
 
 class RoutingPolicyError(ValueError):
     """Raised when a requested route violates the GPT-5.6 contract."""
+
+
+def validate_operator_config(config: Mapping[str, Any]) -> bool:
+    """Validate the complete opt-in contract and return whether it is enabled."""
+    if not isinstance(config, Mapping):
+        raise RoutingPolicyError("delegation.gpt56_routing must be a mapping")
+    raw_enabled = config.get("enabled", False)
+    enabled = raw_enabled is True or str(raw_enabled).strip().lower() in {
+        "1",
+        "true",
+        "yes",
+        "on",
+    }
+    if not enabled:
+        return False
+
+    errors = []
+    if config.get("contract") != ROUTING_CONTRACT:
+        errors.append(f"contract must be {ROUTING_CONTRACT!r}")
+    if config.get("provider") != PRIMARY_PROVIDER:
+        errors.append(f"provider must be {PRIMARY_PROVIDER!r}")
+    if config.get("max_children") != MAX_CHILDREN:
+        errors.append(f"max_children must be exactly {MAX_CHILDREN}")
+    if config.get("max_depth") != MAX_DEPTH:
+        errors.append(f"max_depth must be exactly {MAX_DEPTH}")
+    if errors:
+        raise RoutingPolicyError(
+            "Invalid delegation.gpt56_routing configuration: " + "; ".join(errors)
+        )
+    return True
 
 
 class RouteId(str, Enum):
@@ -239,6 +271,8 @@ __all__ = [
     "AUXILIARY_ROUTES",
     "MODEL_EFFORTS",
     "MODEL_IDS",
+    "MAX_CHILDREN",
+    "MAX_DEPTH",
     "ModelAlias",
     "PRIMARY_PROVIDER",
     "ROUTING_CONTRACT",
@@ -248,5 +282,6 @@ __all__ = [
     "auxiliary_spec",
     "route_spec",
     "validate_model_effort",
+    "validate_operator_config",
     "validate_ultra_tasks",
 ]

@@ -185,13 +185,16 @@ def dispatch_async_delegation(
         "dispatched_at": dispatched_at,
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
+        "capacity_units": 1,
     }
     # Capacity check and record insert under ONE lock hold — checking
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            max(1, int(r.get("capacity_units", 1)))
+            for r in _records.values()
+            if r.get("status") == "running"
         )
         if running >= max_async_children:
             return {
@@ -332,6 +335,7 @@ def dispatch_async_delegation_batch(
     origin_ui_session_id: str = "",
     interrupt_fn: Optional[Callable[[], None]] = None,
     max_async_children: int = _DEFAULT_MAX_ASYNC_CHILDREN,
+    capacity_units: int = 1,
 ) -> Dict[str, Any]:
     """Dispatch a WHOLE fan-out batch as ONE background unit.
 
@@ -339,9 +343,9 @@ def dispatch_async_delegation_batch(
     ``runner`` here runs the entire batch — it builds and joins on every child
     in parallel and returns the combined ``{"results": [...],
     "total_duration_seconds": N}`` dict that the synchronous path would have
-    returned. We occupy ONE async slot for the whole batch (the in-batch
-    parallelism is bounded separately by ``max_concurrent_children``), so a
-    single ``delegate_task`` fan-out never exhausts the async pool by itself.
+    returned. Legacy batches occupy one async unit. Callers with a globally
+    bounded child policy can reserve one unit per child via ``capacity_units``
+    so multiple background fan-outs cannot exceed that global child ceiling.
 
     When the batch finishes, a SINGLE completion event is pushed onto the
     shared ``process_registry.completion_queue`` carrying the full per-task
@@ -356,6 +360,13 @@ def dispatch_async_delegation_batch(
     delegation_id = _new_delegation_id()
     dispatched_at = time.time()
     n = len(goals)
+    try:
+        reserved_units = max(1, int(capacity_units))
+    except (TypeError, ValueError):
+        return {
+            "status": "rejected",
+            "error": f"Invalid async delegation capacity_units={capacity_units!r}",
+        }
     # A combined goal label for status listings / the completion header.
     combined_goal = (
         goals[0] if n == 1 else f"{n} parallel subagents: " + "; ".join(g[:40] for g in goals)
@@ -376,17 +387,21 @@ def dispatch_async_delegation_batch(
         "completed_at": None,
         "interrupt_fn": interrupt_fn,
         "is_batch": True,
+        "capacity_units": reserved_units,
     }
     with _records_lock:
         running = sum(
-            1 for r in _records.values() if r.get("status") == "running"
+            max(1, int(r.get("capacity_units", 1)))
+            for r in _records.values()
+            if r.get("status") == "running"
         )
-        if running >= max_async_children:
+        if running + reserved_units > max_async_children:
             return {
                 "status": "rejected",
                 "error": (
                     f"Async delegation capacity reached ({max_async_children} "
-                    f"running). Wait for one to finish (its result will re-enter "
+                    f"child slots; {running} active and {reserved_units} requested). "
+                    f"Wait for one to finish (its result will re-enter "
                     f"the chat), or raise delegation.max_concurrent_children in "
                     f"config.yaml to allow more concurrent background units."
                 ),
