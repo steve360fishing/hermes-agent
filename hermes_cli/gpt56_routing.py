@@ -225,10 +225,30 @@ AUXILIARY_ROUTES: dict[str, RouteSpec] = {
     "vision": _aux("reviewer", "gpt56_terra", "high", "vision interpretation and verification"),
     "kanban_decomposer": _aux("reviewer", "gpt56_terra", "high", "task-graph decomposition"),
     "approval": _aux("expert", "gpt56_sol", "max", "protected approval decision", protected=True),
+    "goal_judge": _aux("expert", "gpt56_sol", "max", "protected completion verdict", protected=True),
     "curator": _aux("expert", "gpt56_sol", "max", "protected skill-lifecycle review", protected=True),
     "background_review": _aux("expert", "gpt56_sol", "max", "protected memory and skill review", protected=True),
     "moa_aggregator": _aux("expert", "gpt56_sol", "max", "protected final synthesis", protected=True),
 }
+
+
+# Provider-owned plugin tasks keep their native provider-selection contract.
+# They are explicitly classified here so the GPT overlay does not reject them
+# as unknown or invent a GPT model alias for a workflow it does not own.
+PROVIDER_LOCKED_AUXILIARY_TASKS: dict[str, dict[str, str]] = {
+    "call": {
+        "owner": "teams_pipeline",
+        "complexity": "medium",
+        "reason": "Teams meeting-summary provider remains plugin-owned",
+    },
+}
+
+
+def provider_locked_auxiliary_task(task: str) -> dict[str, str] | None:
+    """Return native-provider metadata for an explicitly locked task."""
+    normalized = str(task or "").strip()
+    metadata = PROVIDER_LOCKED_AUXILIARY_TASKS.get(normalized)
+    return dict(metadata) if metadata is not None else None
 
 
 def auxiliary_spec(task: str) -> RouteSpec:
@@ -275,11 +295,13 @@ __all__ = [
     "MAX_DEPTH",
     "ModelAlias",
     "PRIMARY_PROVIDER",
+    "PROVIDER_LOCKED_AUXILIARY_TASKS",
     "ROUTING_CONTRACT",
     "RouteId",
     "RouteSpec",
     "RoutingPolicyError",
     "auxiliary_spec",
+    "provider_locked_auxiliary_task",
     "route_spec",
     "validate_model_effort",
     "validate_operator_config",

@@ -112,6 +112,49 @@ def test_decompose_with_fanout_creates_children(kanban_home):
     assert c1.assignee == "engineer"
 
 
+def test_decomposer_real_caller_receives_canonical_gpt56_effort(kanban_home):
+    with kb.connect() as conn:
+        tid = kb.create_task(conn, title="one bounded task", triage=True)
+    payload = jsonlib.dumps(
+        {
+            "fanout": False,
+            "rationale": "single unit",
+            "title": "Specified task",
+            "body": "Concrete work",
+        }
+    )
+    client = _mock_client_returning(payload)
+    profiles = _patch_list_profiles(["orchestrator"])
+    config = {
+        "delegation": {
+            "gpt56_routing": {
+                "enabled": True,
+                "contract": "gpt56-routing-v3",
+                "provider": "openai-codex",
+                "max_children": 3,
+                "max_depth": 1,
+            }
+        }
+    }
+    for item in profiles:
+        item.start()
+    try:
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=(client, "gpt-5.6-terra"),
+        ), patch("hermes_cli.config.load_config", return_value=config):
+            outcome = decomp.decompose_task(tid)
+    finally:
+        for item in profiles:
+            item.stop()
+
+    assert outcome.ok, outcome.reason
+    assert client.chat.completions.create.call_args.kwargs["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "high",
+    }
+
+
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="just one thing", triage=True)

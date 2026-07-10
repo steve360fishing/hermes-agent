@@ -5134,7 +5134,8 @@ def get_text_auxiliary_client(
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
     provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
+    policy_spec = _get_gpt56_auxiliary_spec(task) if task else None
+    client, final_model = resolve_provider_client(
         provider,
         model=model,
         explicit_base_url=base_url,
@@ -5142,6 +5143,13 @@ def get_text_auxiliary_client(
         api_mode=api_mode,
         main_runtime=main_runtime,
     )
+    _log_gpt56_auxiliary_route(
+        task,
+        policy_spec,
+        provider=provider,
+        fallback_used=False,
+    )
+    return client, final_model
 
 
 def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None):
@@ -5449,13 +5457,15 @@ def resolve_vision_provider_client(
     return requested, client, final_model
 
 
-def get_auxiliary_extra_body() -> dict:
+def get_auxiliary_extra_body(task: str = "") -> dict:
     """Return extra_body kwargs for auxiliary API calls.
-    
+
     Includes Nous Portal product tags when the auxiliary client is backed
-    by Nous Portal. Returns empty dict otherwise.
+    by Nous Portal. When *task* is classified by the enabled GPT-5.6 policy,
+    its canonical reasoning effort is merged into the request body.
     """
-    return _nous_extra_body() if auxiliary_is_nous else {}
+    extra_body = _nous_extra_body() if auxiliary_is_nous else {}
+    return _apply_gpt56_auxiliary_reasoning(task, extra_body) if task else extra_body
 
 
 def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> dict:
@@ -5877,9 +5887,23 @@ def _get_gpt56_auxiliary_spec(task: str):
         if isinstance(delegation, dict)
         else {}
     )
-    from hermes_cli.gpt56_routing import auxiliary_spec, validate_operator_config
+    from hermes_cli.gpt56_routing import (
+        auxiliary_spec,
+        provider_locked_auxiliary_task,
+        validate_operator_config,
+    )
 
     if not validate_operator_config(routing):
+        return None
+
+    provider_lock = provider_locked_auxiliary_task(normalized_task)
+    if provider_lock is not None:
+        logger.info(
+            "Auxiliary task=%s provider_locked=true owner=%s complexity=%s",
+            normalized_task,
+            provider_lock["owner"],
+            provider_lock["complexity"],
+        )
         return None
 
     return auxiliary_spec(normalized_task)

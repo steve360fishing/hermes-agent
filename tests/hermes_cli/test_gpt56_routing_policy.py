@@ -63,6 +63,7 @@ def test_auxiliary_slots_match_the_accepted_policy() -> None:
         "vision": ("gpt-5.6-terra", "high"),
         "kanban_decomposer": ("gpt-5.6-terra", "high"),
         "approval": ("gpt-5.6-sol", "max"),
+        "goal_judge": ("gpt-5.6-sol", "max"),
         "curator": ("gpt-5.6-sol", "max"),
         "background_review": ("gpt-5.6-sol", "max"),
         "moa_aggregator": ("gpt-5.6-sol", "max"),

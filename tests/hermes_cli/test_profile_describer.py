@@ -166,3 +166,35 @@ def test_describer_returns_false_when_profile_missing(profile_env, monkeypatch):
     outcome = describer.describe_profile("ghost")
     assert outcome.ok is False
     assert "not found" in outcome.reason
+
+
+def test_describer_real_caller_receives_canonical_gpt56_effort(profile_env, monkeypatch):
+    monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
+    monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
+    monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
+    client = MagicMock()
+    client.chat.completions.create.return_value = _fake_aux_response(
+        jsonlib.dumps({"description": "routes profiles cheaply"})
+    )
+    config = {
+        "delegation": {
+            "gpt56_routing": {
+                "enabled": True,
+                "contract": "gpt56-routing-v3",
+                "provider": "openai-codex",
+                "max_children": 3,
+                "max_depth": 1,
+            }
+        }
+    }
+    with patch(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        return_value=(client, "gpt-5.6-luna"),
+    ), patch("hermes_cli.config.load_config", return_value=config):
+        outcome = describer.describe_profile("myprof")
+
+    assert outcome.ok, outcome.reason
+    assert client.chat.completions.create.call_args.kwargs["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "low",
+    }
