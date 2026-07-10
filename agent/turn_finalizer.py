@@ -469,7 +469,19 @@ def finalize_turn(
 
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
-    if final_response and not interrupted and (_should_review_memory or _should_review_skills):
+    try:
+        from agent.openrouter_fallback_guard import is_emergency_openrouter_fallback_active
+
+        openrouter_fallback_active = is_emergency_openrouter_fallback_active(agent)
+    except Exception:
+        openrouter_fallback_active = False
+
+    if (
+        final_response
+        and not interrupted
+        and not openrouter_fallback_active
+        and (_should_review_memory or _should_review_skills)
+    ):
         try:
             agent._spawn_background_review(
                 messages_snapshot=list(messages),

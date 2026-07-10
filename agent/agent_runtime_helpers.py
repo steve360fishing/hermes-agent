@@ -1274,6 +1274,17 @@ def restore_primary_runtime(agent) -> bool:
         # ── Reset fallback chain for the new turn ──
         agent._fallback_activated = False
         agent._fallback_index = 0
+        try:
+            from agent.openrouter_fallback_guard import (
+                restore_openrouter_fallback_state,
+            )
+
+            restore_openrouter_fallback_state(agent)
+        except Exception as guard_error:
+            logger.warning(
+                "Failed to restore OpenRouter fallback guard state: %s",
+                guard_error,
+            )
 
         # Reset the stale-call circuit breaker (#58962): the streak measured
         # the FALLBACK provider we're leaving; the restored primary deserves

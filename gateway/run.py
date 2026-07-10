@@ -107,6 +107,27 @@ def _gateway_surface_passes_raw_text(platform: Any) -> bool:
     return _gateway_platform_value(platform) in _GATEWAY_RAW_TEXT_PLATFORMS
 
 
+def _apply_openrouter_fallback_notice_to_result(
+    agent: Any, result: dict[str, Any]
+) -> None:
+    if not agent or not isinstance(result, dict):
+        return
+    try:
+        from agent.openrouter_fallback_guard import apply_openrouter_fallback_notice
+
+        final_response = result.get("final_response") or ""
+        guarded_response, changed = apply_openrouter_fallback_notice(
+            agent, final_response
+        )
+    except Exception:
+        logger.debug("OpenRouter fallback notice guard failed", exc_info=True)
+        return
+
+    if changed:
+        result["final_response"] = guarded_response
+        result["response_transformed"] = True
+
+
 _GATEWAY_PROVIDER_ERROR_RE = re.compile(
     r"("  # infrastructure/provider error preambles, not ordinary assistant prose
     r"api\s+(?:call\s+)?failed"
@@ -18807,7 +18828,33 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _conversation_kwargs["moa_config"] = moa_config
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
-                result = agent.run_conversation(_api_run_message, **_conversation_kwargs)
+                try:
+                    from agent.openrouter_fallback_guard import (
+                        fallback_cap_message_if_exhausted,
+                    )
+
+                    fallback_cap_message = fallback_cap_message_if_exhausted(agent)
+                except Exception:
+                    fallback_cap_message = None
+                if fallback_cap_message:
+                    result = {
+                        "final_response": fallback_cap_message,
+                        "messages": list(agent_history)
+                        + [
+                            {"role": "user", "content": message},
+                            {"role": "assistant", "content": fallback_cap_message},
+                        ],
+                        "api_calls": 0,
+                        "completed": True,
+                        "interrupted": False,
+                        "failed": False,
+                        "partial": False,
+                        "response_transformed": True,
+                    }
+                else:
+                    result = agent.run_conversation(
+                        _api_run_message, **_conversation_kwargs
+                    )
             finally:
                 unregister_gateway_notify(_approval_session_key)
                 # Cancel any pending clarify entries so blocked agent
@@ -18819,6 +18866,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     pass
                 reset_current_session_key(_approval_session_token)
+            _apply_openrouter_fallback_notice_to_result(agent_holder[0], result)
             result_holder[0] = result
 
             # Signal the stream consumer that the agent is done
@@ -19009,7 +19057,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     final_response = final_response + "\n" + "\n".join(unique_tags)
             
             # Auto-generate session title after first exchange (non-blocking)
-            if final_response and self._session_db:
+            try:
+                from agent.openrouter_fallback_guard import (
+                    is_emergency_openrouter_fallback_active,
+                )
+
+                openrouter_fallback_active = is_emergency_openrouter_fallback_active(
+                    agent
+                )
+            except Exception:
+                openrouter_fallback_active = False
+
+            if final_response and self._session_db and not openrouter_fallback_active:
                 try:
                     from agent.title_generator import maybe_auto_title
                     all_msgs = result_holder[0].get("messages", []) if result_holder[0] else []
