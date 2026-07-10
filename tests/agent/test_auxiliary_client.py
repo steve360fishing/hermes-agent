@@ -3,6 +3,7 @@
 import base64
 import json
 import logging
+import threading
 import time
 from types import SimpleNamespace
 from unittest.mock import patch, MagicMock, AsyncMock
@@ -42,6 +43,63 @@ def _jwt_with_claims(claims: dict) -> str:
     header = base64.urlsafe_b64encode(b'{"alg":"none","typ":"JWT"}').decode().rstrip("=")
     payload = base64.urlsafe_b64encode(json.dumps(claims).encode()).decode().rstrip("=")
     return f"{header}.{payload}.sig"
+
+
+@pytest.mark.parametrize("async_mode", [False, True])
+def test_concurrent_cache_miss_closes_losing_built_client(
+    monkeypatch, async_mode: bool
+) -> None:
+    """Two builders racing one key must not leak the losing SDK client."""
+    from agent import auxiliary_client as aux
+
+    aux.shutdown_cached_clients()
+    barrier = threading.Barrier(2)
+    built = []
+
+    class FakeLoop:
+        def is_closed(self):
+            return False
+
+    fake_loop = FakeLoop()
+    if async_mode:
+        monkeypatch.setattr("asyncio.get_event_loop", lambda: fake_loop)
+
+    def build(*_args, **_kwargs):
+        client = MagicMock(name=f"built-{len(built)}")
+        built.append(client)
+        barrier.wait(timeout=5)
+        return client, "model"
+
+    force_close = MagicMock()
+    monkeypatch.setattr(aux, "resolve_provider_client", build)
+    monkeypatch.setattr(aux, "_force_close_async_httpx", force_close)
+    results = []
+
+    def lookup():
+        results.append(
+            aux._get_cached_client(
+                "race-provider",
+                "model",
+                async_mode=async_mode,
+                api_key="test-key",
+            )[0]
+        )
+
+    threads = [threading.Thread(target=lookup) for _ in range(2)]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=5)
+
+    assert all(not thread.is_alive() for thread in threads)
+    assert len(built) == 2
+    assert results[0] is results[1]
+    winner = results[0]
+    loser = next(client for client in built if client is not winner)
+    force_close.assert_any_call(loser)
+    if not async_mode:
+        loser.close.assert_called_once()
+    aux.shutdown_cached_clients()
 
 
 class _FakeAnthropicStream:

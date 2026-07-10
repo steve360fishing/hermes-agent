@@ -10,6 +10,7 @@ from __future__ import annotations
 
 import json
 import os
+from unittest.mock import MagicMock
 
 import pytest
 
@@ -620,11 +621,25 @@ def test_complete_goal_mode_rejected_by_judge(monkeypatch, tmp_path):
 
     # Mock the judge to reject the completion. The gate only runs when a
     # judge is reachable, so force the availability probe True as well.
-    def mock_judge_goal(goal, last_response, *, timeout=30.0, subgoals=None):
-        return "continue", "missing verification evidence", False
+    def mock_judge_goal(
+        goal,
+        last_response,
+        *,
+        timeout=30.0,
+        subgoals=None,
+        _auxiliary_binding=None,
+    ):
+        return "continue", "missing verification evidence", False, None
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", mock_judge_goal)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: True)
+    monkeypatch.setattr(
+        "tools.kanban_tools._goal_judge_probe",
+        lambda: kt._GoalJudgeProbe(
+            binding=object(),
+            available=True,
+            policy_required=False,
+        ),
+    )
 
     # Attempt to complete should be rejected
     out = kt._handle_complete({"summary": "I did some stuff but not X"})
@@ -680,7 +695,10 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
         raise AssertionError("judge_goal must not run when no judge is available")
 
     monkeypatch.setattr("tools.kanban_tools.judge_goal", fail_if_called)
-    monkeypatch.setattr("tools.kanban_tools._goal_judge_available", lambda: False)
+    monkeypatch.setattr(
+        "tools.kanban_tools._goal_judge_probe",
+        lambda: kt._GoalJudgeProbe(available=False, policy_required=False),
+    )
 
     out = kt._handle_complete({"summary": "done enough"})
     d = json.loads(out)
@@ -691,6 +709,88 @@ def test_complete_goal_mode_allows_when_judge_unavailable(monkeypatch, tmp_path)
         assert kb.get_task(conn2, goal_task_id).status == "done"
     finally:
         conn2.close()
+
+
+def test_complete_goal_mode_rejects_unavailable_judge_when_gpt56_enabled(
+    monkeypatch,
+    tmp_path,
+):
+    """Protected goal judging may not disappear behind the legacy fail-open gate."""
+    from tools import kanban_tools as kt
+
+    task_id = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    enabled = {
+        "delegation": {
+            "gpt56_routing": {
+                "enabled": True,
+                "contract": "gpt56-routing-v3",
+                "provider": "openai-codex",
+                "max_children": 3,
+                "max_depth": 1,
+            }
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: enabled)
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: (None, None),
+    )
+
+    payload = json.loads(kt._handle_complete({"summary": "done enough"}))
+
+    assert "error" in payload
+    assert "goal judge" in payload["error"].lower()
+    assert "retry" in payload["error"].lower()
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).status == "running"
+    finally:
+        conn.close()
+
+
+def test_complete_goal_mode_rejects_judge_exception_when_gpt56_enabled(
+    monkeypatch,
+    tmp_path,
+):
+    from tools import kanban_tools as kt
+
+    task_id = _make_goal_mode_worker_env(monkeypatch, tmp_path)
+    enabled = {
+        "delegation": {
+            "gpt56_routing": {
+                "enabled": True,
+                "contract": "gpt56-routing-v3",
+                "provider": "openai-codex",
+                "max_children": 3,
+                "max_depth": 1,
+            }
+        }
+    }
+    monkeypatch.setattr("hermes_cli.config.load_config", lambda: enabled)
+    client = MagicMock()
+    client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
+    monkeypatch.setattr(
+        "agent.auxiliary_client.resolve_provider_client",
+        lambda *_args, **_kwargs: (client, "gpt-5.6-sol"),
+    )
+
+    def exploding_judge(*_args, **_kwargs):
+        raise RuntimeError("judge crashed")
+
+    monkeypatch.setattr(kt, "judge_goal", exploding_judge)
+    payload = json.loads(kt._handle_complete({"summary": "done enough"}))
+
+    assert "error" in payload
+    assert "goal judge" in payload["error"].lower()
+    assert "retry" in payload["error"].lower()
+    from hermes_cli import kanban_db as kb
+    conn = kb.connect()
+    try:
+        assert kb.get_task(conn, task_id).status == "running"
+    finally:
+        conn.close()
 
 
 def test_block_happy_path(worker_env):

@@ -41,14 +41,16 @@ Payment / credit exhaustion fallback:
 """
 
 import contextlib
+from copy import deepcopy
+from dataclasses import dataclass, field
 import json
 import logging
 import os
 import threading
 import time
 from pathlib import Path  # noqa: F401 — used by test mocks
-from types import SimpleNamespace
-from typing import Any, Dict, List, Optional, Tuple, TYPE_CHECKING
+from types import MappingProxyType, SimpleNamespace
+from typing import Any, Dict, Iterator, List, Mapping, Optional, Tuple, TYPE_CHECKING
 from urllib.parse import urlparse, parse_qs, urlunparse
 
 # NOTE: `from openai import OpenAI` is deliberately NOT at module top — the
@@ -108,6 +110,50 @@ from hermes_constants import OPENROUTER_BASE_URL
 from utils import base_url_host_matches, base_url_hostname, env_float, model_forces_max_completion_tokens, normalize_proxy_env_vars
 
 logger = logging.getLogger(__name__)
+
+
+@dataclass(frozen=True)
+class AuxiliaryRouteDecision:
+    """One immutable provider/model/policy decision from one config snapshot."""
+
+    task: str
+    provider: str
+    model: Optional[str]
+    base_url: Optional[str]
+    api_key: Optional[str] = field(repr=False)
+    api_mode: Optional[str]
+    policy_spec: Any = None
+    task_config: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    task_extra_body: Mapping[str, Any] = field(default_factory=dict, repr=False)
+    fallback_used: bool = False
+    fallback_source: str = ""
+
+    @property
+    def route_id(self) -> str:
+        return str(getattr(self.policy_spec, "route_id", "") or "")
+
+    @property
+    def effort(self) -> str:
+        return str(getattr(self.policy_spec, "effort", "") or "")
+
+
+@dataclass(frozen=True)
+class TextAuxiliaryClientBinding:
+    """Tuple-compatible client result carrying its immutable route decision."""
+
+    client: Any = field(repr=False)
+    model: Optional[str]
+    decision: AuxiliaryRouteDecision
+
+    def __iter__(self) -> Iterator[Any]:
+        yield self.client
+        yield self.model
+
+    def __len__(self) -> int:
+        return 2
+
+    def __getitem__(self, index: int) -> Any:
+        return (self.client, self.model)[index]
 
 
 # ── resolve_provider_client fall-through dedup ───────────────────────────
@@ -3372,6 +3418,7 @@ def _recover_provider_pool(provider: str, exc: Exception, *, failed_api_key: str
 
 def _retry_same_provider_sync(
     *,
+    route_decision: AuxiliaryRouteDecision,
     task: Optional[str],
     resolved_provider: str,
     resolved_model: Optional[str],
@@ -3394,6 +3441,7 @@ def _retry_same_provider_sync(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             async_mode=False,
+            _route_decision=route_decision,
         )
     else:
         retry_client, retry_model = _get_cached_client(
@@ -3409,6 +3457,12 @@ def _retry_same_provider_sync(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
 
+    _validate_routed_auxiliary_client(
+        route_decision,
+        retry_client,
+        retry_model or final_model,
+        actual_provider=resolved_provider,
+    )
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
         resolved_provider,
@@ -3430,6 +3484,7 @@ def _retry_same_provider_sync(
 
 async def _retry_same_provider_async(
     *,
+    route_decision: AuxiliaryRouteDecision,
     task: Optional[str],
     resolved_provider: str,
     resolved_model: Optional[str],
@@ -3451,6 +3506,7 @@ async def _retry_same_provider_async(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             async_mode=True,
+            _route_decision=route_decision,
         )
     else:
         retry_client, retry_model = _get_cached_client(
@@ -3466,6 +3522,12 @@ async def _retry_same_provider_async(
             f"Auxiliary {task or 'call'}: provider {resolved_provider} could not be rebuilt after recovery"
         )
 
+    _validate_routed_auxiliary_client(
+        route_decision,
+        retry_client,
+        retry_model or final_model,
+        actual_provider=resolved_provider,
+    )
     retry_base = str(getattr(retry_client, "base_url", "") or "")
     retry_kwargs = _build_call_kwargs(
         resolved_provider,
@@ -3583,11 +3645,63 @@ def _auth_refresh_provider_for_route(
     return normalized
 
 
+def _fallback_provider_id(source_label: str) -> str:
+    """Extract the request provider without using the display label on wire."""
+    normalized = str(source_label or "").strip()
+    if normalized.endswith(")") and "(" in normalized:
+        candidate = normalized.rsplit("(", 1)[1][:-1].strip()
+        if candidate:
+            return _normalize_aux_provider(candidate)
+    return _normalize_aux_provider(normalized)
+
+
+def _fallback_request_extra_body(
+    extra_body: Optional[Dict[str, Any]],
+    *,
+    provider_id: str,
+    model: Optional[str],
+) -> Dict[str, Any]:
+    """Remove GPT-only request fields before a heterogeneous fallback."""
+    body = deepcopy(extra_body or {})
+    normalized_provider = _normalize_aux_provider(provider_id)
+    normalized_model = str(model or "").strip().lower()
+    if normalized_provider != "openai-codex" or not normalized_model.startswith("gpt-"):
+        body.pop("reasoning", None)
+    return body
+
+
+def _report_fallback_attempt(
+    *,
+    task: str,
+    policy_spec: Any,
+    provider_id: str,
+    source_label: str,
+    succeeded: bool,
+) -> None:
+    """Report fallback_used only after a candidate returned a valid result."""
+    if not succeeded:
+        logger.warning(
+            "Auxiliary %s fallback attempt failed provider=%s source=%s",
+            task or "call",
+            provider_id or "unknown",
+            source_label or "unknown",
+        )
+        return
+    _log_gpt56_auxiliary_route(
+        task,
+        policy_spec,
+        provider=provider_id,
+        fallback_used=True,
+        fallback_source=source_label,
+    )
+
+
 def _call_fallback_candidate_sync(
     fb_client: Any,
     fb_model: Optional[str],
-    fb_label: str,
     *,
+    provider_id: str,
+    source_label: str,
     task: Optional[str],
     messages: list,
     temperature: Optional[float],
@@ -3612,18 +3726,23 @@ def _call_fallback_candidate_sync(
     caller can continue to the next fallback layer. Non-auth errors raise.
     """
     fb_base = str(getattr(fb_client, "base_url", "") or "")
+    fallback_extra_body = _fallback_request_extra_body(
+        effective_extra_body,
+        provider_id=provider_id,
+        model=fb_model,
+    )
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
+        provider_id, fb_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, base_url=fb_base)
+        extra_body=fallback_extra_body, base_url=fb_base)
     try:
         return _validate_llm_response(
             fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
+        fb_provider = _auth_refresh_provider_for_route(provider_id, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(fb_provider, fb_model)
             if retry_client is not None:
@@ -3631,7 +3750,7 @@ def _call_fallback_candidate_sync(
                     fb_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=fallback_extra_body,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
                 try:
                     return _validate_llm_response(
@@ -3643,11 +3762,11 @@ def _call_fallback_candidate_sync(
         # the token is dead (expired setup token with no refresh token).
         # Quarantine the candidate so subsequent chain walks skip it, and
         # let the caller move on instead of aborting the whole task.
-        _mark_provider_unhealthy(fb_provider or fb_label)
+        _mark_provider_unhealthy(fb_provider or provider_id)
         logger.warning(
             "Auxiliary %s: fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            task or "call", source_label, fb_err,
         )
         return None
 
@@ -3655,8 +3774,9 @@ def _call_fallback_candidate_sync(
 async def _call_fallback_candidate_async(
     fb_client: Any,
     fb_model: Optional[str],
-    fb_label: str,
     *,
+    provider_id: str,
+    source_label: str,
     task: Optional[str],
     messages: list,
     temperature: Optional[float],
@@ -3667,18 +3787,23 @@ async def _call_fallback_candidate_async(
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
     fb_base = str(getattr(fb_client, "base_url", "") or "")
+    fallback_extra_body = _fallback_request_extra_body(
+        effective_extra_body,
+        provider_id=provider_id,
+        model=fb_model,
+    )
     fb_kwargs = _build_call_kwargs(
-        fb_label, fb_model, messages,
+        provider_id, fb_model, messages,
         temperature=temperature, max_tokens=max_tokens,
         tools=tools, timeout=effective_timeout,
-        extra_body=effective_extra_body, base_url=fb_base)
+        extra_body=fallback_extra_body, base_url=fb_base)
     try:
         return _validate_llm_response(
             await fb_client.chat.completions.create(**fb_kwargs), task)
     except Exception as fb_err:
         if not _is_auth_error(fb_err):
             raise
-        fb_provider = _auth_refresh_provider_for_route(fb_label, fb_base)
+        fb_provider = _auth_refresh_provider_for_route(provider_id, fb_base)
         if fb_provider not in {"auto", "", None} and _refresh_provider_credentials(fb_provider):
             retry_client, retry_model = _get_cached_client(
                 fb_provider, fb_model, async_mode=True)
@@ -3687,7 +3812,7 @@ async def _call_fallback_candidate_async(
                     fb_provider, retry_model or fb_model, messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, timeout=effective_timeout,
-                    extra_body=effective_extra_body,
+                    extra_body=fallback_extra_body,
                     base_url=str(getattr(retry_client, "base_url", "") or fb_base))
                 try:
                     return _validate_llm_response(
@@ -3695,11 +3820,11 @@ async def _call_fallback_candidate_async(
                 except Exception as retry_err:
                     if not _is_auth_error(retry_err):
                         raise
-        _mark_provider_unhealthy(fb_provider or fb_label)
+        _mark_provider_unhealthy(fb_provider or provider_id)
         logger.warning(
             "Auxiliary %s (async): fallback candidate %s has a stale/unrefreshable "
             "credential (%s) — skipping to next fallback",
-            task or "call", fb_label, fb_err,
+            task or "call", source_label, fb_err,
         )
         return None
 
@@ -3890,6 +4015,8 @@ def _try_configured_fallback_chain(
     task: str,
     failed_provider: str,
     reason: str = "error",
+    *,
+    task_config: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try user-configured fallback_chain for a specific auxiliary task.
 
@@ -3903,8 +4030,12 @@ def _try_configured_fallback_chain(
     if not task:
         return None, None, ""
 
-    task_config = _get_auxiliary_task_config(task)
-    chain = task_config.get("fallback_chain")
+    bound_config = (
+        task_config
+        if task_config is not None
+        else _get_auxiliary_task_config(task)
+    )
+    chain = bound_config.get("fallback_chain")
     if not chain or not isinstance(chain, list):
         return None, None, ""
 
@@ -3960,6 +4091,8 @@ def _try_configured_fallback_chain(
 def _try_configured_fallback_for_unavailable_client(
     task: Optional[str],
     failed_provider: str,
+    *,
+    task_config: Optional[Mapping[str, Any]] = None,
 ) -> Tuple[Optional[Any], Optional[str], str]:
     """Try task fallback_chain when an explicit aux provider cannot build.
 
@@ -3972,10 +4105,12 @@ def _try_configured_fallback_for_unavailable_client(
     explicit = (failed_provider or "").strip().lower()
     if not task or not explicit or explicit in {"auto"}:
         return None, None, ""
+    kwargs = {"task_config": task_config} if task_config is not None else {}
     return _try_configured_fallback_chain(
         task,
         explicit,
         reason="provider unavailable",
+        **kwargs,
     )
 
 
@@ -5123,7 +5258,7 @@ def get_text_auxiliary_client(
     task: str = "",
     *,
     main_runtime: Optional[Dict[str, Any]] = None,
-) -> Tuple[Optional[OpenAI], Optional[str]]:
+) -> TextAuxiliaryClientBinding:
     """Return (client, default_model_slug) for text-only auxiliary tasks.
 
     Args:
@@ -5133,23 +5268,23 @@ def get_text_auxiliary_client(
     Callers may override the returned model via config.yaml
     (e.g. auxiliary.compression.model, auxiliary.web_extract.model).
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    policy_spec = _get_gpt56_auxiliary_spec(task) if task else None
+    decision = resolve_auxiliary_route_decision(task or None)
     client, final_model = resolve_provider_client(
-        provider,
-        model=model,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
+        decision.provider,
+        model=decision.model,
+        explicit_base_url=decision.base_url,
+        explicit_api_key=decision.api_key,
+        api_mode=decision.api_mode,
         main_runtime=main_runtime,
     )
+    _validate_routed_auxiliary_client(decision, client, final_model)
     _log_gpt56_auxiliary_route(
         task,
-        policy_spec,
-        provider=provider,
+        decision.policy_spec,
+        provider=decision.provider,
         fallback_used=False,
     )
-    return client, final_model
+    return TextAuxiliaryClientBinding(client, final_model, decision)
 
 
 def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Dict[str, Any]] = None):
@@ -5159,16 +5294,24 @@ def get_async_text_auxiliary_client(task: str = "", *, main_runtime: Optional[Di
     (AsyncCodexAuxiliaryClient, model) which wraps the Responses API.
     Returns (None, None) when no provider is available.
     """
-    provider, model, base_url, api_key, api_mode = _resolve_task_provider_model(task or None)
-    return resolve_provider_client(
-        provider,
-        model=model,
+    decision = resolve_auxiliary_route_decision(task or None)
+    client, final_model = resolve_provider_client(
+        decision.provider,
+        model=decision.model,
         async_mode=True,
-        explicit_base_url=base_url,
-        explicit_api_key=api_key,
-        api_mode=api_mode,
+        explicit_base_url=decision.base_url,
+        explicit_api_key=decision.api_key,
+        api_mode=decision.api_mode,
         main_runtime=main_runtime,
     )
+    _validate_routed_auxiliary_client(decision, client, final_model)
+    _log_gpt56_auxiliary_route(
+        task,
+        decision.policy_spec,
+        provider=decision.provider,
+        fallback_used=False,
+    )
+    return TextAuxiliaryClientBinding(client, final_model, decision)
 
 
 _VISION_AUTO_PROVIDER_ORDER = (
@@ -5271,6 +5414,7 @@ def resolve_vision_provider_client(
     base_url: Optional[str] = None,
     api_key: Optional[str] = None,
     async_mode: bool = False,
+    _route_decision: Optional[AuxiliaryRouteDecision] = None,
 ) -> Tuple[Optional[str], Optional[Any], Optional[str]]:
     """Resolve the client actually used for vision tasks.
 
@@ -5279,9 +5423,18 @@ def resolve_vision_provider_client(
     backends, so users can intentionally force experimental providers. Auto mode
     stays conservative and only tries vision backends known to work today.
     """
-    requested, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        "vision", provider, model, base_url, api_key
+    decision = _route_decision or resolve_auxiliary_route_decision(
+        "vision",
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
     )
+    requested = decision.provider
+    resolved_model = decision.model
+    resolved_base_url = decision.base_url
+    resolved_api_key = decision.api_key
+    resolved_api_mode = decision.api_mode
     requested = _normalize_vision_provider(requested)
 
     def _finalize(resolved_provider: str, sync_client: Any, default_model: Optional[str]):
@@ -5457,15 +5610,23 @@ def resolve_vision_provider_client(
     return requested, client, final_model
 
 
-def get_auxiliary_extra_body(task: str = "") -> dict:
+def get_auxiliary_extra_body(
+    task: str = "",
+    *,
+    decision: Optional[AuxiliaryRouteDecision] = None,
+) -> dict:
     """Return extra_body kwargs for auxiliary API calls.
 
     Includes Nous Portal product tags when the auxiliary client is backed
     by Nous Portal. When *task* is classified by the enabled GPT-5.6 policy,
     its canonical reasoning effort is merged into the request body.
     """
-    extra_body = _nous_extra_body() if auxiliary_is_nous else {}
-    return _apply_gpt56_auxiliary_reasoning(task, extra_body) if task else extra_body
+    if not task:
+        return _nous_extra_body() if auxiliary_is_nous else {}
+    bound = decision or resolve_auxiliary_route_decision(task)
+    if bound.task != str(task or "").strip():
+        raise ValueError("auxiliary route decision task does not match request task")
+    return _extra_body_from_decision(bound, include_nous_tags=True)
 
 
 def auxiliary_max_tokens_param(value: int, *, model: Optional[str] = None) -> dict:
@@ -5833,6 +5994,7 @@ def _get_cached_client(
         # For async clients, remember which loop they were created on so we
         # can detect stale entries later.
         bound_loop = current_loop
+        losing_client = None
         with _client_cache_lock:
             if cache_key not in _client_cache:
                 # Safety belt: if the cache has grown beyond the max, evict
@@ -5843,7 +6005,20 @@ def _get_cached_client(
                     del _client_cache[evict_key]
                 _client_cache[cache_key] = (client, default_model, bound_loop)
             else:
+                losing_client = client
                 client, default_model, _ = _client_cache[cache_key]
+        if losing_client is not None and losing_client is not client:
+            # Two threads can build the same key outside the lock. The winner
+            # is cached; the losing SDK client must be explicitly disposed.
+            _force_close_async_httpx(losing_client)
+            try:
+                import inspect
+
+                close_fn = getattr(losing_client, "close", None)
+                if callable(close_fn) and not inspect.iscoroutinefunction(close_fn):
+                    close_fn()
+            except Exception:
+                logger.debug("Failed to close uncached auxiliary client", exc_info=True)
     return client, model or default_model
 
 
@@ -5863,8 +6038,24 @@ _AUX_DIRECT_API_BASE_URLS: Dict[str, str] = {
     "openai": "https://api.openai.com/v1",
 }
 
+_CONFIG_UNSET = object()
 
-def _get_gpt56_auxiliary_spec(task: str):
+
+def _load_auxiliary_config_snapshot(task: str) -> Dict[str, Any]:
+    """Load one config snapshot; only a missing shared loader is legacy-safe."""
+    if not task:
+        return {}
+    try:
+        from hermes_cli.config import load_config
+    except ImportError:
+        return {}
+    config = load_config()
+    if not isinstance(config, dict):
+        raise TypeError("Hermes config loader returned a non-mapping value")
+    return config
+
+
+def _get_gpt56_auxiliary_spec(task: str, *, config: Any = _CONFIG_UNSET):
     """Return Steve's enabled GPT-5.6 route for an auxiliary slot.
 
     ``session_search`` is intentionally ignored: it is an obsolete slot kept
@@ -5875,12 +6066,8 @@ def _get_gpt56_auxiliary_spec(task: str):
     normalized_task = str(task or "").strip()
     if not normalized_task or normalized_task == "session_search":
         return None
-    try:
-        from hermes_cli.config import load_config
-
-        config = load_config()
-    except ImportError:
-        return None
+    if config is _CONFIG_UNSET:
+        config = _load_auxiliary_config_snapshot(normalized_task)
     delegation = config.get("delegation", {}) if isinstance(config, dict) else {}
     routing = (
         delegation.get("gpt56_routing", {})
@@ -5909,14 +6096,21 @@ def _get_gpt56_auxiliary_spec(task: str):
     return auxiliary_spec(normalized_task)
 
 
+_ROUTING_SPEC_UNSET = object()
+
+
 def _apply_gpt56_auxiliary_reasoning(
     task: str,
     extra_body: Optional[Dict[str, Any]],
     *,
-    spec=None,
+    spec: Any = _ROUTING_SPEC_UNSET,
 ) -> Dict[str, Any]:
     """Pin a routed auxiliary call to its canonical reasoning effort."""
-    resolved_spec = spec if spec is not None else _get_gpt56_auxiliary_spec(task)
+    resolved_spec = (
+        _get_gpt56_auxiliary_spec(task)
+        if spec is _ROUTING_SPEC_UNSET
+        else spec
+    )
     merged = dict(extra_body or {})
     if resolved_spec is not None:
         merged["reasoning"] = {
@@ -5932,18 +6126,20 @@ def _log_gpt56_auxiliary_route(
     *,
     provider: Optional[str],
     fallback_used: bool,
+    fallback_source: str = "",
 ) -> None:
     if spec is None:
         return
     logger.info(
         "GPT-5.6 auxiliary route task=%s route_id=%s model_alias=%s "
-        "effort=%s provider=%s fallback_used=%s",
+        "effort=%s provider=%s fallback_used=%s fallback_source=%s",
         task,
         spec.route_id,
         spec.model_alias,
         spec.effort,
         provider or spec.provider,
         str(bool(fallback_used)).lower(),
+        fallback_source or "none",
     )
 
 
@@ -5953,6 +6149,11 @@ def _resolve_task_provider_model(
     model: str = None,
     base_url: str = None,
     api_key: str = None,
+    *,
+    _config: Any = _CONFIG_UNSET,
+    _task_config: Any = _CONFIG_UNSET,
+    _routing_spec: Any = _CONFIG_UNSET,
+    _policy_authoritative: bool = False,
 ) -> Tuple[str, Optional[str], Optional[str], Optional[str], Optional[str]]:
     """Determine provider + model for a call.
 
@@ -5975,16 +6176,31 @@ def _resolve_task_provider_model(
     cfg_api_mode = None
 
     if task:
-        task_config = _get_auxiliary_task_config(task)
+        if _config is _CONFIG_UNSET:
+            _config = _load_auxiliary_config_snapshot(task)
+        task_config = (
+            _get_auxiliary_task_config(task, config=_config)
+            if _task_config is _CONFIG_UNSET
+            else _task_config
+        )
         cfg_provider = str(task_config.get("provider", "")).strip() or None
         cfg_model = str(task_config.get("model", "")).strip() or None
         cfg_base_url = str(task_config.get("base_url", "")).strip() or None
         cfg_api_key = str(task_config.get("api_key", "")).strip() or None
         cfg_api_mode = str(task_config.get("api_mode", "")).strip() or None
 
-        routing_spec = _get_gpt56_auxiliary_spec(task)
+        routing_spec = (
+            _get_gpt56_auxiliary_spec(task, config=_config)
+            if _routing_spec is _CONFIG_UNSET
+            else _routing_spec
+        )
         explicit_override = any((provider, model, base_url, api_key))
-        if routing_spec is not None and routing_spec.protected and explicit_override:
+        if (
+            routing_spec is not None
+            and routing_spec.protected
+            and explicit_override
+            and not _policy_authoritative
+        ):
             mismatches = []
             if provider and str(provider).strip() != routing_spec.provider:
                 mismatches.append(f"provider must be {routing_spec.provider!r}")
@@ -6106,6 +6322,138 @@ def _resolve_task_provider_model(
     return "auto", resolved_model, None, None, resolved_api_mode
 
 
+def _freeze_route_value(value: Any) -> Any:
+    if isinstance(value, dict):
+        return MappingProxyType(
+            {str(key): _freeze_route_value(item) for key, item in value.items()}
+        )
+    if isinstance(value, list):
+        return tuple(_freeze_route_value(item) for item in value)
+    return value
+
+
+def _thaw_route_value(value: Any) -> Any:
+    if isinstance(value, Mapping):
+        return {key: _thaw_route_value(item) for key, item in value.items()}
+    if isinstance(value, tuple):
+        return [_thaw_route_value(item) for item in value]
+    return deepcopy(value)
+
+
+def resolve_auxiliary_route_decision(
+    task: str = None,
+    *,
+    provider: str = None,
+    model: str = None,
+    base_url: str = None,
+    api_key: str = None,
+    api_mode: str = None,
+    policy_authoritative: bool = False,
+    _config: Any = _CONFIG_UNSET,
+) -> AuxiliaryRouteDecision:
+    """Resolve one auxiliary request from exactly one config snapshot."""
+    normalized_task = str(task or "").strip()
+    config = (
+        _load_auxiliary_config_snapshot(normalized_task)
+        if _config is _CONFIG_UNSET
+        else _config
+    )
+    if not isinstance(config, dict):
+        raise TypeError("Hermes config snapshot must be a mapping")
+    task_config = (
+        _get_auxiliary_task_config(normalized_task, config=config)
+        if normalized_task
+        else {}
+    )
+    policy_spec = (
+        _get_gpt56_auxiliary_spec(normalized_task, config=config)
+        if normalized_task
+        else None
+    )
+    (
+        resolved_provider,
+        resolved_model,
+        resolved_base_url,
+        resolved_api_key,
+        resolved_api_mode,
+    ) = _resolve_task_provider_model(
+        normalized_task or None,
+        provider,
+        model,
+        base_url,
+        api_key,
+        _config=config,
+        _task_config=task_config,
+        _routing_spec=policy_spec,
+        _policy_authoritative=policy_authoritative,
+    )
+    if api_mode:
+        if (
+            policy_spec is not None
+            and api_mode != "codex_responses"
+            and not policy_authoritative
+        ):
+            raise ValueError(
+                f"GPT-5.6 auxiliary route '{normalized_task}' requires "
+                "api_mode='codex_responses'"
+            )
+        resolved_api_mode = (
+            "codex_responses" if policy_spec is not None else api_mode
+        )
+
+    raw_extra_body = task_config.get("extra_body")
+    task_extra_body = raw_extra_body if isinstance(raw_extra_body, dict) else {}
+    return AuxiliaryRouteDecision(
+        task=normalized_task,
+        provider=resolved_provider,
+        model=resolved_model,
+        base_url=resolved_base_url,
+        api_key=resolved_api_key,
+        api_mode=resolved_api_mode,
+        policy_spec=policy_spec,
+        task_config=_freeze_route_value(dict(task_config)),
+        task_extra_body=_freeze_route_value(dict(task_extra_body)),
+    )
+
+
+def _validate_routed_auxiliary_client(
+    decision: AuxiliaryRouteDecision,
+    client: Any,
+    final_model: Optional[str],
+    *,
+    actual_provider: Optional[str] = None,
+) -> None:
+    spec = decision.policy_spec
+    if spec is None or client is None:
+        return
+    from hermes_cli.gpt56_routing import validate_codex_route_runtime
+
+    validate_codex_route_runtime(
+        spec,
+        provider=actual_provider or decision.provider,
+        model=final_model,
+        api_mode=decision.api_mode,
+        base_url=getattr(client, "base_url", None),
+        api_key=getattr(client, "api_key", None),
+    )
+
+
+def _extra_body_from_decision(
+    decision: AuxiliaryRouteDecision,
+    caller_extra_body: Optional[Dict[str, Any]] = None,
+    *,
+    include_nous_tags: bool = False,
+) -> Dict[str, Any]:
+    merged = _nous_extra_body() if include_nous_tags and auxiliary_is_nous else {}
+    merged.update(_thaw_route_value(decision.task_extra_body))
+    merged.update(caller_extra_body or {})
+    return _apply_gpt56_auxiliary_reasoning(
+        decision.task,
+        merged,
+        spec=decision.policy_spec,
+    )
+
+
 _DEFAULT_AUX_TIMEOUT = 30.0
 
 # Compression summarises large conversation histories; a reasoning auxiliary
@@ -6120,7 +6468,11 @@ _DEFAULT_AUX_TIMEOUT = 30.0
 _COMPRESSION_TIMEOUT_FLOOR_SECONDS = 300.0
 
 
-def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
+def _get_auxiliary_task_config(
+    task: str,
+    *,
+    config: Any = _CONFIG_UNSET,
+) -> Dict[str, Any]:
     """Return the config dict for auxiliary.<task>, or {} when unavailable.
 
     For plugin-registered auxiliary tasks (see
@@ -6134,11 +6486,8 @@ def _get_auxiliary_task_config(task: str) -> Dict[str, Any]:
     """
     if not task:
         return {}
-    try:
-        from hermes_cli.config import load_config
-        config = load_config()
-    except ImportError:
-        return {}
+    if config is _CONFIG_UNSET:
+        config = _load_auxiliary_config_snapshot(task)
     aux = config.get("auxiliary", {}) if isinstance(config, dict) else {}
     task_config = aux.get(task, {}) if isinstance(aux, dict) else {}
     if not isinstance(task_config, dict):
@@ -6178,7 +6527,12 @@ def _get_task_timeout(task: str, default: float = _DEFAULT_AUX_TIMEOUT) -> float
     return default
 
 
-def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
+def _effective_aux_timeout(
+    task: str,
+    timeout: Optional[float],
+    *,
+    task_config: Optional[Mapping[str, Any]] = None,
+) -> float:
     """Resolve the effective timeout for an auxiliary LLM call.
 
     Uses the caller-provided ``timeout`` when given; otherwise reads
@@ -6189,7 +6543,20 @@ def _effective_aux_timeout(task: str, timeout: Optional[float]) -> float:
     explicit ``timeout=`` — explicit per-call deadlines are always honoured —
     and it is a minimum (``max``), so a config value already above it is kept.
     """
-    effective = timeout if timeout is not None else _get_task_timeout(task)
+    if timeout is not None:
+        effective = timeout
+    elif task_config is not None:
+        raw_timeout = task_config.get("timeout")
+        try:
+            effective = (
+                float(raw_timeout)
+                if raw_timeout is not None
+                else _DEFAULT_AUX_TIMEOUT
+            )
+        except (TypeError, ValueError):
+            effective = _DEFAULT_AUX_TIMEOUT
+    else:
+        effective = _get_task_timeout(task)
     if timeout is None and task == "compression":
         effective = max(effective, _COMPRESSION_TIMEOUT_FLOOR_SECONDS)
     return effective
@@ -6521,6 +6888,8 @@ def call_llm(
     api_mode: str = None,
     stream: bool = False,
     stream_options: dict = None,
+    _route_decision: Optional[AuxiliaryRouteDecision] = None,
+    _policy_authoritative: bool = False,
 ) -> Any:
     """Centralized synchronous LLM call.
 
@@ -6555,28 +6924,29 @@ def call_llm(
     Raises:
         RuntimeError: If no provider is configured.
     """
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
-    policy_spec = _get_gpt56_auxiliary_spec(task)
-    gpt56_spec = policy_spec
-    if api_mode:
-        if (
-            gpt56_spec is not None
-            and api_mode != "codex_responses"
-        ):
-            raise ValueError(
-                f"GPT-5.6 auxiliary route '{task}' requires "
-                "api_mode='codex_responses'"
-            )
-        resolved_api_mode = api_mode
-    effective_extra_body = _get_task_extra_body(task)
-    effective_extra_body.update(extra_body or {})
-    if gpt56_spec is not None:
-        effective_extra_body = _apply_gpt56_auxiliary_reasoning(
-            task,
-            effective_extra_body,
-            spec=gpt56_spec,
-        )
+    decision = _route_decision or resolve_auxiliary_route_decision(
+        task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        api_mode=api_mode,
+        policy_authoritative=_policy_authoritative,
+    )
+    if decision.task != str(task or "").strip():
+        raise ValueError("auxiliary route decision task does not match request task")
+    resolved_provider = decision.provider
+    resolved_model = decision.model
+    resolved_base_url = decision.base_url
+    resolved_api_key = decision.api_key
+    resolved_api_mode = decision.api_mode
+    gpt56_spec = decision.policy_spec
+    fallback_config_kwargs = (
+        {"task_config": decision.task_config} if gpt56_spec is not None else {}
+    )
+    pending_fallback_source = ""
+    pending_fallback_provider = ""
+    effective_extra_body = _extra_body_from_decision(decision, extra_body)
     _log_gpt56_auxiliary_route(
         task,
         gpt56_spec,
@@ -6592,6 +6962,7 @@ def call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             async_mode=False,
+            _route_decision=decision,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
             logger.warning(
@@ -6610,13 +6981,16 @@ def call_llm(
                 f"Run: hermes setup"
             )
         resolved_provider = effective_provider or resolved_provider
-        if vision_fallback_used:
-            _log_gpt56_auxiliary_route(
-                task,
-                gpt56_spec,
-                provider=resolved_provider,
-                fallback_used=True,
+        if not vision_fallback_used:
+            _validate_routed_auxiliary_client(
+                decision,
+                client,
+                final_model,
+                actual_provider=resolved_provider,
             )
+        if vision_fallback_used:
+            pending_fallback_provider = _normalize_aux_provider(resolved_provider)
+            pending_fallback_source = f"vision-auto({pending_fallback_provider})"
     else:
         client, final_model = _get_cached_client(
             resolved_provider,
@@ -6625,6 +6999,12 @@ def call_llm(
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
             main_runtime=main_runtime,
+        )
+        _validate_routed_auxiliary_client(
+            decision,
+            client,
+            final_model,
+            actual_provider=resolved_provider,
         )
         if client is None:
             # When the user explicitly chose a non-OpenRouter provider but no
@@ -6640,17 +7020,13 @@ def call_llm(
                         "and cannot fall back to a cheaper or different model."
                     )
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, **fallback_config_kwargs,
                 )
                 if fb_client is not None:
                     client, final_model = fb_client, fb_model
-                    resolved_provider = fb_label or resolved_provider
-                    _log_gpt56_auxiliary_route(
-                        task,
-                        gpt56_spec,
-                        provider=resolved_provider,
-                        fallback_used=True,
-                    )
+                    pending_fallback_source = fb_label
+                    pending_fallback_provider = _fallback_provider_id(fb_label)
+                    resolved_provider = pending_fallback_provider or resolved_provider
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -6671,7 +7047,11 @@ def call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = _effective_aux_timeout(
+        task,
+        timeout,
+        task_config=decision.task_config,
+    )
 
     # Log what we're about to do — makes auxiliary operations visible
     _base_info = str(getattr(client, "base_url", resolved_base_url) or "")
@@ -6728,8 +7108,17 @@ def call_llm(
         # ``first_err`` and the existing fallback handling unchanged. Unified home
         # for the transient retry every auxiliary task shares. (PR #16587)
         try:
-            return _validate_llm_response(
+            initial_response = _validate_llm_response(
                 client.chat.completions.create(**kwargs), task)
+            if pending_fallback_source:
+                _report_fallback_attempt(
+                    task=task,
+                    policy_spec=gpt56_spec,
+                    provider_id=pending_fallback_provider,
+                    source_label=pending_fallback_source,
+                    succeeded=True,
+                )
+            return initial_response
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -6925,6 +7314,7 @@ def call_llm(
                     task or "call", auth_refresh_provider,
                 )
                 return _retry_same_provider_sync(
+                    route_decision=decision,
                     task=task,
                     resolved_provider=auth_refresh_provider,
                     resolved_model=resolved_model or final_model,
@@ -6967,6 +7357,7 @@ def call_llm(
                 )
                 try:
                     return _retry_same_provider_sync(
+                        route_decision=decision,
                         task=task,
                         resolved_provider=resolved_provider,
                         resolved_model=resolved_model,
@@ -7086,7 +7477,8 @@ def call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    **fallback_config_kwargs)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -7095,39 +7487,61 @@ def call_llm(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    **fallback_config_kwargs)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
-                _log_gpt56_auxiliary_route(
-                    task,
-                    gpt56_spec,
-                    provider=fb_label,
-                    fallback_used=True,
-                )
+                fb_provider_id = _fallback_provider_id(fb_label)
                 fb_resp = _call_fallback_candidate_sync(
-                    fb_client, fb_model, fb_label,
+                    fb_client, fb_model,
+                    provider_id=fb_provider_id,
+                    source_label=fb_label,
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body)
                 if fb_resp is not None:
+                    _report_fallback_attempt(
+                        task=task,
+                        policy_spec=gpt56_spec,
+                        provider_id=fb_provider_id,
+                        source_label=fb_label,
+                        succeeded=True,
+                    )
                     return fb_resp
+                _report_fallback_attempt(
+                    task=task,
+                    policy_spec=gpt56_spec,
+                    provider_id=fb_provider_id,
+                    source_label=fb_label,
+                    succeeded=False,
+                )
                 # The candidate had a stale/unrefreshable credential and was
                 # quarantined — walk the discovery chain once more; unhealthy
                 # entries are skipped so the next viable candidate serves.
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
+                    fb_provider_id = _fallback_provider_id(fb_label)
                     fb_resp = _call_fallback_candidate_sync(
-                        fb_client, fb_model, fb_label,
+                        fb_client, fb_model,
+                        provider_id=fb_provider_id,
+                        source_label=fb_label,
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body)
                     if fb_resp is not None:
+                        _report_fallback_attempt(
+                            task=task,
+                            policy_spec=gpt56_spec,
+                            provider_id=fb_provider_id,
+                            source_label=fb_label,
+                            succeeded=True,
+                        )
                         return fb_resp
             # All fallback layers exhausted — emit a single user-visible
             # warning so the operator knows aux task is about to fail.
@@ -7228,23 +7642,35 @@ async def async_call_llm(
     tools: list = None,
     timeout: float = None,
     extra_body: dict = None,
+    _route_decision: Optional[AuxiliaryRouteDecision] = None,
+    _policy_authoritative: bool = False,
 ) -> Any:
     """Centralized asynchronous LLM call.
 
     Same as call_llm() but async. See call_llm() for full documentation.
     """
-    resolved_provider, resolved_model, resolved_base_url, resolved_api_key, resolved_api_mode = _resolve_task_provider_model(
-        task, provider, model, base_url, api_key)
-    policy_spec = _get_gpt56_auxiliary_spec(task)
-    gpt56_spec = policy_spec
-    effective_extra_body = _get_task_extra_body(task)
-    effective_extra_body.update(extra_body or {})
-    if gpt56_spec is not None:
-        effective_extra_body = _apply_gpt56_auxiliary_reasoning(
-            task,
-            effective_extra_body,
-            spec=gpt56_spec,
-        )
+    decision = _route_decision or resolve_auxiliary_route_decision(
+        task,
+        provider=provider,
+        model=model,
+        base_url=base_url,
+        api_key=api_key,
+        policy_authoritative=_policy_authoritative,
+    )
+    if decision.task != str(task or "").strip():
+        raise ValueError("auxiliary route decision task does not match request task")
+    resolved_provider = decision.provider
+    resolved_model = decision.model
+    resolved_base_url = decision.base_url
+    resolved_api_key = decision.api_key
+    resolved_api_mode = decision.api_mode
+    gpt56_spec = decision.policy_spec
+    fallback_config_kwargs = (
+        {"task_config": decision.task_config} if gpt56_spec is not None else {}
+    )
+    pending_fallback_source = ""
+    pending_fallback_provider = ""
+    effective_extra_body = _extra_body_from_decision(decision, extra_body)
     _log_gpt56_auxiliary_route(
         task,
         gpt56_spec,
@@ -7260,6 +7686,7 @@ async def async_call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             async_mode=True,
+            _route_decision=decision,
         )
         if client is None and resolved_provider != "auto" and not resolved_base_url:
             logger.warning(
@@ -7278,13 +7705,16 @@ async def async_call_llm(
                 f"Run: hermes setup"
             )
         resolved_provider = effective_provider or resolved_provider
-        if vision_fallback_used:
-            _log_gpt56_auxiliary_route(
-                task,
-                gpt56_spec,
-                provider=resolved_provider,
-                fallback_used=True,
+        if not vision_fallback_used:
+            _validate_routed_auxiliary_client(
+                decision,
+                client,
+                final_model,
+                actual_provider=resolved_provider,
             )
+        if vision_fallback_used:
+            pending_fallback_provider = _normalize_aux_provider(resolved_provider)
+            pending_fallback_source = f"vision-auto({pending_fallback_provider})"
     else:
         client, final_model = _get_cached_client(
             resolved_provider,
@@ -7293,6 +7723,12 @@ async def async_call_llm(
             base_url=resolved_base_url,
             api_key=resolved_api_key,
             api_mode=resolved_api_mode,
+        )
+        _validate_routed_auxiliary_client(
+            decision,
+            client,
+            final_model,
+            actual_provider=resolved_provider,
         )
         if client is None:
             _explicit = (resolved_provider or "").strip().lower()
@@ -7303,19 +7739,15 @@ async def async_call_llm(
                         "and cannot fall back to a cheaper or different model."
                     )
                 fb_client, fb_model, fb_label = _try_configured_fallback_for_unavailable_client(
-                    task, _explicit,
+                    task, _explicit, **fallback_config_kwargs,
                 )
                 if fb_client is not None:
                     client, final_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
-                    resolved_provider = fb_label or resolved_provider
-                    _log_gpt56_auxiliary_route(
-                        task,
-                        gpt56_spec,
-                        provider=resolved_provider,
-                        fallback_used=True,
-                    )
+                    pending_fallback_source = fb_label
+                    pending_fallback_provider = _fallback_provider_id(fb_label)
+                    resolved_provider = pending_fallback_provider or resolved_provider
                 else:
                     raise RuntimeError(
                         f"Provider '{_explicit}' is set in config.yaml but no API key "
@@ -7331,7 +7763,11 @@ async def async_call_llm(
                 f"No LLM provider configured for task={task} provider={resolved_provider}. "
                 f"Run: hermes setup")
 
-    effective_timeout = _effective_aux_timeout(task, timeout)
+    effective_timeout = _effective_aux_timeout(
+        task,
+        timeout,
+        task_config=decision.task_config,
+    )
 
     # Pass the client's actual base_url (not just resolved_base_url) so
     # endpoint-specific temperature overrides can distinguish
@@ -7352,8 +7788,17 @@ async def async_call_llm(
         # before the except-chain escalates to fallback — see call_llm()
         # for the rationale. (PR #16587)
         try:
-            return _validate_llm_response(
+            initial_response = _validate_llm_response(
                 await client.chat.completions.create(**kwargs), task)
+            if pending_fallback_source:
+                _report_fallback_attempt(
+                    task=task,
+                    policy_spec=gpt56_spec,
+                    provider_id=pending_fallback_provider,
+                    source_label=pending_fallback_source,
+                    succeeded=True,
+                )
+            return initial_response
         except Exception as transient_err:
             if not _is_transient_transport_error(transient_err):
                 raise
@@ -7524,6 +7969,7 @@ async def async_call_llm(
                     task or "call", auth_refresh_provider,
                 )
                 return await _retry_same_provider_async(
+                    route_decision=decision,
                     task=task,
                     resolved_provider=auth_refresh_provider,
                     resolved_model=resolved_model or final_model,
@@ -7561,6 +8007,7 @@ async def async_call_llm(
                 )
                 try:
                     return await _retry_same_provider_async(
+                        route_decision=decision,
                         task=task,
                         resolved_provider=resolved_provider,
                         resolved_model=resolved_model,
@@ -7642,7 +8089,8 @@ async def async_call_llm(
             fb_client, fb_model, fb_label = (None, None, "")
             if is_auto:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    **fallback_config_kwargs)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_fallback_chain(
                         task, resolved_provider or "auto", reason=reason)
@@ -7651,45 +8099,67 @@ async def async_call_llm(
                         resolved_provider, task, reason=reason)
             else:
                 fb_client, fb_model, fb_label = _try_configured_fallback_chain(
-                    task, resolved_provider or "auto", reason=reason)
+                    task, resolved_provider or "auto", reason=reason,
+                    **fallback_config_kwargs)
                 if fb_client is None:
                     fb_client, fb_model, fb_label = _try_main_agent_model_fallback(
                         resolved_provider, task, reason=reason)
 
             if fb_client is not None:
-                _log_gpt56_auxiliary_route(
-                    task,
-                    gpt56_spec,
-                    provider=fb_label,
-                    fallback_used=True,
-                )
+                fb_provider_id = _fallback_provider_id(fb_label)
                 # Convert sync fallback client to async
                 async_fb, async_fb_model = _to_async_client(
                     fb_client, fb_model or "", is_vision=(task == "vision")
                 )
                 fb_resp = await _call_fallback_candidate_async(
-                    async_fb, async_fb_model or fb_model, fb_label,
+                    async_fb, async_fb_model or fb_model,
+                    provider_id=fb_provider_id,
+                    source_label=fb_label,
                     task=task, messages=messages,
                     temperature=temperature, max_tokens=max_tokens,
                     tools=tools, effective_timeout=effective_timeout,
                     effective_extra_body=effective_extra_body)
                 if fb_resp is not None:
+                    _report_fallback_attempt(
+                        task=task,
+                        policy_spec=gpt56_spec,
+                        provider_id=fb_provider_id,
+                        source_label=fb_label,
+                        succeeded=True,
+                    )
                     return fb_resp
+                _report_fallback_attempt(
+                    task=task,
+                    policy_spec=gpt56_spec,
+                    provider_id=fb_provider_id,
+                    source_label=fb_label,
+                    succeeded=False,
+                )
                 # Stale/unrefreshable candidate credential — quarantined; walk
                 # the discovery chain once more (unhealthy entries skipped).
                 fb_client, fb_model, fb_label = _try_payment_fallback(
                     resolved_provider, task, reason="stale fallback credential")
                 if fb_client is not None:
+                    fb_provider_id = _fallback_provider_id(fb_label)
                     async_fb, async_fb_model = _to_async_client(
                         fb_client, fb_model or "", is_vision=(task == "vision")
                     )
                     fb_resp = await _call_fallback_candidate_async(
-                        async_fb, async_fb_model or fb_model, fb_label,
+                        async_fb, async_fb_model or fb_model,
+                        provider_id=fb_provider_id,
+                        source_label=fb_label,
                         task=task, messages=messages,
                         temperature=temperature, max_tokens=max_tokens,
                         tools=tools, effective_timeout=effective_timeout,
                         effective_extra_body=effective_extra_body)
                     if fb_resp is not None:
+                        _report_fallback_attempt(
+                            task=task,
+                            policy_spec=gpt56_spec,
+                            provider_id=fb_provider_id,
+                            source_label=fb_label,
+                            succeeded=True,
+                        )
                         return fb_resp
             # All fallback layers exhausted — warn before re-raising. (#26882)
             logger.warning(

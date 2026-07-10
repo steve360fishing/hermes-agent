@@ -163,6 +163,61 @@ def test_dispatch_rejected_at_capacity():
     ev.set()
 
 
+def test_sync_reservation_shares_capacity_with_async_dispatch():
+    gate = threading.Event()
+
+    def blocker():
+        gate.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    dispatched = ad.dispatch_async_delegation_batch(
+        goals=["a", "b"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model="m",
+        session_key="other-session",
+        runner=blocker,
+        max_async_children=3,
+        capacity_units=2,
+    )
+    assert dispatched["status"] == "dispatched"
+
+    reservation = ad.reserve_delegation_capacity(
+        capacity_units=2,
+        max_concurrent_children=3,
+        label="sync batch",
+    )
+    assert reservation["status"] == "rejected"
+
+    one = ad.reserve_delegation_capacity(
+        capacity_units=1,
+        max_concurrent_children=3,
+        label="sync child",
+    )
+    assert one["status"] == "reserved"
+    assert ad.release_delegation_capacity(one["reservation_id"]) is True
+    gate.set()
+
+
+def test_sync_capacity_reservation_release_is_idempotent():
+    reservation = ad.reserve_delegation_capacity(
+        capacity_units=3,
+        max_concurrent_children=3,
+        label="sync batch",
+    )
+    assert reservation["status"] == "reserved"
+    assert ad.release_delegation_capacity(reservation["reservation_id"]) is True
+    assert ad.release_delegation_capacity(reservation["reservation_id"]) is False
+
+    replacement = ad.reserve_delegation_capacity(
+        capacity_units=3,
+        max_concurrent_children=3,
+        label="replacement",
+    )
+    assert replacement["status"] == "reserved"
+
+
 def test_crashed_runner_produces_error_completion():
     def boom():
         raise RuntimeError("subagent exploded")

@@ -29,6 +29,30 @@ def _enabled_config() -> dict:
     }
 
 
+def _disabled_config() -> dict:
+    return {
+        "delegation": {"gpt56_routing": {"enabled": False}},
+        "auxiliary": {
+            "compression": {
+                "provider": "openrouter",
+                "model": "legacy-model",
+            }
+        },
+    }
+
+
+def _routed_client(*, async_mode: bool = False):
+    client = MagicMock()
+    client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
+    response = MagicMock()
+    if async_mode:
+        client.chat.completions.create = AsyncMock(return_value=response)
+    else:
+        client.chat.completions.create.return_value = response
+    return client, response
+
+
 @pytest.mark.parametrize(
     "task,model,effort",
     [(task, spec.model, spec.effort) for task, spec in AUXILIARY_ROUTES.items()],
@@ -71,12 +95,13 @@ def test_operator_policy_replaces_ordinary_explicit_call_hints() -> None:
 
 def test_operator_policy_replaces_ordinary_explicit_reasoning_hint() -> None:
     client = MagicMock()
-    client.base_url = "https://example.invalid/v1"
+    client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
     client.chat.completions.create.return_value = MagicMock()
 
     with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
         "agent.auxiliary_client._get_cached_client",
-        return_value=(client, "explicit-model"),
+        return_value=(client, "gpt-5.6-luna"),
     ):
         auxiliary.call_llm(
             task="compression",
@@ -165,9 +190,202 @@ def test_protected_route_rejects_noncanonical_api_mode() -> None:
             )
 
 
+@pytest.mark.parametrize(
+    "base_url,api_key",
+    [
+        ("https://openrouter.ai/api/v1", "oauth-token"),
+        ("https://chatgpt.com/backend-api/codex", ""),
+    ],
+)
+def test_sync_routed_client_rejects_noncanonical_runtime_without_secret_leak(
+    base_url: str,
+    api_key: str,
+) -> None:
+    client, _ = _routed_client()
+    client.base_url = base_url
+    client.api_key = api_key
+    secret = "must-not-appear-in-errors"
+
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
+        "agent.auxiliary_client._get_cached_client",
+        return_value=(client, "gpt-5.6-luna"),
+    ):
+        with pytest.raises(ValueError, match="failed closed") as exc_info:
+            auxiliary.call_llm(
+                task="compression",
+                api_key=secret,
+                messages=[{"role": "user", "content": "compress"}],
+            )
+
+    assert secret not in str(exc_info.value)
+    client.chat.completions.create.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_async_routed_client_rejects_noncanonical_endpoint() -> None:
+    client, _ = _routed_client(async_mode=True)
+    client.base_url = "https://chatgpt.com/backend-api/not-codex"
+
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
+        "agent.auxiliary_client._get_cached_client",
+        return_value=(client, "gpt-5.6-terra"),
+    ):
+        with pytest.raises(ValueError, match="failed closed"):
+            await auxiliary.async_call_llm(
+                task="moa_reference",
+                messages=[{"role": "user", "content": "inspect"}],
+            )
+
+    client.chat.completions.create.assert_not_awaited()
+
+
+def test_sync_public_helper_validates_routed_client_runtime() -> None:
+    client, _ = _routed_client()
+    client.api_key = ""
+
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(client, "gpt-5.6-luna"),
+    ):
+        with pytest.raises(ValueError, match="failed closed"):
+            auxiliary.get_text_auxiliary_client("compression")
+
+
+def test_async_public_helper_exposes_and_logs_route_metadata_parity(caplog) -> None:
+    client, _ = _routed_client(async_mode=True)
+
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(client, "gpt-5.6-luna"),
+    ), caplog.at_level("INFO", logger="agent.auxiliary_client"):
+        binding = auxiliary.get_async_text_auxiliary_client("compression")
+
+    resolved_client, resolved_model = binding
+    assert resolved_client is client
+    assert resolved_model == "gpt-5.6-luna"
+    assert binding.decision.policy_spec.route_id == "explorer"
+    assert binding.decision.policy_spec.effort == "medium"
+    assert "task=compression" in caplog.text
+    assert "fallback_used=false" in caplog.text
+
+
+def test_sync_call_uses_one_disabled_policy_snapshot() -> None:
+    client, response = _routed_client()
+
+    def cached(_provider, model, **_kwargs):
+        return client, model
+
+    calls = 0
+
+    def drifting_config(*_args):
+        nonlocal calls
+        calls += 1
+        return _disabled_config() if calls == 1 else _enabled_config()
+
+    with patch("agent.auxiliary_client._load_auxiliary_config_snapshot", side_effect=drifting_config) as loader, patch(
+        "agent.auxiliary_client._get_cached_client", side_effect=cached
+    ):
+        result = auxiliary.call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "compress"}],
+            timeout=5,
+        )
+
+    assert result is response
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "legacy-model"
+    assert "reasoning" not in (kwargs.get("extra_body") or {})
+    assert loader.call_count == 1
+
+
+def test_sync_call_uses_one_enabled_policy_snapshot() -> None:
+    client, response = _routed_client()
+
+    def cached(_provider, model, **_kwargs):
+        return client, model
+
+    calls = 0
+
+    def drifting_config(*_args):
+        nonlocal calls
+        calls += 1
+        return _enabled_config() if calls == 1 else _disabled_config()
+
+    with patch("agent.auxiliary_client._load_auxiliary_config_snapshot", side_effect=drifting_config) as loader, patch(
+        "agent.auxiliary_client._get_cached_client", side_effect=cached
+    ):
+        result = auxiliary.call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "compress"}],
+            timeout=5,
+        )
+
+    assert result is response
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "gpt-5.6-luna"
+    assert kwargs["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "medium",
+    }
+    assert loader.call_count == 1
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize(
+    "first_config,expected_model,expected_effort",
+    [
+        (_disabled_config(), "legacy-model", None),
+        (_enabled_config(), "gpt-5.6-luna", "medium"),
+    ],
+)
+async def test_async_call_uses_one_policy_snapshot(
+    first_config: dict,
+    expected_model: str,
+    expected_effort: str | None,
+) -> None:
+    client, response = _routed_client(async_mode=True)
+    alternate = (
+        _enabled_config()
+        if first_config["delegation"]["gpt56_routing"]["enabled"] is False
+        else _disabled_config()
+    )
+
+    def cached(_provider, model, **_kwargs):
+        return client, model
+
+    calls = 0
+
+    def drifting_config(*_args):
+        nonlocal calls
+        calls += 1
+        return first_config if calls == 1 else alternate
+
+    with patch(
+        "agent.auxiliary_client._load_auxiliary_config_snapshot",
+        side_effect=drifting_config,
+    ) as loader, patch(
+        "agent.auxiliary_client._get_cached_client", side_effect=cached
+    ):
+        result = await auxiliary.async_call_llm(
+            task="compression",
+            messages=[{"role": "user", "content": "compress"}],
+            timeout=5,
+        )
+
+    assert result is response
+    kwargs = client.chat.completions.create.await_args.kwargs
+    assert kwargs["model"] == expected_model
+    if expected_effort is None:
+        assert "reasoning" not in (kwargs.get("extra_body") or {})
+    else:
+        assert kwargs["extra_body"]["reasoning"]["effort"] == expected_effort
+    assert loader.call_count == 1
+
+
 def test_sync_call_enforces_route_reasoning_and_reports_no_fallback(caplog) -> None:
     client = MagicMock()
     client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
     response = MagicMock()
     client.chat.completions.create.return_value = response
 
@@ -237,6 +455,7 @@ def test_vision_initial_fallback_reports_routed_fallback(caplog) -> None:
 def test_vision_adapter_does_not_restore_explicit_endpoint_hints() -> None:
     client = MagicMock()
     client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
     client.chat.completions.create.return_value = MagicMock()
     resolver = MagicMock(return_value=("openai-codex", client, "gpt-5.6-terra"))
 
@@ -252,19 +471,24 @@ def test_vision_adapter_does_not_restore_explicit_endpoint_hints() -> None:
             messages=[{"role": "user", "content": "inspect"}],
         )
 
-    assert resolver.call_args.kwargs == {
+    resolver_kwargs = resolver.call_args.kwargs
+    assert {key: resolver_kwargs[key] for key in (
+        "provider", "model", "base_url", "api_key", "async_mode"
+    )} == {
         "provider": "openai-codex",
         "model": "gpt-5.6-terra",
         "base_url": None,
         "api_key": None,
         "async_mode": False,
     }
+    assert resolver_kwargs["_route_decision"].model == "gpt-5.6-terra"
 
 
 @pytest.mark.asyncio
 async def test_async_call_enforces_route_model_and_reasoning(caplog) -> None:
     client = MagicMock()
     client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
     response = MagicMock()
     client.chat.completions.create = AsyncMock(return_value=response)
 
@@ -340,6 +564,7 @@ async def test_async_vision_initial_fallback_reports_routed_fallback(caplog) -> 
 async def test_async_vision_adapter_does_not_restore_explicit_endpoint_hints() -> None:
     client = MagicMock()
     client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
     client.chat.completions.create = AsyncMock(return_value=MagicMock())
     resolver = MagicMock(return_value=("openai-codex", client, "gpt-5.6-terra"))
 
@@ -355,13 +580,17 @@ async def test_async_vision_adapter_does_not_restore_explicit_endpoint_hints() -
             messages=[{"role": "user", "content": "inspect"}],
         )
 
-    assert resolver.call_args.kwargs == {
+    resolver_kwargs = resolver.call_args.kwargs
+    assert {key: resolver_kwargs[key] for key in (
+        "provider", "model", "base_url", "api_key", "async_mode"
+    )} == {
         "provider": "openai-codex",
         "model": "gpt-5.6-terra",
         "base_url": None,
         "api_key": None,
         "async_mode": True,
     }
+    assert resolver_kwargs["_route_decision"].model == "gpt-5.6-terra"
 
 
 def test_protected_auxiliary_route_does_not_try_unavailable_client_fallback() -> None:
@@ -379,3 +608,22 @@ def test_protected_auxiliary_route_does_not_try_unavailable_client_fallback() ->
             )
 
     fallback.assert_not_called()
+
+
+@pytest.mark.parametrize("token", ["", "   ", object(), 123])
+def test_canonical_runtime_rejects_non_string_or_blank_tokens(token) -> None:
+    from hermes_cli.gpt56_routing import (
+        RoutingPolicyError,
+        route_spec,
+        validate_codex_route_runtime,
+    )
+
+    with pytest.raises(RoutingPolicyError, match="token"):
+        validate_codex_route_runtime(
+            route_spec("worker", reason="bounded implementation"),
+            provider="openai-codex",
+            model="gpt-5.6-terra",
+            api_mode="codex_responses",
+            base_url="https://chatgpt.com/backend-api/codex",
+            api_key=token,
+        )

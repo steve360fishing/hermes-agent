@@ -219,7 +219,8 @@ def describe_profile(
         return DescribeOutcome(canon, False, "auxiliary client unavailable")
 
     try:
-        client, aux_model = get_text_auxiliary_client("profile_describer")
+        binding = get_text_auxiliary_client("profile_describer")
+        client, aux_model = binding
     except Exception as exc:
         logger.debug("describe: get_text_auxiliary_client failed: %s", exc)
         return DescribeOutcome(canon, False, "auxiliary client unavailable")
@@ -246,7 +247,10 @@ def describe_profile(
             temperature=0.3,
             max_tokens=400,
             timeout=timeout or 60,
-            extra_body=get_auxiliary_extra_body("profile_describer") or None,
+            extra_body=get_auxiliary_extra_body(
+                "profile_describer",
+                decision=getattr(binding, "decision", None),
+            ) or None,
         )
     except Exception as exc:
         logger.info("describe: API call failed for %s (%s)", canon, exc)

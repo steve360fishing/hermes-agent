@@ -25,6 +25,28 @@ def _enabled_config() -> dict:
     }
 
 
+def _disabled_config() -> dict:
+    return {
+        "model": {
+            "provider": "openrouter",
+            "default": "legacy-parent-model",
+        },
+        "delegation": {"gpt56_routing": {"enabled": False}},
+    }
+
+
+def _background_parent() -> SimpleNamespace:
+    return SimpleNamespace(
+        provider="openrouter",
+        model="legacy-parent-model",
+        _current_main_runtime=lambda: {
+            "api_key": "legacy-key",
+            "base_url": "https://openrouter.ai/api/v1",
+            "api_mode": "chat_completions",
+        },
+    )
+
+
 def _response(content: str) -> SimpleNamespace:
     return SimpleNamespace(
         choices=[SimpleNamespace(message=SimpleNamespace(content=content))]
@@ -41,6 +63,11 @@ def test_curator_real_fork_enforces_protected_sol_max_and_reports_no_fallback(
     class _ReviewAgent:
         def __init__(self, *args, **kwargs):
             captured["kwargs"] = kwargs
+            self.provider = kwargs.get("provider")
+            self.model = kwargs.get("model")
+            self.api_mode = kwargs.get("api_mode")
+            self.base_url = kwargs.get("base_url")
+            self.api_key = kwargs.get("api_key")
             self._memory_nudge_interval = 1
             self._skill_nudge_interval = 1
             self._memory_write_origin = "assistant_tool"
@@ -100,6 +127,50 @@ def test_curator_invalid_enabled_policy_fails_closed_before_agent_construction()
     assert "Invalid delegation.gpt56_routing" in meta["error"]
 
 
+def test_curator_config_read_failure_fails_closed_before_agent_construction() -> None:
+    from agent import curator
+
+    agent_factory = MagicMock()
+    with patch(
+        "hermes_cli.config.load_config",
+        side_effect=RuntimeError("config unreadable"),
+    ), patch("run_agent.AIAgent", agent_factory):
+        meta = curator._run_llm_review("review the skill library")
+
+    agent_factory.assert_not_called()
+    assert "config" in meta["error"].lower()
+
+
+@pytest.mark.parametrize(
+    "base_url,api_key",
+    [
+        ("https://openrouter.ai/api/v1", "oauth-token"),
+        ("https://chatgpt.com/backend-api/codex", ""),
+    ],
+)
+def test_curator_rejects_noncanonical_endpoint_or_missing_token(
+    base_url: str,
+    api_key: str,
+) -> None:
+    from agent import curator
+
+    agent_factory = MagicMock()
+    resolved = {
+        "provider": "openai-codex",
+        "api_key": api_key,
+        "base_url": base_url,
+        "api_mode": "codex_responses",
+    }
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=resolved,
+    ), patch("run_agent.AIAgent", agent_factory):
+        meta = curator._run_llm_review("review the skill library")
+
+    agent_factory.assert_not_called()
+    assert "failed closed" in meta["error"]
+
+
 def test_curator_rejects_runtime_provider_substitution_before_construction() -> None:
     from agent import curator
 
@@ -117,7 +188,7 @@ def test_curator_rejects_runtime_provider_substitution_before_construction() -> 
         meta = curator._run_llm_review("review the skill library")
 
     agent_factory.assert_not_called()
-    assert "canonical provider" in meta["error"]
+    assert "not canonical" in meta["error"]
 
 
 def test_background_review_real_fork_enforces_protected_sol_max_and_reports_no_fallback(
@@ -134,7 +205,7 @@ def test_background_review_real_fork_enforces_protected_sol_max_and_reports_no_f
         session_id = "parent-session"
         enabled_toolsets = ["memory", "skills"]
         disabled_toolsets = []
-        _credential_pool = None
+        _credential_pool = object()
         _memory_store = None
         _memory_enabled = False
         _user_profile_enabled = False
@@ -159,6 +230,11 @@ def test_background_review_real_fork_enforces_protected_sol_max_and_reports_no_f
     class _ReviewAgent:
         def __init__(self, *args, **kwargs):
             captured["kwargs"] = kwargs
+            self.provider = kwargs.get("provider")
+            self.model = kwargs.get("model")
+            self.api_mode = kwargs.get("api_mode")
+            self.base_url = kwargs.get("base_url")
+            self.api_key = kwargs.get("api_key")
             self._memory_write_origin = None
             self._memory_write_context = None
             self._memory_store = None
@@ -211,6 +287,7 @@ def test_background_review_real_fork_enforces_protected_sol_max_and_reports_no_f
         "effort": "max",
     }
     assert captured["kwargs"]["fallback_model"] == []
+    assert captured["kwargs"]["credential_pool"] is None
     assert "task=background_review" in caplog.text
     assert "fallback_used=false" in caplog.text
 
@@ -237,14 +314,54 @@ def test_background_review_rejects_runtime_provider_substitution() -> None:
         "hermes_cli.runtime_provider.resolve_runtime_provider",
         return_value=substituted,
     ):
-        with pytest.raises(RuntimeError, match="canonical provider"):
+        with pytest.raises(RuntimeError, match="not canonical"):
             background_review._resolve_review_runtime(parent)
+
+
+def test_background_review_config_read_failure_fails_closed() -> None:
+    from agent import background_review
+
+    with patch(
+        "hermes_cli.config.load_config",
+        side_effect=RuntimeError("config unreadable"),
+    ):
+        with pytest.raises(RuntimeError, match="config"):
+            background_review._resolve_review_runtime(_background_parent())
+
+
+@pytest.mark.parametrize(
+    "base_url,api_key",
+    [
+        ("https://chatgpt.com/backend-api/not-codex", "oauth-token"),
+        ("https://chatgpt.com/backend-api/codex", ""),
+    ],
+)
+def test_background_review_rejects_noncanonical_endpoint_or_missing_token(
+    base_url: str,
+    api_key: str,
+) -> None:
+    from agent import background_review
+
+    resolved = {
+        "provider": "openai-codex",
+        "api_key": api_key,
+        "base_url": base_url,
+        "api_mode": "codex_responses",
+    }
+    with patch("hermes_cli.config.load_config", return_value=_enabled_config()), patch(
+        "hermes_cli.runtime_provider.resolve_runtime_provider",
+        return_value=resolved,
+    ):
+        with pytest.raises(RuntimeError, match="failed closed"):
+            background_review._resolve_review_runtime(_background_parent())
 
 
 def test_goal_judge_real_caller_remains_available_on_protected_sol_max(caplog) -> None:
     from hermes_cli import goals
 
     client = MagicMock()
+    client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
     client.chat.completions.create.return_value = _response(
         json.dumps({"done": True, "reason": "all acceptance checks passed"})
     )
@@ -270,6 +387,48 @@ def test_goal_judge_real_caller_remains_available_on_protected_sol_max(caplog) -
     }
     assert "task=goal_judge" in caplog.text
     assert "fallback_used=false" in caplog.text
+
+
+def test_goal_judge_uses_one_enabled_policy_snapshot() -> None:
+    from hermes_cli import goals
+
+    client = MagicMock()
+    client.base_url = "https://chatgpt.com/backend-api/codex"
+    client.api_key = "oauth-token"
+    client.chat.completions.create.return_value = _response(
+        json.dumps({"done": True, "reason": "verified"})
+    )
+
+    calls = 0
+
+    def drifting_config(*_args):
+        nonlocal calls
+        calls += 1
+        return _enabled_config() if calls == 1 else _disabled_config()
+
+    with patch(
+        "agent.auxiliary_client._load_auxiliary_config_snapshot",
+        side_effect=drifting_config,
+    ) as loader, patch(
+        "agent.auxiliary_client.resolve_provider_client",
+        return_value=(client, "gpt-5.6-sol"),
+    ):
+        verdict, reason, parse_failed, wait_directive = goals.judge_goal(
+            "finish the task",
+            "Verified evidence is attached.",
+        )
+
+    assert verdict == "done"
+    assert reason == "verified"
+    assert parse_failed is False
+    assert wait_directive is None
+    kwargs = client.chat.completions.create.call_args.kwargs
+    assert kwargs["model"] == "gpt-5.6-sol"
+    assert kwargs["extra_body"]["reasoning"] == {
+        "enabled": True,
+        "effort": "max",
+    }
+    assert loader.call_count == 1
 
 
 @pytest.mark.asyncio

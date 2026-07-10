@@ -99,6 +99,69 @@ def active_count() -> int:
         return sum(1 for r in _records.values() if r.get("status") == "running")
 
 
+def _active_capacity_units_locked() -> int:
+    """Return occupied child slots. Caller must hold ``_records_lock``."""
+    return sum(
+        max(1, int(record.get("capacity_units", 1)))
+        for record in _records.values()
+        if record.get("status") == "running"
+    )
+
+
+def reserve_delegation_capacity(
+    *,
+    capacity_units: int,
+    max_concurrent_children: int,
+    label: str,
+) -> Dict[str, Any]:
+    """Atomically reserve routed child slots for synchronous execution.
+
+    Background and synchronous routed work share ``_records`` so concurrent
+    sessions cannot each satisfy a local cap while exceeding the global one.
+    The caller must release a successful reservation in ``finally``.
+    """
+    try:
+        requested = max(1, int(capacity_units))
+        maximum = max(1, int(max_concurrent_children))
+    except (TypeError, ValueError):
+        return {
+            "status": "rejected",
+            "error": "Invalid delegation capacity request.",
+        }
+    reservation_id = f"reserve_{uuid.uuid4().hex[:8]}"
+    with _records_lock:
+        running = _active_capacity_units_locked()
+        if running + requested > maximum:
+            return {
+                "status": "rejected",
+                "error": (
+                    f"Delegation capacity reached ({maximum} child slots; "
+                    f"{running} active and {requested} requested)."
+                ),
+            }
+        _records[reservation_id] = {
+            "delegation_id": reservation_id,
+            "goal": str(label or "synchronous routed delegation"),
+            "status": "running",
+            "dispatched_at": time.time(),
+            "completed_at": None,
+            "capacity_units": requested,
+            "synchronous_reservation": True,
+            "interrupt_fn": None,
+        }
+    return {"status": "reserved", "reservation_id": reservation_id}
+
+
+def release_delegation_capacity(reservation_id: str) -> bool:
+    """Release a synchronous reservation; return False if already absent."""
+    with _records_lock:
+        record = _records.get(str(reservation_id or ""))
+        if not record or not record.get("synchronous_reservation"):
+            return False
+        _records.pop(str(reservation_id), None)
+    return True
+
+
 def _new_delegation_id() -> str:
     return f"deleg_{uuid.uuid4().hex[:8]}"
 
@@ -191,11 +254,7 @@ def dispatch_async_delegation(
     # active_count() separately would let two concurrent dispatches (e.g.
     # from different gateway sessions) both pass the check and exceed the cap.
     with _records_lock:
-        running = sum(
-            max(1, int(r.get("capacity_units", 1)))
-            for r in _records.values()
-            if r.get("status") == "running"
-        )
+        running = _active_capacity_units_locked()
         if running >= max_async_children:
             return {
                 "status": "rejected",
@@ -390,11 +449,7 @@ def dispatch_async_delegation_batch(
         "capacity_units": reserved_units,
     }
     with _records_lock:
-        running = sum(
-            max(1, int(r.get("capacity_units", 1)))
-            for r in _records.values()
-            if r.get("status") == "running"
-        )
+        running = _active_capacity_units_locked()
         if running + reserved_units > max_async_children:
             return {
                 "status": "rejected",

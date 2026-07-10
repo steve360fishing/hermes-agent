@@ -58,6 +58,16 @@ def _make_mock_parent(depth=0):
     parent._print_fn = None
     parent.tool_progress_callback = None
     parent.thinking_callback = None
+    parent.acp_command = None
+    parent.acp_args = []
+    parent.max_tokens = None
+    parent.reasoning_config = None
+    parent.prefill_messages = None
+    parent._fallback_chain = []
+    parent.openrouter_min_coding_score = None
+    parent.enabled_toolsets = []
+    parent._credential_pool = None
+    parent.session_id = "test-parent-session"
     return parent
 
 
@@ -2418,7 +2428,7 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 self.assertEqual(_load_config()["max_concurrent_children"], 50)
                 self.assertEqual(_get_max_concurrent_children(), 50)
 
-    def test_load_config_falls_back_to_cli_config_when_persistent_load_fails(self):
+    def test_load_config_fails_closed_when_persistent_loader_raises(self):
         fallback_cli = types.ModuleType("cli")
         fallback_cli.CLI_CONFIG = {
             "delegation": {
@@ -2432,7 +2442,23 @@ class TestConcurrencyDefaults(unittest.TestCase):
                 "hermes_cli.config.load_config_readonly",
                 side_effect=RuntimeError("boom"),
             ):
-                self.assertEqual(_load_config()["max_concurrent_children"], 8)
+                with self.assertRaisesRegex(RuntimeError, "boom"):
+                    _load_config()
+
+    def test_load_config_uses_cli_only_when_shared_loader_is_unavailable(self):
+        fallback_cli = types.ModuleType("cli")
+        fallback_cli.CLI_CONFIG = {
+            "delegation": {
+                "max_iterations": 45,
+                "max_concurrent_children": 8,
+            }
+        }
+
+        with patch.dict(
+            "sys.modules",
+            {"cli": fallback_cli, "hermes_cli.config": None},
+        ):
+            self.assertEqual(_load_config()["max_concurrent_children"], 8)
 
     def test_load_config_prefers_cli_config_when_user_config_ignored(self):
         # `hermes chat --ignore-user-config` sets HERMES_IGNORE_USER_CONFIG=1,

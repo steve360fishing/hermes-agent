@@ -5,16 +5,67 @@ from __future__ import annotations
 from dataclasses import dataclass, replace
 from enum import Enum
 from typing import Any, Mapping, Sequence
+from urllib.parse import urlsplit
 
 
 ROUTING_CONTRACT = "gpt56-routing-v3"
 PRIMARY_PROVIDER = "openai-codex"
+CANONICAL_CODEX_BASE_URL = "https://chatgpt.com/backend-api/codex"
 MAX_CHILDREN = 3
 MAX_DEPTH = 1
 
 
 class RoutingPolicyError(ValueError):
     """Raised when a requested route violates the GPT-5.6 contract."""
+
+
+def validate_codex_route_runtime(
+    spec: "RouteSpec",
+    *,
+    provider: Any,
+    model: Any,
+    api_mode: Any,
+    base_url: Any,
+    api_key: Any,
+) -> None:
+    """Fail closed unless a routed runtime is canonical Codex OAuth.
+
+    Error text deliberately names only violated fields.  Runtime values can
+    originate in persisted credential pools, so serializing them here could
+    disclose endpoint-embedded credentials or access tokens.
+    """
+    normalized_provider = str(provider or "").strip().lower()
+    normalized_model = str(model or "").strip().lower()
+    normalized_api_mode = str(api_mode or "").strip().lower()
+    raw_base_url = str(base_url or "").strip()
+    parsed = urlsplit(raw_base_url)
+    canonical_endpoint = (
+        parsed.scheme.lower() == "https"
+        and (parsed.hostname or "").lower() == "chatgpt.com"
+        and parsed.port in (None, 443)
+        and parsed.path.rstrip("/") == "/backend-api/codex"
+        and not parsed.username
+        and not parsed.password
+        and not parsed.query
+        and not parsed.fragment
+    )
+
+    errors: list[str] = []
+    if normalized_provider != spec.provider:
+        errors.append("provider is not canonical")
+    if normalized_model != spec.model:
+        errors.append("model is not canonical")
+    if normalized_api_mode != "codex_responses":
+        errors.append("api_mode is not codex_responses")
+    if not canonical_endpoint:
+        errors.append("base_url is not the canonical Codex endpoint")
+    if not isinstance(api_key, str) or not api_key.strip():
+        errors.append("Codex OAuth token is missing")
+    if errors:
+        raise RoutingPolicyError(
+            f"GPT-5.6 route {spec.route_id!r} runtime validation failed closed: "
+            + "; ".join(errors)
+        )
 
 
 def validate_operator_config(config: Mapping[str, Any]) -> bool:
@@ -289,6 +340,7 @@ def validate_ultra_tasks(
 
 __all__ = [
     "AUXILIARY_ROUTES",
+    "CANONICAL_CODEX_BASE_URL",
     "MODEL_EFFORTS",
     "MODEL_IDS",
     "MAX_CHILDREN",
@@ -304,6 +356,7 @@ __all__ = [
     "provider_locked_auxiliary_task",
     "route_spec",
     "validate_model_effort",
+    "validate_codex_route_runtime",
     "validate_operator_config",
     "validate_ultra_tasks",
 ]

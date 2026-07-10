@@ -357,6 +357,130 @@ def test_delegate_task_builds_each_child_with_its_own_model_and_effort(monkeypat
     assert [item["routing"]["route_id"] for item in payload["results"]] == ["explorer", "reviewer"]
 
 
+def test_delegate_dispatch_uses_one_enabled_policy_snapshot(monkeypatch) -> None:
+    enabled = _enabled_config()
+    disabled = {
+        "max_concurrent_children": 99,
+        "max_spawn_depth": 99,
+        "max_iterations": 4,
+        "gpt56_routing": {"enabled": False},
+    }
+    calls = 0
+
+    def drifting_config():
+        nonlocal calls
+        calls += 1
+        return enabled if calls == 1 else disabled
+
+    loader = MagicMock(side_effect=drifting_config)
+    monkeypatch.setattr(delegation, "_load_config", loader)
+
+    def fake_credentials(task_cfg, _parent):
+        return {
+            "model": task_cfg.get("model"),
+            "provider": task_cfg.get("provider"),
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": None,
+        }
+
+    def fake_build(**kwargs):
+        spec = kwargs["routing_spec"]
+        return SimpleNamespace(
+            model=kwargs["model"],
+            provider=kwargs["override_provider"],
+            _delegate_role="leaf",
+            _gpt56_route_metadata=spec.as_contract(),
+            _fallback_activated=False,
+            session_id="child",
+            session_estimated_cost_usd=0.0,
+        )
+
+    monkeypatch.setattr(delegation, "_resolve_delegation_credentials", fake_credentials)
+    monkeypatch.setattr(delegation, "_build_child_agent", fake_build)
+    monkeypatch.setattr(
+        delegation,
+        "_run_single_child",
+        lambda task_index, goal, child, parent_agent: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0,
+            "routing": delegation._child_routing_contract(child),
+            "_child_role": "leaf",
+        },
+    )
+    monkeypatch.setattr(delegation, "_apply_summary_budget", lambda *_: None)
+
+    payload = json.loads(
+        delegation.delegate_task(
+            goal="bounded work",
+            route="worker",
+            reason="routine implementation",
+            background=False,
+            parent_agent=_parent_agent(),
+        )
+    )
+
+    assert payload["results"][0]["routing"]["route_id"] == "worker"
+    assert loader.call_count == 1
+
+
+def test_delegate_dispatch_uses_one_disabled_policy_snapshot(monkeypatch) -> None:
+    disabled = {
+        "max_concurrent_children": 3,
+        "max_spawn_depth": 2,
+        "max_iterations": 4,
+        "gpt56_routing": {"enabled": False},
+    }
+    calls = 0
+
+    def drifting_config():
+        nonlocal calls
+        calls += 1
+        return disabled if calls == 1 else _enabled_config()
+
+    loader = MagicMock(side_effect=drifting_config)
+    monkeypatch.setattr(delegation, "_load_config", loader)
+    credentials = MagicMock()
+    monkeypatch.setattr(delegation, "_resolve_delegation_credentials", credentials)
+
+    payload = json.loads(
+        delegation.delegate_task(
+            goal="bounded work",
+            route="worker",
+            reason="routine implementation",
+            background=False,
+            parent_agent=_parent_agent(),
+        )
+    )
+
+    assert "disabled" in payload["error"].lower()
+    assert loader.call_count == 1
+    credentials.assert_not_called()
+
+
+def test_delegate_dispatch_reports_config_load_failure(monkeypatch) -> None:
+    monkeypatch.setattr(
+        delegation,
+        "_load_config",
+        MagicMock(side_effect=RuntimeError("config unreadable")),
+    )
+
+    payload = json.loads(
+        delegation.delegate_task(
+            goal="bounded work",
+            background=False,
+            parent_agent=_parent_agent(),
+        )
+    )
+
+    assert "config" in payload["error"].lower()
+
+
 def test_batch_tasks_inherit_top_level_context_and_routing_defaults(monkeypatch) -> None:
     cfg = _enabled_config()
     monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
@@ -578,6 +702,230 @@ def test_routed_capacity_rejection_never_runs_children_synchronously(monkeypatch
     assert payload["status"] == "rejected"
     assert "capacity reached" in payload["error"]
     child.close.assert_called_once()
+
+
+def test_routed_stateless_fallback_rejects_when_shared_registry_is_full(
+    monkeypatch,
+) -> None:
+    """No-async sessions must not bypass the global routed child ceiling."""
+    from tools import async_delegation
+
+    async_delegation._reset_for_tests()
+    release = threading.Event()
+
+    def occupied_runner():
+        release.wait(timeout=5)
+        return {"results": [{"status": "completed"}] * 3}
+
+    occupied = async_delegation.dispatch_async_delegation_batch(
+        goals=["a", "b", "c"],
+        context=None,
+        toolsets=None,
+        role="leaf",
+        model=None,
+        session_key="other-session",
+        runner=occupied_runner,
+        max_async_children=3,
+        capacity_units=3,
+    )
+    assert occupied["status"] == "dispatched"
+
+    cfg = _enabled_config()
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    child = MagicMock()
+    child.model = "gpt-5.6-terra"
+    child.provider = "openai-codex"
+    child.session_id = "stateless-child"
+    child._delegate_role = "leaf"
+    child._gpt56_route_metadata = route_spec(
+        "worker", reason="bounded work"
+    ).as_contract()
+    child._fallback_activated = False
+    child.session_estimated_cost_usd = 0.0
+
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(delegation, "_build_child_agent", lambda **_kwargs: child)
+
+    def fail_if_child_runs(*_args, **_kwargs):
+        pytest.fail("stateless routed child ran outside shared capacity accounting")
+
+    monkeypatch.setattr(delegation, "_run_single_child", fail_if_child_runs)
+    monkeypatch.setattr(
+        "gateway.session_context.async_delivery_supported",
+        lambda: False,
+    )
+
+    try:
+        payload = json.loads(
+            delegation.delegate_task(
+                goal="bounded work",
+                route="worker",
+                reason="routine implementation",
+                background=True,
+                parent_agent=_parent_agent(),
+            )
+        )
+        assert payload["status"] == "rejected"
+        assert "capacity" in payload["error"].lower()
+        child.close.assert_called_once()
+    finally:
+        release.set()
+        deadline = time.monotonic() + 5
+        while async_delegation.active_count() and time.monotonic() < deadline:
+            time.sleep(0.01)
+        async_delegation._reset_for_tests()
+
+
+def test_routed_synchronous_dispatch_rejects_when_shared_registry_is_full(
+    monkeypatch,
+) -> None:
+    """background=false must obey the same routed capacity registry."""
+    from tools import async_delegation
+
+    async_delegation._reset_for_tests()
+    occupied = async_delegation.reserve_delegation_capacity(
+        capacity_units=3,
+        max_concurrent_children=3,
+        label="other session",
+    )
+    assert occupied["status"] == "reserved"
+
+    cfg = _enabled_config()
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    child = MagicMock()
+    child.model = "gpt-5.6-terra"
+    child.provider = "openai-codex"
+    child.session_id = "sync-child"
+    child._delegate_role = "leaf"
+    child._gpt56_route_metadata = route_spec(
+        "worker", reason="bounded work"
+    ).as_contract()
+    child._fallback_activated = False
+    child.session_estimated_cost_usd = 0.0
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(delegation, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        delegation,
+        "_run_single_child",
+        lambda *_args, **_kwargs: pytest.fail(
+            "capacity-rejected routed sync child ran"
+        ),
+    )
+
+    try:
+        payload = json.loads(
+            delegation.delegate_task(
+                goal="bounded work",
+                route="worker",
+                reason="routine implementation",
+                background=False,
+                parent_agent=_parent_agent(),
+            )
+        )
+        assert payload["status"] == "rejected"
+        assert "capacity" in payload["error"].lower()
+        child.close.assert_called_once()
+    finally:
+        async_delegation.release_delegation_capacity(
+            occupied["reservation_id"]
+        )
+        async_delegation._reset_for_tests()
+
+
+def test_routed_sync_capacity_is_released_when_execution_raises(monkeypatch) -> None:
+    from tools import async_delegation
+
+    async_delegation._reset_for_tests()
+    cfg = _enabled_config()
+    monkeypatch.setattr(delegation, "_load_config", lambda: cfg)
+    child = MagicMock()
+    child.model = "gpt-5.6-terra"
+    child.provider = "openai-codex"
+    child.session_id = "sync-child"
+    child._delegate_role = "leaf"
+    child._gpt56_route_metadata = route_spec(
+        "worker", reason="bounded work"
+    ).as_contract()
+    child._fallback_activated = False
+    child.session_estimated_cost_usd = 0.0
+    monkeypatch.setattr(
+        delegation,
+        "_resolve_delegation_credentials",
+        lambda *_args, **_kwargs: {
+            "model": "gpt-5.6-terra",
+            "provider": "openai-codex",
+            "base_url": "https://chatgpt.com/backend-api/codex",
+            "api_key": "child-token",
+            "api_mode": "codex_responses",
+            "command": None,
+            "args": None,
+        },
+    )
+    monkeypatch.setattr(delegation, "_build_child_agent", lambda **_kwargs: child)
+    monkeypatch.setattr(
+        delegation,
+        "_run_single_child",
+        lambda task_index, *_args, **_kwargs: {
+            "task_index": task_index,
+            "status": "completed",
+            "summary": "ok",
+            "api_calls": 1,
+            "duration_seconds": 0,
+            "_child_role": "leaf",
+        },
+    )
+    monkeypatch.setattr(
+        delegation,
+        "_apply_summary_budget",
+        MagicMock(side_effect=RuntimeError("post-run failure")),
+    )
+
+    with pytest.raises(RuntimeError, match="post-run failure"):
+        delegation.delegate_task(
+            goal="bounded work",
+            route="worker",
+            reason="routine implementation",
+            background=False,
+            parent_agent=_parent_agent(),
+        )
+
+    replacement = async_delegation.reserve_delegation_capacity(
+        capacity_units=3,
+        max_concurrent_children=3,
+        label="replacement",
+    )
+    try:
+        assert replacement["status"] == "reserved"
+    finally:
+        if replacement["status"] == "reserved":
+            async_delegation.release_delegation_capacity(
+                replacement["reservation_id"]
+            )
+        async_delegation._reset_for_tests()
 
 
 def test_legacy_capacity_rejection_preserves_synchronous_fallback(monkeypatch) -> None:

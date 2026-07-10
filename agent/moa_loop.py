@@ -13,7 +13,7 @@ import logging
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
-from agent.auxiliary_client import call_llm
+from agent.auxiliary_client import call_llm, resolve_auxiliary_route_decision
 from agent.transports import get_transport
 
 logger = logging.getLogger(__name__)
@@ -171,6 +171,33 @@ def _slot_runtime(slot: dict[str, str]) -> dict[str, Any]:
     except Exception as exc:  # pragma: no cover - defensive
         logger.debug("MoA slot runtime resolution failed for %s: %s", _slot_label(slot), exc)
     return out
+
+
+def _bind_aggregator_runtime(
+    slot: dict[str, str],
+    *,
+    config: Any = None,
+) -> tuple[Any, dict[str, Any]]:
+    """Freeze one authoritative aggregator route before request shaping."""
+    requested = _slot_runtime(slot)
+    decision = resolve_auxiliary_route_decision(
+        "moa_aggregator",
+        provider=requested.get("provider"),
+        model=requested.get("model"),
+        base_url=requested.get("base_url"),
+        api_key=requested.get("api_key"),
+        api_mode=requested.get("api_mode"),
+        policy_authoritative=True,
+        **({"_config": config} if config is not None else {}),
+    )
+    runtime = {
+        "provider": decision.provider,
+        "model": decision.model,
+        "base_url": decision.base_url,
+        "api_key": decision.api_key,
+        "api_mode": decision.api_mode,
+    }
+    return decision, runtime
 
 
 def _maybe_apply_moa_cache_control(
@@ -618,7 +645,7 @@ def aggregate_moa_context(
     )
 
     agg_label = _slot_label(aggregator)
-    agg_runtime = _slot_runtime(aggregator)
+    agg_decision, agg_runtime = _bind_aggregator_runtime(aggregator)
     try:
         # Same cache_control decoration as _run_reference's advisor calls
         # (see _maybe_apply_moa_cache_control) — this synthesis call is a
@@ -638,11 +665,19 @@ def aggregate_moa_context(
             messages=agg_messages,
             temperature=aggregator_temperature,
             max_tokens=max_tokens,
-            **agg_runtime,
+            _route_decision=agg_decision,
         )
         synthesis = _extract_text(response)
     except Exception as exc:
         logger.warning("MoA aggregator model %s failed: %s", agg_label, exc)
+        if (
+            agg_decision.policy_spec is not None
+            and getattr(agg_decision.policy_spec, "protected", False)
+        ):
+            raise RuntimeError(
+                "protected GPT-5.6 MoA aggregator failed closed; retry after "
+                "restoring its canonical runtime."
+            ) from exc
         synthesis = ""
 
     if not synthesis:
@@ -801,7 +836,8 @@ class MoAChatCompletions:
         from hermes_cli.config import load_config
         from hermes_cli.moa_config import resolve_moa_preset
 
-        preset = resolve_moa_preset(load_config().get("moa") or {}, self.preset_name)
+        config = load_config()
+        preset = resolve_moa_preset(config.get("moa") or {}, self.preset_name)
         messages = list(api_kwargs.get("messages") or [])
         reference_models = preset.get("reference_models") or []
         aggregator = preset.get("aggregator") or {}
@@ -1010,6 +1046,18 @@ class MoAChatCompletions:
             # actually governs the aggregator stream, not just call_llm's default.
             if api_kwargs.get("timeout") is not None:
                 stream_kwargs["timeout"] = api_kwargs["timeout"]
+        agg_decision, agg_runtime = _bind_aggregator_runtime(
+            aggregator,
+            config=config,
+        )
+        self.last_aggregator_slot = {
+            "provider": agg_runtime["provider"],
+            "model": agg_runtime["model"],
+        }
+        agg_messages = _maybe_apply_moa_cache_control(
+            agg_messages,
+            agg_runtime,
+        )
         _agg_response = call_llm(
             task="moa_aggregator",
             messages=agg_messages,
@@ -1018,7 +1066,7 @@ class MoAChatCompletions:
             tools=agg_kwargs.get("tools"),
             extra_body=agg_kwargs.get("extra_body"),
             **stream_kwargs,
-            **_slot_runtime(aggregator),
+            _route_decision=agg_decision,
         )
         # Non-streaming path (quiet mode / eval / subagents): the aggregator
         # output is available inline, so capture it into the pending trace now.
