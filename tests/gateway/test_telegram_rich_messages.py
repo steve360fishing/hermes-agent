@@ -11,6 +11,7 @@ The ``telegram`` package is mocked by ``tests/gateway/conftest.py``
 """
 
 import logging
+import warnings
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -20,6 +21,10 @@ from gateway.config import PlatformConfig
 from gateway.platforms.base import SendResult
 from plugins.platforms.telegram.adapter import TelegramAdapter
 from telegram.error import BadRequest, NetworkError, TimedOut
+try:
+    from telegram.warnings import PTBUserWarning
+except ImportError:  # shared gateway test double is a module, not a package
+    PTBUserWarning = UserWarning
 
 
 # Content exercising rich-only constructs: a heading, a real Markdown table,
@@ -854,6 +859,90 @@ async def test_finalize_edit_uses_rich_for_table_content():
     # No fresh send / delete — the whole point of the in-place rich edit.
     adapter._bot.edit_message_text.assert_not_called()
     adapter._bot.delete_message.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_suppresses_only_exact_ptb_raw_endpoint_warning():
+    adapter = _make_adapter()
+
+    async def raw_edit(endpoint, api_kwargs=None):
+        warnings.warn(
+            "Please use 'Bot.editMessageText' instead of "
+            "'Bot.do_api_request(\"editMessageText\", ...)'",
+            PTBUserWarning,
+        )
+        return {"message_id": api_kwargs["message_id"]}
+
+    adapter._bot.do_api_request = raw_edit
+
+    with warnings.catch_warnings(record=True) as caught:
+        warnings.simplefilter("always")
+        result = await adapter.edit_message(
+            "12345", "555", RICH_CONTENT, finalize=True,
+        )
+
+    assert result.success is True
+    assert caught == []
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_does_not_suppress_unrelated_ptb_warning():
+    adapter = _make_adapter()
+
+    async def raw_edit(endpoint, api_kwargs=None):
+        warnings.warn("A different PTB compatibility warning", PTBUserWarning)
+        return {"message_id": api_kwargs["message_id"]}
+
+    adapter._bot.do_api_request = raw_edit
+
+    with pytest.warns(PTBUserWarning, match="different PTB compatibility"):
+        result = await adapter.edit_message(
+            "12345", "555", RICH_CONTENT, finalize=True,
+        )
+
+    assert result.success is True
+
+
+@pytest.mark.asyncio
+async def test_finalize_edit_uses_public_ptb_method_when_rich_model_is_supported(
+    monkeypatch,
+):
+    import telegram
+
+    adapter = _make_adapter()
+    calls = []
+
+    class InputRichMessage:
+        @classmethod
+        def de_json(cls, payload, bot):
+            return ("rich-model", payload, bot)
+
+    class RichMessage:
+        pass
+
+    async def edit_message_text(*, chat_id, message_id, rich_message):
+        calls.append((chat_id, message_id, rich_message))
+        return MagicMock(message_id=message_id)
+
+    monkeypatch.setattr(
+        telegram, "InputRichMessage", InputRichMessage, raising=False
+    )
+    monkeypatch.setattr(telegram, "RichMessage", RichMessage, raising=False)
+    adapter._bot.edit_message_text = edit_message_text
+
+    result = await adapter.edit_message(
+        "12345", "555", RICH_CONTENT, finalize=True,
+    )
+
+    assert result.success is True
+    assert calls == [
+        (
+            12345,
+            555,
+            ("rich-model", {"markdown": RICH_CONTENT}, adapter._bot),
+        )
+    ]
+    adapter._bot.do_api_request.assert_not_called()
 
 
 @pytest.mark.asyncio

@@ -229,6 +229,15 @@ class TestToolsetConsistency:
         # silently let a platform diverge so far that nothing is shared).
         assert len(core) > 20, f"Suspiciously small shared core: {len(core)} tools"
 
+    def test_documented_teams_and_google_chat_composites_use_exact_core_contract(self):
+        from toolsets import _HERMES_CORE_TOOLS
+
+        for name in ("hermes-teams", "hermes-google_chat"):
+            assert name in TOOLSETS
+            assert TOOLSETS[name]["tools"] is _HERMES_CORE_TOOLS
+            assert TOOLSETS[name]["includes"] == []
+            assert resolve_toolset(name) == sorted(set(_HERMES_CORE_TOOLS))
+
 
 class TestPluginToolsets:
     def test_get_all_toolsets_includes_plugin_toolset(self, monkeypatch):

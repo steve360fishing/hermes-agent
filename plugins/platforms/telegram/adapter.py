@@ -16,10 +16,21 @@ import os
 import html as _html
 import re
 import threading
+import warnings
 from datetime import datetime, timezone
 from typing import Dict, List, Optional, Set, Any
 
 logger = logging.getLogger(__name__)
+
+_PTB_RAW_EDIT_WARNING = (
+    "Please use 'Bot.editMessageText' instead of "
+    "'Bot.do_api_request(\"editMessageText\", ...)'"
+)
+
+try:
+    from telegram.warnings import PTBUserWarning as _PTBUserWarning
+except ImportError:  # pragma: no cover - exercised by the gateway test double
+    _PTBUserWarning = UserWarning
 
 
 def _redact_telegram_error_text(error: object) -> str:
@@ -1728,10 +1739,24 @@ class TelegramAdapter(BasePlatformAdapter):
         if getattr(self, "_disable_link_previews", False):
             payload["link_preview_options"] = {"is_disabled": True}
         try:
-            # Raw Bot API result; do not request return_type=Message (PTB does
-            # not fully model the 10.1 response shape yet — a post-edit parse
-            # error must not be mistaken for a failed edit).
-            await self._bot.do_api_request("editMessageText", api_kwargs=payload)
+            public_edit = self._public_rich_edit_call(payload)
+            if public_edit is not None:
+                method, kwargs = public_edit
+                await method(**kwargs)
+            else:
+                # Raw Bot API result; do not request return_type=Message (PTB
+                # 22.x does not model RichMessage yet). PTB warns whenever a
+                # known endpoint is reached through do_api_request; suppress
+                # only that exact compatibility warning for this call.
+                with warnings.catch_warnings():
+                    warnings.filterwarnings(
+                        "ignore",
+                        message=f"^{re.escape(_PTB_RAW_EDIT_WARNING)}$",
+                        category=_PTBUserWarning,
+                    )
+                    await self._bot.do_api_request(
+                        "editMessageText", api_kwargs=payload
+                    )
         except Exception as exc:
             if self._is_rich_fallback_error(exc):
                 if self._is_rich_capability_error(exc):
@@ -1775,6 +1800,44 @@ class TelegramAdapter(BasePlatformAdapter):
         except Exception:
             pass
         return SendResult(success=True, message_id=message_id)
+
+    def _public_rich_edit_call(self, payload: Dict[str, Any]):
+        """Return PTB's public rich-edit call once its model is available.
+
+        Current PTB 22.x exposes ``edit_message_text`` but not the ``rich_message``
+        parameter, ``InputRichMessage`` request model, or ``RichMessage`` response
+        model, so it must stay on the raw Bot API path. Future PTB versions can
+        take the public path without a version string check once all capabilities
+        are present.
+        """
+        try:
+            import telegram
+
+            input_rich_model = getattr(telegram, "InputRichMessage", None)
+            output_rich_model = getattr(telegram, "RichMessage", None)
+            method = getattr(self._bot, "edit_message_text", None)
+            if (
+                not inspect.isclass(input_rich_model)
+                or not inspect.isclass(output_rich_model)
+                or not callable(method)
+            ):
+                return None
+            signature = inspect.signature(method)
+            if "rich_message" not in signature.parameters:
+                return None
+            rich_message = input_rich_model.de_json(
+                payload["rich_message"], self._bot
+            )
+        except (AttributeError, TypeError, ValueError):
+            return None
+
+        kwargs = {
+            key: value
+            for key, value in payload.items()
+            if key in signature.parameters and key != "rich_message"
+        }
+        kwargs["rich_message"] = rich_message
+        return method, kwargs
 
     def _should_attempt_rich_draft(self, content: str) -> bool:
         return bool(
