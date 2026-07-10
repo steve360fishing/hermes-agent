@@ -2129,6 +2129,16 @@ DEFAULT_CONFIG = {
         # Flip to true only if you trust delegated work to run dangerous cmds
         # without human review (cron pipelines, batch automation, etc.).
         "subagent_auto_approve": False,
+        # Steve's fail-closed GPT-5.6 route contract. Disabled in the generic
+        # source default; the reviewed deployment overlay enables it only after
+        # Sol/Terra/Luna availability has been verified for this account.
+        "gpt56_routing": {
+            "enabled": False,
+            "contract": "gpt56-routing-v3",
+            "provider": "openai-codex",
+            "max_children": 3,
+            "max_depth": 1,
+        },
     },
 
     # Ephemeral prefill messages file — JSON list of {role, content} dicts

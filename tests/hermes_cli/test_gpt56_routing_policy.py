@@ -103,3 +103,19 @@ def test_protected_routes_never_inherit_fallback() -> None:
     assert routing.route_spec("expert").allow_fallback is False
     assert routing.auxiliary_spec("approval").allow_fallback is False
     assert routing.auxiliary_spec("vision").allow_fallback is True
+
+
+def test_operator_config_validator_is_shared_and_fail_closed() -> None:
+    routing = _routing()
+    valid = {
+        "enabled": True,
+        "contract": routing.ROUTING_CONTRACT,
+        "provider": routing.PRIMARY_PROVIDER,
+        "max_children": routing.MAX_CHILDREN,
+        "max_depth": routing.MAX_DEPTH,
+    }
+
+    assert routing.validate_operator_config(valid) is True
+    assert routing.validate_operator_config({"enabled": False}) is False
+    with pytest.raises(routing.RoutingPolicyError, match="provider must be"):
+        routing.validate_operator_config({**valid, "provider": "openrouter"})

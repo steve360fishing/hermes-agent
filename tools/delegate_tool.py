@@ -351,6 +351,21 @@ def _normalize_role(r: Optional[str]) -> str:
     return "leaf"
 
 
+def _get_gpt56_routing_config(cfg: Optional[dict] = None):
+    """Return the operator config for GPT-5.6 routing."""
+    source = cfg if isinstance(cfg, dict) else _load_config()
+    if not isinstance(source, dict) or "gpt56_routing" not in source:
+        return {}
+    return source.get("gpt56_routing")
+
+
+def _gpt56_routing_enabled(cfg: Optional[dict] = None) -> bool:
+    routing = _get_gpt56_routing_config(cfg)
+    from hermes_cli.gpt56_routing import validate_operator_config
+
+    return validate_operator_config(routing)
+
+
 def _get_max_concurrent_children() -> int:
     """Read delegation.max_concurrent_children from config, falling back to
     DELEGATION_MAX_CONCURRENT_CHILDREN env var, then the default (3).
@@ -361,6 +376,7 @@ def _get_max_concurrent_children() -> int:
     uses, keeping config priority consistent (config.yaml > env > default).
     """
     cfg = _load_config()
+    gpt56_enabled = _gpt56_routing_enabled(cfg)
     val = cfg.get("max_concurrent_children")
     if val is not None:
         try:
@@ -374,7 +390,7 @@ def _get_max_concurrent_children() -> int:
                         "independently. High values multiply cost linearly.",
                         result,
                     )
-            return result
+            return min(result, 3) if gpt56_enabled else result
         except (TypeError, ValueError):
             logger.warning(
                 "delegation.max_concurrent_children=%r is not a valid integer; "
@@ -386,7 +402,8 @@ def _get_max_concurrent_children() -> int:
     env_val = os.getenv("DELEGATION_MAX_CONCURRENT_CHILDREN")
     if env_val:
         try:
-            return max(1, int(env_val))
+            result = max(1, int(env_val))
+            return min(result, 3) if gpt56_enabled else result
         except (TypeError, ValueError):
             return _DEFAULT_MAX_CONCURRENT_CHILDREN
     return _DEFAULT_MAX_CONCURRENT_CHILDREN
@@ -404,10 +421,12 @@ def _get_max_async_children() -> int:
     max_concurrent_children, which bounds a single synchronous batch.
     """
     cfg = _load_config()
+    gpt56_enabled = _gpt56_routing_enabled(cfg)
     val = cfg.get("max_async_children")
     if val is not None:
         try:
-            return max(1, int(val))
+            result = max(1, int(val))
+            return min(result, 3) if gpt56_enabled else result
         except (TypeError, ValueError):
             logger.warning(
                 "delegation.max_async_children=%r is not a valid integer; "
@@ -418,7 +437,8 @@ def _get_max_async_children() -> int:
     env_val = os.getenv("DELEGATION_MAX_ASYNC_CHILDREN")
     if env_val:
         try:
-            return max(1, int(env_val))
+            result = max(1, int(env_val))
+            return min(result, 3) if gpt56_enabled else result
         except (TypeError, ValueError):
             return _DEFAULT_MAX_ASYNC_CHILDREN
     return _DEFAULT_MAX_ASYNC_CHILDREN
@@ -482,6 +502,8 @@ def _get_max_spawn_depth() -> int:
     extra level multiplies API cost, so raise it deliberately.
     """
     cfg = _load_config()
+    if _gpt56_routing_enabled(cfg):
+        return 1
     val = cfg.get("max_spawn_depth")
     if val is None:
         return MAX_DEPTH
@@ -513,6 +535,8 @@ def _get_orchestrator_enabled() -> bool:
     Lets an operator disable the feature without a code revert.
     """
     cfg = _load_config()
+    if _gpt56_routing_enabled(cfg):
+        return False
     val = cfg.get("orchestrator_enabled", True)
     if isinstance(val, bool):
         return val
@@ -1064,6 +1088,8 @@ def _build_child_agent(
     # 'leaf' (default) cannot; 'orchestrator' retains the delegation
     # toolset subject to depth/kill-switch bounds applied below.
     role: str = "leaf",
+    # Independently resolved GPT-5.6 route. None preserves legacy behavior.
+    routing_spec=None,
 ):
     """
     Build a child AIAgent on the main thread (thread-safe construction).
@@ -1253,11 +1279,16 @@ def _build_child_agent(
         effective_provider = "copilot-acp"
         effective_api_mode = "chat_completions"
 
-    # Resolve reasoning config: delegation override > parent inherit
+    # Resolve reasoning config: per-task GPT-5.6 route > delegation override
+    # > parent inherit.
     parent_reasoning = getattr(parent_agent, "reasoning_config", None)
     child_reasoning = parent_reasoning
     try:
-        delegation_effort = str(delegation_cfg.get("reasoning_effort") or "").strip()
+        delegation_effort = str(
+            getattr(routing_spec, "effort", "")
+            or delegation_cfg.get("reasoning_effort")
+            or ""
+        ).strip()
         if delegation_effort:
             from hermes_constants import parse_reasoning_effort
 
@@ -1276,7 +1307,7 @@ def _build_child_agent(
     # from rate-limits and credential exhaustion exactly like the top-level
     # agent does.  _fallback_chain is a list accepted by AIAgent's
     # fallback_model parameter (which handles both list and dict forms).
-    parent_fallback = getattr(parent_agent, "_fallback_chain", None) or None
+    parent_fallback = _fallback_chain_for_route(parent_agent, routing_spec)
 
     # Inherit the parent's OpenRouter provider-preference filters by default
     # (so subagents routed to the same provider honour the same routing
@@ -1340,6 +1371,9 @@ def _build_child_agent(
     # Stash the post-degrade role for introspection (leaf if the
     # kill switch or depth bounded the caller's requested role).
     child._delegate_role = effective_role
+    if routing_spec is not None:
+        child._gpt56_route_metadata = routing_spec.as_contract()
+        child._gpt56_route_protected = bool(getattr(routing_spec, "protected", False))
     # Stash subagent identity for nested-delegation event propagation and
     # for _run_single_child / interrupt_subagent to look up by id.
     child._subagent_id = subagent_id
@@ -1396,6 +1430,16 @@ def _build_child_agent(
         logger.debug("subagent_start hook invocation failed", exc_info=True)
 
     return child
+
+
+def _fallback_chain_for_route(parent_agent, routing_spec=None):
+    """Keep continuity fallback for ordinary work; fail closed for Sol gates."""
+    chain = getattr(parent_agent, "_fallback_chain", None) or None
+    if routing_spec is not None and not bool(
+        getattr(routing_spec, "allow_fallback", True)
+    ):
+        return None
+    return chain
 
 
 def _dump_subagent_timeout_diagnostic(
@@ -1717,6 +1761,19 @@ def _apply_summary_budget(results: List[Dict[str, Any]], parent_agent) -> None:
         )
 
 
+def _child_routing_contract(child) -> Optional[Dict[str, Any]]:
+    """Return explicit route/fallback metadata captured before child teardown."""
+    raw = getattr(child, "_gpt56_route_metadata", None)
+    if not isinstance(raw, dict):
+        return None
+    metadata = dict(raw)
+    metadata["fallback_used"] = bool(getattr(child, "_fallback_activated", False))
+    provider = getattr(child, "provider", None)
+    if isinstance(provider, str) and provider.strip():
+        metadata["provider"] = provider.strip()
+    return metadata
+
+
 def _run_single_child(
     task_index: int,
     goal: str,
@@ -2016,6 +2073,7 @@ def _run_single_child(
                 "duration_seconds": duration,
                 "_child_role": getattr(child, "_delegate_role", None),
                 "diagnostic_path": diagnostic_path,
+                "routing": _child_routing_contract(child),
             }
         finally:
             # Shut down executor without waiting — if the child thread
@@ -2119,6 +2177,7 @@ def _run_single_child(
                 ),
             },
             "tool_trace": tool_trace,
+            "routing": _child_routing_contract(child),
             # Captured before the finally block calls child.close() so the
             # parent thread can fire subagent_stop with the correct role.
             # Stripped before the dict is serialised back to the model.
@@ -2258,6 +2317,7 @@ def _run_single_child(
             "api_calls": 0,
             "duration_seconds": duration,
             "_child_role": getattr(child, "_delegate_role", None),
+            "routing": _child_routing_contract(child),
         }
 
     finally:
@@ -2336,6 +2396,79 @@ def _recover_tasks_from_json_string(
     return parsed, None
 
 
+def _resolve_task_route_specs(
+    task_list: List[Dict[str, Any]],
+    *,
+    cfg: dict,
+    top_route: Optional[str],
+    top_reason: Optional[str],
+    mode: Optional[str],
+    parent_depth: int,
+) -> List[Any]:
+    """Resolve each child independently under the optional GPT-5.6 policy."""
+    normalized_mode = str(mode or "standard").strip().lower()
+    if normalized_mode not in {"standard", "ultra"}:
+        raise ValueError("delegate_task mode must be 'standard' or 'ultra'")
+
+    enabled = _gpt56_routing_enabled(cfg)
+    route_fields_present = bool(top_route or top_reason) or any(
+        isinstance(task, dict)
+        and any(key in task for key in ("route", "reason", "independent"))
+        for task in task_list
+    )
+    if not enabled:
+        if normalized_mode == "ultra" or route_fields_present:
+            raise ValueError(
+                "GPT-5.6 route selection is disabled. Enable "
+                "delegation.gpt56_routing only after account capability validation."
+            )
+        return [None] * len(task_list)
+
+    from hermes_cli.gpt56_routing import (
+        RoutingPolicyError,
+        route_spec,
+        validate_ultra_tasks,
+    )
+
+    try:
+        if normalized_mode == "ultra":
+            return list(validate_ultra_tasks(task_list, parent_depth=parent_depth))
+        if len(task_list) > 3:
+            raise RoutingPolicyError(
+                "GPT-5.6 routing allows at most three delegated children"
+            )
+
+        resolved = []
+        for index, task in enumerate(task_list):
+            if str(task.get("role") or "leaf").strip().lower() != "leaf":
+                raise RoutingPolicyError(
+                    "GPT-5.6 routing forbids recursive fan-out; every child must be a leaf"
+                )
+            requested_route = str(task.get("route") or top_route or "").strip()
+            requested_reason = str(task.get("reason") or top_reason or "").strip()
+            if not requested_route:
+                requested_route = "expert"
+                requested_reason = (
+                    requested_reason
+                    or "unclassified delegation defaulted upward to expert"
+                )
+            elif not requested_reason:
+                raise RoutingPolicyError(
+                    f"delegated task {index + 1} with explicit route "
+                    f"{requested_route!r} requires a routing reason"
+                )
+            resolved.append(
+                route_spec(
+                    requested_route,
+                    reason=requested_reason,
+                    fanout_depth=parent_depth + 1,
+                )
+            )
+        return resolved
+    except RoutingPolicyError as exc:
+        raise ValueError(str(exc)) from exc
+
+
 def delegate_task(
     goal: Optional[str] = None,
     context: Optional[str] = None,
@@ -2344,6 +2477,9 @@ def delegate_task(
     acp_command: Optional[str] = None,
     acp_args: Optional[List[str]] = None,
     role: Optional[str] = None,
+    route: Optional[str] = None,
+    reason: Optional[str] = None,
+    mode: Optional[str] = None,
     background: Optional[bool] = None,
     parent_agent=None,
 ) -> str:
@@ -2351,8 +2487,8 @@ def delegate_task(
     Spawn one or more child agents to handle delegated tasks.
 
     Supports two modes:
-      - Single: provide goal (+ optional context, toolsets, role)
-      - Batch:  provide tasks array [{goal, context, toolsets, role}, ...]
+      - Single: provide goal (+ optional context, role, route, reason)
+      - Batch:  provide tasks array [{goal, context, role, route, reason}, ...]
 
     The 'role' parameter controls whether a child can further delegate:
     'leaf' (default) cannot; 'orchestrator' retains the delegation
@@ -2382,6 +2518,14 @@ def delegate_task(
     # the completion queue on its own, carrying its own handle. There's no
     # combined "wait for all" — fan-out is exactly N background subagents.
     background = is_truthy_value(background, default=False) if background is not None else False
+
+    # Validate the complete nested contract before any depth, concurrency, or
+    # model logic acts on an enabled policy. Invalid metadata is a tool error,
+    # never a reason to fall back to legacy delegation behavior.
+    try:
+        _gpt56_routing_enabled(_load_config())
+    except ValueError as exc:
+        return tool_error(str(exc))
 
     # Depth limit — configurable via delegation.max_spawn_depth,
     # default 2 for parity with the original MAX_DEPTH constant.
@@ -2415,16 +2559,6 @@ def delegate_task(
             max_iterations, default_max_iter,
         )
     effective_max_iter = default_max_iter
-
-    # Resolve delegation credentials (provider:model pair).
-    # When delegation.provider is configured, this resolves the full credential
-    # bundle (base_url, api_key, api_mode) via the same runtime provider system
-    # used by CLI/gateway startup.  When unconfigured, returns None values so
-    # children inherit from the parent.
-    try:
-        creds = _resolve_delegation_credentials(cfg, parent_agent)
-    except ValueError as exc:
-        return tool_error(str(exc))
 
     # Normalize to task list
     max_children = _get_max_concurrent_children()
@@ -2461,6 +2595,30 @@ def delegate_task(
         if not task.get("goal", "").strip():
             return tool_error(f"Task {i} is missing a 'goal'.")
 
+    try:
+        route_specs = _resolve_task_route_specs(
+            task_list,
+            cfg=cfg,
+            top_route=route,
+            top_reason=reason,
+            mode=mode,
+            parent_depth=depth,
+        )
+        task_creds = []
+        for spec in route_specs:
+            task_cfg = dict(cfg)
+            if spec is not None:
+                task_cfg.update(
+                    {
+                        "model": spec.model,
+                        "provider": spec.provider,
+                        "reasoning_effort": spec.effort,
+                    }
+                )
+            task_creds.append(_resolve_delegation_credentials(task_cfg, parent_agent))
+    except ValueError as exc:
+        return tool_error(str(exc))
+
     overall_start = time.monotonic()
     results = []
 
@@ -2481,6 +2639,8 @@ def delegate_task(
     children = []
     try:
         for i, t in enumerate(task_list):
+            creds = task_creds[i]
+            routing_spec = route_specs[i]
             task_acp_args = t.get("acp_args") if "acp_args" in t else None
             # Per-task role beats top-level; normalise again so unknown
             # per-task values warn and degrade to leaf uniformly.
@@ -2509,6 +2669,7 @@ def delegate_task(
                     else (acp_args if acp_args is not None else creds.get("args"))
                 ),
                 role=effective_role,
+                routing_spec=routing_spec,
             )
             # Override with correct parent tool names (before child construction mutated global)
             child._delegate_saved_tool_names = _parent_tool_names
@@ -2580,6 +2741,9 @@ def delegate_task(
                                         "_child_role": getattr(
                                             _child_by_index.get(idx), "_delegate_role", None
                                         ),
+                                        "routing": _child_routing_contract(
+                                            _child_by_index.get(idx)
+                                        ),
                                     }
                             else:
                                 entry = {
@@ -2591,6 +2755,9 @@ def delegate_task(
                                     "duration_seconds": 0,
                                     "_child_role": getattr(
                                         _child_by_index.get(idx), "_delegate_role", None
+                                    ),
+                                    "routing": _child_routing_contract(
+                                        _child_by_index.get(idx)
                                     ),
                                 }
                             results.append(entry)
@@ -2616,6 +2783,9 @@ def delegate_task(
                                 "duration_seconds": 0,
                                 "_child_role": getattr(
                                     _child_by_index.get(idx), "_delegate_role", None
+                                ),
+                                "routing": _child_routing_contract(
+                                    _child_by_index.get(idx)
                                 ),
                             }
                         results.append(entry)
@@ -2829,6 +2999,11 @@ def delegate_task(
                     pass
 
         _goals = [t["goal"] for t in task_list]
+        _routed_models = {
+            str(item.get("model") or getattr(parent_agent, "model", "") or "")
+            for item in task_creds
+        }
+        _dispatch_model = next(iter(_routed_models)) if len(_routed_models) == 1 else None
         dispatch = dispatch_async_delegation_batch(
             goals=_goals,
             context=context,
@@ -2836,11 +3011,16 @@ def delegate_task(
             # parent's toolsets (no model-facing toolsets arg).
             toolsets=None,
             role=top_role,
-            model=creds["model"],
+            model=_dispatch_model,
             session_key=_session_key,
             runner=_batch_runner,
             interrupt_fn=_batch_interrupt,
             max_async_children=_get_max_async_children(),
+            capacity_units=(
+                len(_goals)
+                if any(spec is not None for spec in route_specs)
+                else 1
+            ),
         )
 
         if dispatch.get("status") == "dispatched":
@@ -2863,6 +3043,10 @@ def delegate_task(
                 "count": n,
                 "delegation_id": dispatch["delegation_id"],
                 "goals": _goals,
+                "routing": [
+                    spec.as_contract() if spec is not None else None
+                    for spec in route_specs
+                ],
                 "note": note,
             }
             return json.dumps(payload, ensure_ascii=False)
@@ -3141,6 +3325,7 @@ def _build_top_level_description() -> str:
         orchestrator_on = _get_orchestrator_enabled()
     except Exception:
         orchestrator_on = True
+    gpt56_enabled = _gpt56_routing_enabled()
 
     if max_depth >= 2 and orchestrator_on:
         nesting_clause = (
@@ -3163,6 +3348,16 @@ def _build_top_level_description() -> str:
             f"cannot delegate further. Raise delegation.max_spawn_depth in "
             f"config.yaml to enable nesting."
         )
+
+    route_clause = (
+        "- GPT-5.6 routing IS enabled. Classify every child independently with "
+        "route=explorer|worker|reviewer|expert and a non-secret reason. Omitted "
+        "classification defaults upward to expert. For mode='ultra', provide "
+        "exactly 2-3 genuinely independent tasks, each with independent=true, "
+        "an explicit route, and role='leaf'.\n"
+        if gpt56_enabled
+        else "- GPT-5.6 per-task routing is disabled on this install; omit route, reason, mode, and independent.\n"
+    )
 
     return (
         "Spawn one or more subagents to work on tasks in isolated contexts. "
@@ -3217,7 +3412,7 @@ def _build_top_level_description() -> str:
         f"Orchestrators are bounded by max_spawn_depth={max_depth} for this "
         f"user and can be disabled globally via "
         "delegation.orchestrator_enabled=false.\n"
-        "- Subagent model is NOT selectable per call: children inherit the parent model (plus its fallback chain) unless you pin all subagents to a model via delegation.provider / delegation.model in config.yaml.\n"
+        + route_clause +
         "- Each subagent gets its own terminal session (separate working directory and state).\n"
         "- Results are always returned as an array, one entry per task."
     )
@@ -3401,6 +3596,19 @@ DELEGATE_TASK_SCHEMA = {
                             "enum": ["leaf", "orchestrator"],
                             "description": "Per-task role override. See top-level 'role' for semantics.",
                         },
+                        "route": {
+                            "type": "string",
+                            "enum": ["explorer", "worker", "reviewer", "expert"],
+                            "description": "Independent GPT-5.6 route for this task when operator routing is enabled.",
+                        },
+                        "reason": {
+                            "type": "string",
+                            "description": "Required non-secret explanation for the selected route.",
+                        },
+                        "independent": {
+                            "type": "boolean",
+                            "description": "Set true only for genuinely independent mode='ultra' workstreams.",
+                        },
                     },
                     "required": ["goal"],
                 },
@@ -3413,6 +3621,20 @@ DELEGATE_TASK_SCHEMA = {
                 "type": "string",
                 "enum": ["leaf", "orchestrator"],
                 "description": "(rebuilt at get_definitions() time)",
+            },
+            "route": {
+                "type": "string",
+                "enum": ["explorer", "worker", "reviewer", "expert"],
+                "description": "Route for a single task or default for batch tasks when GPT-5.6 routing is enabled.",
+            },
+            "reason": {
+                "type": "string",
+                "description": "Non-secret routing explanation for the top-level route.",
+            },
+            "mode": {
+                "type": "string",
+                "enum": ["standard", "ultra"],
+                "description": "Use ultra only for 2-3 independent, explicitly routed leaf workstreams.",
             },
             "background": {
                 "type": "boolean",
@@ -3486,6 +3708,9 @@ registry.register(
         acp_command=args.get("acp_command"),
         acp_args=args.get("acp_args"),
         role=args.get("role"),
+        route=args.get("route"),
+        reason=args.get("reason"),
+        mode=args.get("mode"),
         background=_model_background_value(args, kw.get("parent_agent")),
         parent_agent=kw.get("parent_agent"),
     ),
