@@ -238,7 +238,7 @@ class TestRunSingleChildTimeoutDump:
         """Run _run_single_child with a tiny timeout to force the timeout branch."""
         from tools import delegate_tool
         # Force a 0.3s timeout so the test is fast
-        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda: 0.3)
+        monkeypatch.setattr(delegate_tool, "_get_child_timeout", lambda _cfg=None: 0.3)
 
         parent = MagicMock()
         parent._touch_activity = MagicMock()
