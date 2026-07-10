@@ -217,8 +217,7 @@ def _resolve_cron_reasoning_config(job: dict, cfg: dict) -> dict | None:
     agent_cfg = cfg.get("agent") or {}
     if not isinstance(agent_cfg, dict):
         agent_cfg = {}
-    global_effort = str(agent_cfg.get("reasoning_effort") or "").strip()
-    return parse_reasoning_effort(global_effort)
+    return parse_reasoning_effort(agent_cfg.get("reasoning_effort"))
 
 # Valid delivery platforms — used to validate user-supplied platform names
 # in cron delivery targets, preventing env var enumeration via crafted names.

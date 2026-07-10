@@ -283,6 +283,15 @@ def test_scheduler_without_job_effort_uses_global(tmp_path, monkeypatch):
     }
 
 
+def test_scheduler_preserves_yaml_boolean_false_global_reasoning():
+    from cron.scheduler import _resolve_cron_reasoning_config
+
+    assert _resolve_cron_reasoning_config(
+        {},
+        {"agent": {"reasoning_effort": False}},
+    ) == {"enabled": False}
+
+
 def test_scheduler_invalid_persisted_effort_fails_before_inference(
     tmp_path, monkeypatch
 ):
