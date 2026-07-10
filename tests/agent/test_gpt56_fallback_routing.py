@@ -14,6 +14,130 @@ def _response(text: str = "fallback ok") -> SimpleNamespace:
     )
 
 
+def _enabled_routing_config() -> dict:
+    return {
+        "delegation": {
+            "gpt56_routing": {
+                "enabled": True,
+                "contract": "gpt56-routing-v3",
+                "provider": "openai-codex",
+                "max_children": 3,
+                "max_depth": 1,
+            }
+        }
+    }
+
+
+def _same_fallback_retry_case(kind: str) -> tuple[Exception, dict]:
+    if kind == "transient":
+        return ConnectionError("connection reset"), {}
+    if kind == "temperature":
+        return RuntimeError("Unsupported parameter: temperature is not supported"), {
+            "temperature": 0.2
+        }
+    if kind == "max_tokens":
+        return RuntimeError("Unsupported parameter: max_tokens is not supported"), {
+            "max_tokens": 100
+        }
+    raise AssertionError(f"unknown retry kind: {kind}")
+
+
+def _assert_actual_fallback_report(report: MagicMock) -> None:
+    report.assert_called_once()
+    reported = report.call_args.kwargs
+    assert reported["task"] == "compression"
+    assert reported["policy_spec"] is not None
+    assert reported["provider_id"] == "anthropic"
+    assert reported["source_label"] == "fallback_chain[0](anthropic)"
+    assert reported["succeeded"] is True
+
+
+@pytest.mark.parametrize("retry_kind", ["transient", "temperature", "max_tokens"])
+def test_sync_initial_fallback_reports_once_after_successful_same_candidate_retry(
+    monkeypatch, retry_kind: str
+) -> None:
+    first_error, call_options = _same_fallback_retry_case(retry_kind)
+    fallback_client = MagicMock()
+    fallback_client.base_url = "https://api.anthropic.com/v1"
+    fallback_client.chat.completions.create.side_effect = [
+        first_error,
+        _response("retry ok"),
+    ]
+    report = MagicMock()
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: _enabled_routing_config()
+    )
+    monkeypatch.setattr(auxiliary, "_get_cached_client", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(
+        auxiliary,
+        "_try_configured_fallback_for_unavailable_client",
+        lambda *args, **kwargs: (
+            fallback_client,
+            "claude-3-5-haiku-latest",
+            "fallback_chain[0](anthropic)",
+        ),
+    )
+    monkeypatch.setattr(auxiliary, "_transient_retry_count", lambda: 1)
+    monkeypatch.setattr(auxiliary, "_TRANSIENT_RETRY_BACKOFF_BASE", 0.0)
+    monkeypatch.setattr(auxiliary, "_report_fallback_attempt", report)
+
+    result = auxiliary.call_llm(
+        task="compression",
+        messages=[{"role": "user", "content": "compress"}],
+        **call_options,
+    )
+
+    assert result.choices[0].message.content == "retry ok"
+    assert fallback_client.chat.completions.create.call_count == 2
+    _assert_actual_fallback_report(report)
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("retry_kind", ["transient", "temperature", "max_tokens"])
+async def test_async_initial_fallback_reports_once_after_successful_same_candidate_retry(
+    monkeypatch, retry_kind: str
+) -> None:
+    first_error, call_options = _same_fallback_retry_case(retry_kind)
+    fallback_sync = MagicMock()
+    fallback_async = MagicMock()
+    fallback_async.base_url = "https://api.anthropic.com/v1"
+    fallback_async.chat.completions.create = AsyncMock(
+        side_effect=[first_error, _response("retry ok")]
+    )
+    report = MagicMock()
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config", lambda: _enabled_routing_config()
+    )
+    monkeypatch.setattr(auxiliary, "_get_cached_client", lambda *args, **kwargs: (None, None))
+    monkeypatch.setattr(
+        auxiliary,
+        "_try_configured_fallback_for_unavailable_client",
+        lambda *args, **kwargs: (
+            fallback_sync,
+            "claude-3-5-haiku-latest",
+            "fallback_chain[0](anthropic)",
+        ),
+    )
+    monkeypatch.setattr(
+        auxiliary,
+        "_to_async_client",
+        lambda *args, **kwargs: (fallback_async, "claude-3-5-haiku-latest"),
+    )
+    monkeypatch.setattr(auxiliary, "_report_fallback_attempt", report)
+
+    result = await auxiliary.async_call_llm(
+        task="compression",
+        messages=[{"role": "user", "content": "compress"}],
+        **call_options,
+    )
+
+    assert result.choices[0].message.content == "retry ok"
+    assert fallback_async.chat.completions.create.await_count == 2
+    _assert_actual_fallback_report(report)
+
+
 def test_sync_fallback_uses_provider_id_and_strips_incompatible_reasoning(
     monkeypatch,
 ) -> None:
