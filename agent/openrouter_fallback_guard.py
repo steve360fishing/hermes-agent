@@ -7,9 +7,9 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-OPENROUTER_FALLBACK_MODEL = "anthropic/claude-haiku-4.5"
+OPENROUTER_FALLBACK_MODEL = "x-ai/grok-4.5"
 OPENROUTER_FALLBACK_NOTICE = (
-    "OPENROUTER FALLBACK ACTIVE: using anthropic/claude-haiku-4.5 because "
+    "OPENROUTER FALLBACK ACTIVE: using x-ai/grok-4.5 because "
     "GPT-5.6 subscription access failed."
 )
 _OPENROUTER_GPT55_MODELS = {"openai/gpt-5.5", "openai/gpt-5.5-pro"}
@@ -82,7 +82,7 @@ def record_openrouter_fallback_activation(
                 "category": str(reason or "primary_failed"),
                 "safe_summary": (
                     "GPT-5.6 subscription route failed; Hermes entered visible "
-                    "capped OpenRouter Haiku fallback."
+                    "capped OpenRouter Grok 4.5 fallback."
                 ),
             },
         }

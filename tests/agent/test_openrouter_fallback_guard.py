@@ -29,6 +29,10 @@ def _agent(**overrides):
     return SimpleNamespace(**values)
 
 
+def test_incident_fallback_is_exactly_grok_45_via_openrouter() -> None:
+    assert OPENROUTER_FALLBACK_MODEL == "x-ai/grok-4.5"
+
+
 def test_gpt55_is_blocked_while_configured_openrouter_fallbacks_remain_compatible(
     tmp_path, monkeypatch
 ) -> None:
@@ -66,7 +70,16 @@ def test_fallback_is_visible_and_stops_at_turn_cap(tmp_path, monkeypatch) -> Non
     response, changed = apply_openrouter_fallback_notice(agent, "continuity response")
     assert changed is True
     assert response.startswith("OPENROUTER FALLBACK ACTIVE")
+    assert "x-ai/grok-4.5" in response
     assert "GPT-5.6 subscription access failed" in response
+
+    health = __import__("json").loads(
+        (tmp_path / "health.json").read_text(encoding="utf-8")
+    )
+    assert health["status"] == "degraded"
+    assert health["active_provider"] == "openrouter"
+    assert health["active_model"] == "x-ai/grok-4.5"
+    assert "Grok 4.5" in health["last_failure"]["safe_summary"]
 
     cap_message = fallback_cap_message_if_exhausted(agent)
     assert cap_message is not None
