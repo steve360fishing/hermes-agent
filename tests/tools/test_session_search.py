@@ -319,6 +319,42 @@ class TestRoleFilter:
 
 
 class TestRecallPayloadSafety:
+    @pytest.mark.parametrize(
+        ("offset", "limit"),
+        [
+            (0, 100),
+            (7_990, 50),
+            (19_980, 100),
+        ],
+    )
+    def test_exact_message_content_slice_covers_start_middle_and_end(
+        self, db, offset, limit
+    ):
+        db.create_session("s_slice_boundaries", source="cli")
+        content = "".join(str(index % 10) for index in range(20_000))
+        message_id = db.append_message(
+            "s_slice_boundaries", role="user", content=content
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_slice_boundaries",
+                message_id=message_id,
+                content_offset=offset,
+                content_limit=limit,
+                db=db,
+            )
+        )
+
+        expected_end = min(len(content), offset + limit)
+        assert result["success"] is True
+        assert result["content"] == content[offset:expected_end]
+        assert result["next_content_offset"] == (
+            expected_end if expected_end < len(content) else None
+        )
+        assert result["has_more"] is (expected_end < len(content))
+
     def test_exact_message_content_slice_recovers_truncated_tail(self, db):
         db.create_session("s_large_tail", source="cli")
         large = "head " + ("a" * _MESSAGE_CONTENT_MAX_CHARS) + "TAIL_MARKER"

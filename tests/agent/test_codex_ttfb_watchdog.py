@@ -648,6 +648,61 @@ def test_large_codex_request_can_still_ttfb_reconnect_when_capped(tmp_path, monk
         stop["flag"] = True
 
 
+def test_incident_scale_codex_request_keeps_finite_watchdog(tmp_path, monkeypatch):
+    """The observed 1.16M-token incident shape must still time out finitely.
+
+    This exercises the recursive estimator and the large-request watchdog with
+    a Responses API payload at the same estimated scale as the production
+    incident, without making a provider call.
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_MAX_SECONDS", "1")
+
+    incident_payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "role": "tool",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "x" * 4_640_000,
+                    }
+                ],
+            }
+        ],
+    }
+    assert h.estimate_request_context_tokens(incident_payload) >= 1_160_000
+
+    closes: list[str | None] = []
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        cancel_check = api_kwargs["__hermes_request_cancel_check__"]
+        while not cancel_check():
+            time.sleep(0.02)
+        raise ConnectionError("watchdog closed incident-scale request")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    with pytest.raises(TimeoutError, match="TTFB threshold: 1s"):
+        h.interruptible_api_call(agent, incident_payload)
+    assert "codex_ttfb_kill" in closes
+
+
 def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch):
     """Operators can force the old early-reconnect behavior for large inputs
     with HERMES_CODEX_TTFB_STRICT=1."""
