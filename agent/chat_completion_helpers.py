@@ -80,12 +80,47 @@ def estimate_request_context_tokens(api_payload: Any) -> int:
       - any other dict -> fall back to summing string values
     """
 
-    def _chars(value: Any) -> int:
+    def _chars(value: Any, active_ids: Optional[set[int]] = None) -> int:
         if value is None:
             return 0
         if isinstance(value, str):
             return len(value)
-        return len(str(value))
+        if isinstance(value, (bytes, bytearray)):
+            return len(value)
+        if isinstance(value, (bool, int, float)):
+            return len(str(value))
+
+        active_ids = active_ids if active_ids is not None else set()
+        value_id = id(value)
+        if value_id in active_ids:
+            return 0
+        active_ids.add(value_id)
+        try:
+            if isinstance(value, dict):
+                return sum(
+                    _chars(key, active_ids) + _chars(item, active_ids)
+                    for key, item in value.items()
+                )
+            if isinstance(value, (list, tuple, set, frozenset)):
+                return sum(_chars(item, active_ids) for item in value)
+
+            model_dump = getattr(value, "model_dump", None)
+            if callable(model_dump):
+                try:
+                    return _chars(model_dump(), active_ids)
+                except Exception:
+                    pass
+
+            to_dict = getattr(value, "to_dict", None)
+            if callable(to_dict):
+                try:
+                    return _chars(to_dict(), active_ids)
+                except Exception:
+                    pass
+
+            return len(str(value))
+        finally:
+            active_ids.discard(value_id)
 
     def _message_chars(messages: Any) -> int:
         if not isinstance(messages, list):
@@ -381,7 +416,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # main retry loop can reconnect promptly. Large subscription-backed Codex
     # requests can legitimately spend tens of seconds in backend admission /
     # prompt prefill before the first SSE event, so the no-byte TTFB watchdog
-    # is disabled for large chatgpt.com/backend-api/codex requests. A second
+    # scales with request size but remains finite. A second
     # failure mode emits an opening SSE frame and then stalls forever in SSL
     # read; for that we watch the gap since the last Codex stream event. This
     # matches Codex CLI's stream_idle_timeout model: any valid SSE event is
@@ -459,6 +494,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if _codex_watchdog_enabled:
         # Reset before the worker starts so a marker left over from a previous
         # call on this agent can't be misread as first-byte for this one.
+        agent._codex_stream_first_event_ts = None
         agent._codex_stream_last_event_ts = None
         agent._codex_stream_last_progress_ts = None
 
@@ -662,6 +698,14 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
+    _first_event_ts = getattr(agent, "_codex_stream_first_event_ts", None)
+    if _codex_watchdog_enabled and _first_event_ts is not None:
+        logger.info(
+            "Codex stream first event received: ttfb=%.2fs model=%s context=~%s tokens",
+            max(0.0, _first_event_ts - _call_start),
+            api_kwargs.get("model", "unknown"),
+            f"{_est_tokens_for_codex_watchdog:,}",
+        )
     if result["error"] is not None:
         raise result["error"]
     # Success — clear the circuit breaker (#58962): the provider proved

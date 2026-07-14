@@ -851,7 +851,10 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     def _on_event(event: Any) -> None:
         # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        now = time.time()
+        if getattr(agent, "_codex_stream_first_event_ts", None) is None:
+            agent._codex_stream_first_event_ts = now
+        agent._codex_stream_last_event_ts = now
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:
