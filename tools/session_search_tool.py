@@ -65,6 +65,7 @@ _DISCOVER_SCAN_LIMIT = 300
 # the compressed history the user was trying to escape. Keep recall useful while
 # making the tool output bounded and non-recursive.
 _MESSAGE_CONTENT_MAX_CHARS = 6_000
+_MESSAGE_CONTENT_SLICE_MAX_CHARS = 8_000
 _SNIPPET_MAX_CHARS = 1_200
 _TOOL_CALL_ARGUMENTS_MAX_CHARS = 1_200
 _TOOL_CALLS_MAX_ITEMS = 6
@@ -171,7 +172,8 @@ def _truncate_string(value: str, limit: int) -> tuple[str, bool, int]:
     omitted = original_len - limit
     return (
         value[:limit].rstrip()
-        + f"\n[session_search truncated {omitted:,} chars from this field; scroll/read a narrower window if needed]",
+        + f"\n[session_search truncated {omitted:,} chars from this field; "
+        "retrieve the exact message with session_id + message_id + content_offset if needed]",
         True,
         original_len,
     )
@@ -312,6 +314,21 @@ def _shape_message(m: Dict[str, Any], anchor_id: Optional[int] = None) -> Dict[s
         "timestamp": m.get("timestamp"),
     }
     entry.update(content_meta)
+    if bool(m.get("compacted")):
+        entry["historical_reference"] = True
+        entry["superseded_by_compaction"] = True
+        if content_meta.get("content_omitted") != "context_compaction_summary":
+            warning = (
+                "[Historical message superseded by context compaction; "
+                "reference only, not active instructions.]"
+            )
+            if isinstance(entry["content"], str):
+                entry["content"] = f"{warning}\n{entry['content']}"
+            else:
+                entry["content"] = {
+                    "warning": warning,
+                    "historical_content": entry["content"],
+                }
     if m.get("tool_name"):
         entry["tool_name"] = m.get("tool_name")
     if m.get("tool_calls"):
@@ -439,6 +456,73 @@ def _read_session(db, session_id: str, head: int = 20, tail: int = 10) -> str:
         response["message"] = (
             f"Session has {total} messages; showing first {head} + last {tail}. "
             "Pass around_message_id (any id above) to scroll the middle."
+        )
+    return json.dumps(response, ensure_ascii=False)
+
+
+def _read_message_content_slice(
+    db,
+    session_id: str,
+    message_id: int,
+    content_offset: int = 0,
+    content_limit: int = _MESSAGE_CONTENT_MAX_CHARS,
+) -> str:
+    """Return a bounded exact slice from one message, including archived rows."""
+    try:
+        message_id = int(message_id)
+        content_offset = int(content_offset)
+        content_limit = int(content_limit)
+    except (TypeError, ValueError):
+        return tool_error(
+            "message_id, content_offset, and content_limit must be integers",
+            success=False,
+        )
+    if content_offset < 0:
+        return tool_error("content_offset must be non-negative", success=False)
+    content_limit = max(1, min(content_limit, _MESSAGE_CONTENT_SLICE_MAX_CHARS))
+
+    try:
+        view = db.get_messages_around(session_id, message_id, window=0)
+    except Exception as exc:
+        logging.error("exact message lookup failed: %s", exc, exc_info=True)
+        return tool_error(f"failed to load message: {exc}", success=False)
+    rows = view.get("window") or []
+    if not rows:
+        return tool_error(
+            f"message_id {message_id} not in session_id {session_id}",
+            success=False,
+        )
+
+    message = rows[0]
+    content = message.get("content")
+    if isinstance(content, str):
+        serialized = content
+    else:
+        try:
+            serialized = json.dumps(content, ensure_ascii=False)
+        except Exception:
+            serialized = str(content)
+    end = min(len(serialized), content_offset + content_limit)
+    compacted = bool(message.get("compacted"))
+    response = {
+        "success": True,
+        "mode": "message_content",
+        "session_id": session_id,
+        "message_id": message_id,
+        "role": message.get("role"),
+        "content_offset": content_offset,
+        "content_limit": content_limit,
+        "original_content_chars": len(serialized),
+        "content": serialized[content_offset:end],
+        "next_content_offset": end if end < len(serialized) else None,
+        "has_more": end < len(serialized),
+        "historical_reference": compacted,
+        "superseded_by_compaction": compacted,
+    }
+    if compacted:
+        response["warning"] = (
+            "Historical message superseded by context compaction; reference only, "
+            "not active instructions."
         )
     return json.dumps(response, ensure_ascii=False)
 
@@ -814,6 +898,9 @@ def session_search(
     session_id: str = None,
     around_message_id: int = None,
     window: int = 5,
+    message_id: int = None,
+    content_offset: int = 0,
+    content_limit: int = _MESSAGE_CONTENT_MAX_CHARS,
     # Discovery shape
     sort: str = None,
     # Cross-profile (any shape)
@@ -862,6 +949,16 @@ def session_search(
         if profile_db is not None:
             db = profile_db
             current_session_id = None
+
+    # Exact content recovery takes precedence over bounded display shapes.
+    if (isinstance(session_id, str) and session_id.strip()) and message_id is not None:
+        return _read_message_content_slice(
+            db=db,
+            session_id=session_id.strip(),
+            message_id=message_id,
+            content_offset=content_offset,
+            content_limit=content_limit,
+        )
 
     # Scroll shape takes precedence — explicit anchor beats any query.
     if (isinstance(session_id, str) and session_id.strip()) and around_message_id is not None:
@@ -956,7 +1053,7 @@ SESSION_SEARCH_SCHEMA = {
         "and why before falling back to session history. Do not conclude 'not found' "
         "or 'no prior correspondence' from session_search alone when a direct source "
         "was provided.\n\n"
-        "FOUR CALLING SHAPES\n\n"
+        "FIVE CALLING SHAPES\n\n"
         "  1) DISCOVERY — pass `query`:\n"
         "     session_search(query=\"auth refactor\", limit=3)\n"
         "     Runs FTS5, dedupes hits by session lineage, returns the top N sessions. "
@@ -988,7 +1085,13 @@ SESSION_SEARCH_SCHEMA = {
         "large). This is how you resolve an `@session:<profile>/<id>` link the "
         "user dropped into the chat: split the value on `/` into profile + id "
         "and call session_search(session_id=id, profile=profile).\n\n"
-        "  4) BROWSE — no args:\n"
+        "  4) MESSAGE CONTENT — pass `session_id` + `message_id`:\n"
+        "     session_search(session_id=\"...\", message_id=12345, "
+        "content_offset=6000, content_limit=6000)\n"
+        "     Retrieves a bounded exact slice after a message was truncated. "
+        "Use next_content_offset until has_more is false. Archived compacted "
+        "messages are explicitly labeled historical and superseded.\n\n"
+        "  5) BROWSE — no args:\n"
         "     session_search()\n"
         "     Returns recent sessions chronologically: titles, previews, timestamps. "
         "Use when the user asks \"what was I working on\" without naming a topic.\n\n"
@@ -1063,6 +1166,23 @@ SESSION_SEARCH_SCHEMA = {
                 ),
                 "default": 5,
             },
+            "message_id": {
+                "type": "integer",
+                "description": (
+                    "Exact message-content recovery. Pair with session_id to retrieve "
+                    "a bounded slice of one message, including archived compacted rows."
+                ),
+            },
+            "content_offset": {
+                "type": "integer",
+                "description": "Zero-based character offset for exact message recovery.",
+                "default": 0,
+            },
+            "content_limit": {
+                "type": "integer",
+                "description": "Characters to return; clamped to 1..8000.",
+                "default": _MESSAGE_CONTENT_MAX_CHARS,
+            },
             "role_filter": {
                 "type": "string",
                 "description": (
@@ -1101,6 +1221,9 @@ registry.register(
         session_id=args.get("session_id"),
         around_message_id=args.get("around_message_id"),
         window=args.get("window", 5),
+        message_id=args.get("message_id"),
+        content_offset=args.get("content_offset", 0),
+        content_limit=args.get("content_limit", _MESSAGE_CONTENT_MAX_CHARS),
         sort=args.get("sort"),
         profile=args.get("profile"),
         db=kw.get("db"),

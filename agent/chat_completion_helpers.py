@@ -284,6 +284,21 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # so the transport error caused by our own force-close is not misread as a
     # retryable network failure. (PR #6600 — cascading interrupt hang.)
     _request_cancelled = {"value": False}
+    request_event_state = {"first": None, "last": None}
+    request_event_lock = threading.Lock()
+
+    def _record_request_event(event_ts: float) -> None:
+        """Record Codex SSE activity for this request only."""
+        if _request_cancelled["value"]:
+            return
+        with request_event_lock:
+            if request_event_state["first"] is None:
+                request_event_state["first"] = event_ts
+            request_event_state["last"] = event_ts
+
+    def _request_event_times() -> tuple[Optional[float], Optional[float]]:
+        with request_event_lock:
+            return request_event_state["first"], request_event_state["last"]
 
     def _set_request_client(client):
         with request_client_lock:
@@ -332,6 +347,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 request_api_kwargs = dict(api_kwargs)
                 request_api_kwargs["__hermes_request_cancel_check__"] = (
                     lambda: _request_cancelled["value"]
+                )
+                request_api_kwargs["__hermes_request_event_callback__"] = (
+                    _record_request_event
                 )
                 request_client = _set_request_client(
                     agent._create_request_openai_client(
@@ -491,14 +509,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
     if _codex_idle_timeout <= 0:
         _codex_idle_enabled = False
 
-    if _codex_watchdog_enabled:
-        # Reset before the worker starts so a marker left over from a previous
-        # call on this agent can't be misread as first-byte for this one.
-        agent._codex_stream_first_event_ts = None
-        agent._codex_stream_last_event_ts = None
-        agent._codex_stream_last_progress_ts = None
-
-    _call_start = time.time()
+    _call_start = time.monotonic()
     agent._touch_activity("waiting for non-streaming API response")
 
     t = threading.Thread(target=_call, daemon=True)
@@ -511,12 +522,13 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Touch activity every ~30s so the gateway's inactivity
         # monitor knows we're alive while waiting for the response.
         if _poll_count % 100 == 0:  # 100 × 0.3s = 30s
-            _elapsed = time.time() - _call_start
+            _elapsed = time.monotonic() - _call_start
             agent._touch_activity(
                 f"waiting for non-streaming response ({int(_elapsed)}s elapsed)"
             )
 
-        _elapsed = time.time() - _call_start
+        _elapsed = time.monotonic() - _call_start
+        _, _last_codex_event_ts = _request_event_times()
 
         # TTFB detector: the Codex stream has produced no event at all and
         # we're past the first-byte cutoff → the backend opened the
@@ -526,7 +538,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
         if (
             _ttfb_enabled
             and _elapsed > _ttfb_timeout
-            and getattr(agent, "_codex_stream_last_event_ts", None) is None
+            and _last_codex_event_ts is None
         ):
             _silent_hint: Optional[str] = None
             _hint_fn = getattr(agent, "_codex_silent_hang_hint", None)
@@ -580,13 +592,12 @@ def interruptible_api_call(agent, api_kwargs: dict):
         # Stream-idle detector: the Codex backend emitted at least one SSE
         # frame, then stopped emitting events. Valid keepalive / in_progress
         # frames refresh _codex_stream_last_event_ts and should not be killed.
-        _last_codex_event_ts = getattr(agent, "_codex_stream_last_event_ts", None)
         if (
             _codex_idle_enabled
             and _last_codex_event_ts is not None
-            and (time.time() - _last_codex_event_ts) > _codex_idle_timeout
+            and (time.monotonic() - _last_codex_event_ts) > _codex_idle_timeout
         ):
-            _event_stale_elapsed = time.time() - _last_codex_event_ts
+            _event_stale_elapsed = time.monotonic() - _last_codex_event_ts
             logger.warning(
                 "Codex stream produced no SSE events for %.0fs after first byte "
                 "(threshold %.0fs, model=%s, context=~%s tokens). Killing "
@@ -698,10 +709,11 @@ def interruptible_api_call(agent, api_kwargs: dict):
             except Exception:
                 pass
             raise InterruptedError("Agent interrupted during API call")
-    _first_event_ts = getattr(agent, "_codex_stream_first_event_ts", None)
+    _first_event_ts, _ = _request_event_times()
     if _codex_watchdog_enabled and _first_event_ts is not None:
         logger.info(
-            "Codex stream first event received: ttfb=%.2fs model=%s context=~%s tokens",
+            "Codex stream first event received: first_event_latency=%.2fs "
+            "model=%s context=~%s tokens",
             max(0.0, _first_event_ts - _call_start),
             api_kwargs.get("model", "unknown"),
             f"{_est_tokens_for_codex_watchdog:,}",

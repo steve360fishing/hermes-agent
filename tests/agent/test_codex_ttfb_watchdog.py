@@ -181,7 +181,7 @@ def test_event_idle_marks_request_cancelled_before_abort(tmp_path, monkeypatch):
 
     def fake_idle(api_kwargs, client=None, on_first_delta=None):
         cancel_check = api_kwargs["__hermes_request_cancel_check__"]
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         while not cancel_check():
             time.sleep(0.02)
         observed["cancelled"] = True
@@ -245,6 +245,56 @@ def test_codex_runtime_records_first_event_timestamp():
     assert agent._codex_stream_last_event_ts >= agent._codex_stream_first_event_ts
 
 
+def test_codex_runtime_drops_late_event_after_request_cancellation():
+    """A worker that outlives its watchdog must not publish activity into the
+    next request's timing state."""
+    from agent.codex_runtime import run_codex_stream
+
+    cancelled = {"value": False}
+    observed_events = []
+    provider_kwargs = {}
+
+    def event_stream():
+        cancelled["value"] = True
+        yield SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", usage=None, id="late"),
+        )
+
+    def create(**kwargs):
+        provider_kwargs.update(kwargs)
+        return event_stream()
+
+    agent = SimpleNamespace(
+        _ensure_primary_openai_client=lambda **kwargs: SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        ),
+        _interrupt_requested=False,
+        _fire_stream_delta=lambda text: None,
+        _fire_reasoning_delta=lambda text: None,
+        _touch_activity=lambda message: None,
+        _client_log_context=lambda: "test",
+        _codex_stream_first_event_ts=None,
+        _codex_stream_last_event_ts=None,
+    )
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        run_codex_stream(
+            agent,
+            {
+                "model": "gpt-5.5",
+                "input": "hi",
+                "__hermes_request_cancel_check__": lambda: cancelled["value"],
+                "__hermes_request_event_callback__": observed_events.append,
+            },
+        )
+
+    assert observed_events == []
+    assert agent._codex_stream_first_event_ts is None
+    assert agent._codex_stream_last_event_ts is None
+    assert "__hermes_request_event_callback__" not in provider_kwargs
+
+
 def test_success_logs_safe_first_byte_telemetry(tmp_path, monkeypatch, caplog):
     from agent import chat_completion_helpers as h
 
@@ -255,9 +305,8 @@ def test_success_logs_safe_first_byte_telemetry(tmp_path, monkeypatch, caplog):
     sentinel = SimpleNamespace(ok=True)
 
     def fake_success(api_kwargs, client=None, on_first_delta=None):
-        now = time.time()
-        agent._codex_stream_first_event_ts = now
-        agent._codex_stream_last_event_ts = now
+        event_callback = api_kwargs["__hermes_request_event_callback__"]
+        event_callback(time.monotonic())
         return sentinel
 
     monkeypatch.setattr(agent, "_run_codex_stream", fake_success)
@@ -270,7 +319,8 @@ def test_success_logs_safe_first_byte_telemetry(tmp_path, monkeypatch, caplog):
     assert response is sentinel
     telemetry = [r.getMessage() for r in caplog.records if "first event" in r.getMessage()]
     assert len(telemetry) == 1
-    assert "ttfb=" in telemetry[0]
+    assert "first_event_latency=" in telemetry[0]
+    assert "ttfb=" not in telemetry[0]
     assert "context=~" in telemetry[0]
     assert marker not in telemetry[0]
 
@@ -306,7 +356,7 @@ def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
         # well under the 120s default cutoff. Mark the first byte so the
         # no-byte detector sees activity, then return the response.
         time.sleep(2.0)
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         return sentinel
 
     monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_first_event)
@@ -431,7 +481,7 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
         # Bytes flowing: mark stream activity right away, then keep generating
         # past the 1s TTFB cutoff before returning a real response.
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         if on_first_delta:
             on_first_delta()
         time.sleep(2.0)
@@ -471,7 +521,7 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     stop = {"flag": False}
 
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         deadline = time.time() + 30
         while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
             time.sleep(0.02)

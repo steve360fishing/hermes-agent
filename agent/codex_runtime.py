@@ -827,6 +827,9 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
 
     request_kwargs = dict(api_kwargs)
     cancel_check = request_kwargs.pop("__hermes_request_cancel_check__", None)
+    request_event_callback = request_kwargs.pop(
+        "__hermes_request_event_callback__", None
+    )
 
     def _request_cancelled() -> bool:
         if not callable(cancel_check):
@@ -850,11 +853,18 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_reasoning_delta(text)
 
     def _on_event(event: Any) -> None:
-        # TTFB watchdog and activity touch — runs once per SSE event.
-        now = time.time()
-        if getattr(agent, "_codex_stream_first_event_ts", None) is None:
-            agent._codex_stream_first_event_ts = now
-        agent._codex_stream_last_event_ts = now
+        # A daemon worker can receive an event after its supervising request
+        # timed out. Reject that event before it can mutate shared agent state
+        # or contaminate a later request's watchdog.
+        if _request_cancelled():
+            raise InterruptedError("Codex stream request cancelled before event handling")
+        now = time.monotonic()
+        if callable(request_event_callback):
+            request_event_callback(now)
+        else:
+            if getattr(agent, "_codex_stream_first_event_ts", None) is None:
+                agent._codex_stream_first_event_ts = now
+            agent._codex_stream_last_event_ts = now
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:

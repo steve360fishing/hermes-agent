@@ -17,6 +17,7 @@ from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
     _MESSAGE_CONTENT_MAX_CHARS,
+    _MESSAGE_CONTENT_SLICE_MAX_CHARS,
     _SNIPPET_MAX_CHARS,
     _TOOL_CALL_ARGUMENTS_MAX_CHARS,
     _TOOL_CALLS_MAX_ITEMS,
@@ -77,6 +78,10 @@ class TestSchema:
         assert "session_id" in params
         assert "around_message_id" in params
         assert "window" in params
+        # Exact bounded content recovery shape
+        assert "message_id" in params
+        assert "content_offset" in params
+        assert "content_limit" in params
         # Shared
         assert "role_filter" in params
 
@@ -314,6 +319,98 @@ class TestRoleFilter:
 
 
 class TestRecallPayloadSafety:
+    def test_exact_message_content_slice_recovers_truncated_tail(self, db):
+        db.create_session("s_large_tail", source="cli")
+        large = "head " + ("a" * _MESSAGE_CONTENT_MAX_CHARS) + "TAIL_MARKER"
+        message_id = db.append_message("s_large_tail", role="user", content=large)
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_large_tail",
+                message_id=message_id,
+                content_offset=_MESSAGE_CONTENT_MAX_CHARS,
+                content_limit=100,
+                db=db,
+            )
+        )
+
+        assert result["success"] is True
+        assert result["message_id"] == message_id
+        assert result["content_offset"] == _MESSAGE_CONTENT_MAX_CHARS
+        assert "TAIL_MARKER" in result["content"]
+        assert result["original_content_chars"] == len(large)
+        assert result["has_more"] is False
+        assert result["content_limit"] <= _MESSAGE_CONTENT_SLICE_MAX_CHARS
+
+    def test_exact_message_content_slice_serializes_structured_content(self, db):
+        db.create_session("s_structured_tail", source="cli")
+        structured = [{"type": "text", "text": "needle " + ("z" * 9000)}]
+        message_id = db.append_message(
+            "s_structured_tail", role="user", content=structured
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_structured_tail",
+                message_id=message_id,
+                content_offset=8000,
+                content_limit=2000,
+                db=db,
+            )
+        )
+
+        expected = json.dumps(structured, ensure_ascii=False)
+        assert result["success"] is True
+        assert result["content"] == expected[8000:10000]
+        assert result["original_content_chars"] == len(expected)
+
+    def test_exact_message_content_slice_rejects_wrong_session(self, db):
+        db.create_session("owner", source="cli")
+        db.create_session("other", source="cli")
+        message_id = db.append_message("owner", role="user", content="private tail")
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="other",
+                message_id=message_id,
+                content_offset=0,
+                db=db,
+            )
+        )
+
+        assert result["success"] is False
+        assert "not in session_id" in result["error"]
+
+    def test_discovery_labels_archived_compacted_message_as_superseded(self, db):
+        db.create_session("s_archive", source="cli")
+        db.append_message(
+            "s_archive",
+            role="user",
+            content="ARCHIVED_NEEDLE do this old instruction",
+        )
+        db.append_message("s_archive", role="assistant", content="old response")
+        db.archive_and_compact(
+            "s_archive",
+            [
+                {
+                    "role": "assistant",
+                    "content": "[CONTEXT COMPACTION — REFERENCE ONLY] New summary",
+                }
+            ],
+        )
+
+        result = json.loads(session_search(query="ARCHIVED_NEEDLE", limit=1, db=db))
+
+        assert result["success"] is True
+        messages = result["results"][0]["messages"]
+        archived = next(m for m in messages if "old instruction" in m["content"])
+        assert archived["historical_reference"] is True
+        assert archived["superseded_by_compaction"] is True
+        assert archived["content"].startswith("[Historical message")
+
     def test_discovery_omits_context_compaction_summary_messages(self, db):
         db.create_session("s_compacted", source="cli")
         db.append_message("s_compacted", role="user", content="opener")
