@@ -410,6 +410,9 @@ class TestRecallPayloadSafety:
         assert archived["historical_reference"] is True
         assert archived["superseded_by_compaction"] is True
         assert archived["content"].startswith("[Historical message")
+        assert result["results"][0]["historical_reference"] is True
+        assert result["results"][0]["superseded_by_compaction"] is True
+        assert result["results"][0]["snippet"].startswith("[Historical match")
 
     def test_discovery_omits_context_compaction_summary_messages(self, db):
         db.create_session("s_compacted", source="cli")

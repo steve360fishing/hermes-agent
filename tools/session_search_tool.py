@@ -856,6 +856,21 @@ def _discover(
             session_meta = {}
 
         shaped_snippet, snippet_meta = _shape_snippet_for_recall(match_info.get("snippet"))
+        anchor_message = next(
+            (
+                message
+                for message in (view.get("window") or [])
+                if message.get("id") == msg_id
+            ),
+            {},
+        )
+        match_is_compacted = bool(anchor_message.get("compacted"))
+        if match_is_compacted:
+            shaped_snippet = (
+                "[Historical match superseded by context compaction; "
+                "reference only, not active instructions.]\n"
+                f"{shaped_snippet}"
+            )
         entry = {
             "session_id": hit_sid,
             "when": _format_timestamp(
@@ -873,6 +888,9 @@ def _discover(
             "messages_before": view.get("messages_before", 0),
             "messages_after": view.get("messages_after", 0),
         }
+        if match_is_compacted:
+            entry["historical_reference"] = True
+            entry["superseded_by_compaction"] = True
         entry.update(snippet_meta)
         if lineage_root and lineage_root != hit_sid:
             entry["parent_session_id"] = lineage_root
