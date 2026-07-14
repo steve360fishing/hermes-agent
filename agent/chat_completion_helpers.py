@@ -245,10 +245,9 @@ def interruptible_api_call(agent, api_kwargs: dict):
     # because that flag is cleared at run_conversation() turn boundaries, but
     # this daemon worker thread can outlive the turn (the gateway caches
     # AIAgent instances per session). Tracks whether THIS specific request was
-    # cancelled by the main thread's interrupt handler, so the transport error
-    # that is the expected consequence of our own force-close isn't misread as
-    # a network bug and surfaced to the caller. (PR #6600 — cascading interrupt
-    # hang.)
+    # cancelled by the main thread's interrupt handler or a request watchdog,
+    # so the transport error caused by our own force-close is not misread as a
+    # retryable network failure. (PR #6600 — cascading interrupt hang.)
     _request_cancelled = {"value": False}
 
     def _set_request_client(client):
@@ -295,6 +294,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     def _call():
         try:
             if agent.api_mode == "codex_responses":
+                request_api_kwargs = dict(api_kwargs)
+                request_api_kwargs["__hermes_request_cancel_check__"] = (
+                    lambda: _request_cancelled["value"]
+                )
                 request_client = _set_request_client(
                     agent._create_request_openai_client(
                         reason="codex_stream_request",
@@ -302,7 +305,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     )
                 )
                 result["response"] = agent._run_codex_stream(
-                    api_kwargs,
+                    request_api_kwargs,
                     client=request_client,
                     on_first_delta=getattr(agent, "_codex_on_first_delta", None),
                 )
@@ -345,10 +348,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 )
                 result["response"] = request_client.chat.completions.create(**api_kwargs)
         except Exception as e:
-            # If the request was cancelled by the main thread's interrupt
-            # handler, the transport error is the expected consequence of our
-            # own force-close, NOT a network bug. Swallow it instead of
-            # surfacing — the main thread raises InterruptedError. (#6600)
+            # If the request was cancelled by the interrupt handler or a
+            # watchdog, the transport error is the expected consequence of our
+            # force-close, not a network bug. The supervising thread installs
+            # the appropriate InterruptedError/TimeoutError. (#6600)
             if _request_cancelled["value"]:
                 logger.debug(
                     "Non-streaming worker caught %s after request cancellation — "
@@ -515,6 +518,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"(codex stream, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Reconnecting."
                 )
+            _request_cancelled["value"] = True
             try:
                 _close_request_client_once("codex_ttfb_kill")
             except Exception:
@@ -561,6 +565,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                 f"after first byte (model: {api_kwargs.get('model', 'unknown')}). "
                 f"Reconnecting."
             )
+            _request_cancelled["value"] = True
             try:
                 _close_request_client_once("codex_stream_idle_kill")
             except Exception:
@@ -605,6 +610,7 @@ def interruptible_api_call(agent, api_kwargs: dict):
                     f"(non-streaming, model: {api_kwargs.get('model', 'unknown')}). "
                     f"Aborting call."
                 )
+            _request_cancelled["value"] = True
             try:
                 if agent.api_mode == "anthropic_messages":
                     agent._anthropic_client.close()

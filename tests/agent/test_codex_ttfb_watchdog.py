@@ -102,6 +102,71 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
+def test_ttfb_marks_request_cancelled_before_aborting_worker(tmp_path, monkeypatch):
+    """The watchdog must expose a request-local cancellation signal before it
+    aborts the socket, so the Codex transport cannot mistake that forced close
+    for a retryable network failure."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+
+    observed = {"cancelled": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        cancel_check = api_kwargs.get("__hermes_request_cancel_check__")
+        assert callable(cancel_check)
+        deadline = time.time() + 10
+        while time.time() < deadline and not cancel_check():
+            time.sleep(0.02)
+        observed["cancelled"] = cancel_check()
+        raise ConnectionError("socket aborted by watchdog")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    with pytest.raises(TimeoutError):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert observed["cancelled"] is True
+
+
+def test_codex_transport_does_not_retry_after_watchdog_cancellation(monkeypatch):
+    """A forced-close transport error must not issue a second provider call."""
+    import httpx
+
+    from agent.codex_runtime import run_codex_stream
+
+    calls = {"create": 0}
+
+    def create(**kwargs):
+        calls["create"] += 1
+        assert "__hermes_request_cancel_check__" not in kwargs
+        raise httpx.RemoteProtocolError("watchdog closed stream")
+
+    agent = SimpleNamespace(
+        _ensure_primary_openai_client=lambda **kwargs: SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        ),
+        _interrupt_requested=False,
+        _fire_stream_delta=lambda text: None,
+        _fire_reasoning_delta=lambda text: None,
+        _client_log_context=lambda: "test",
+    )
+    payload = {
+        "model": "gpt-5.5",
+        "input": "hi",
+        "__hermes_request_cancel_check__": lambda: calls["create"] >= 1,
+    }
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        run_codex_stream(agent, payload)
+    assert calls["create"] == 1
+
+
 def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
     """With no env var set, the no-byte TTFB default is generous (120s), so a
     request whose first stream event is merely slow (~2s of backend admission /
