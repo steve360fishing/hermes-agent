@@ -13,6 +13,7 @@ import time
 from unittest.mock import MagicMock, patch
 
 
+from agent.error_classifier import FailoverReason
 from run_agent import AIAgent
 
 
@@ -179,6 +180,32 @@ class TestRestorePrimaryRuntime:
 
         assert agent.max_tokens == 8000
         assert agent._openrouter_fallback_notice_required is False
+
+    def test_timeout_does_not_activate_incident_grok_fallback(self):
+        agent = _make_agent(
+            fallback_model={
+                "provider": "openrouter",
+                "model": "x-ai/grok-4.5",
+            },
+            provider="openai-codex",
+        )
+        agent.model = "gpt-5.6-sol"
+        agent._primary_runtime["model"] = "gpt-5.6-sol"
+        agent._primary_runtime["provider"] = "openai-codex"
+
+        with patch(
+            "agent.auxiliary_client.resolve_provider_client"
+        ) as resolve_provider:
+            activated = agent._try_activate_fallback(
+                reason=FailoverReason.timeout
+            )
+
+        assert activated is False
+        assert agent.provider == "openai-codex"
+        assert agent.model == "gpt-5.6-sol"
+        assert agent._fallback_activated is False
+        assert getattr(agent, "_openrouter_fallback_notice_required", False) is False
+        resolve_provider.assert_not_called()
 
     def test_resets_fallback_index(self):
         """After restore, the full fallback chain should be available again."""
@@ -651,6 +678,51 @@ class TestRestoreInRunConversation:
         assert agent._fallback_index == 0
         assert agent.provider == "custom"
         assert agent.base_url == "https://my-llm.example.com/v1"
+
+
+# =============================================================================
+# Timeout reason propagation
+# =============================================================================
+
+class TestTimeoutFallbackReason:
+    def test_max_retry_path_preserves_timeout_reason(self):
+        agent = _make_agent(
+            fallback_model={
+                "provider": "openrouter",
+                "model": "x-ai/grok-4.5",
+            },
+            provider="openai-codex",
+        )
+        agent.model = "gpt-5.6-sol"
+        agent._primary_runtime["model"] = "gpt-5.6-sol"
+        agent._primary_runtime["provider"] = "openai-codex"
+        agent._api_max_retries = 1
+        observed_reasons = []
+
+        def record_reason(reason=None):
+            observed_reasons.append(reason)
+            return False
+
+        with (
+            patch.object(
+                agent,
+                "_interruptible_api_call",
+                side_effect=TimeoutError("Codex first-event watchdog timed out"),
+            ),
+            patch.object(
+                agent, "_try_recover_primary_transport", return_value=False
+            ),
+            patch.object(agent, "_try_activate_fallback", side_effect=record_reason),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+            patch("agent.agent_runtime_helpers.time.sleep"),
+        ):
+            result = agent.run_conversation("hello")
+
+        assert result["completed"] is False
+        assert observed_reasons
+        assert observed_reasons[-1] == FailoverReason.timeout
 
 
 # =============================================================================

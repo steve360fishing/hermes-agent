@@ -16,6 +16,7 @@ stall.
 
 from __future__ import annotations
 
+import logging
 import sys
 import time
 import types
@@ -102,6 +103,228 @@ def test_ttfb_kills_when_no_stream_event(tmp_path, monkeypatch):
         stop["flag"] = True
 
 
+def test_ttfb_marks_request_cancelled_before_aborting_worker(tmp_path, monkeypatch):
+    """The watchdog must expose a request-local cancellation signal before it
+    aborts the socket, so the Codex transport cannot mistake that forced close
+    for a retryable network failure."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+
+    observed = {"cancelled": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        cancel_check = api_kwargs.get("__hermes_request_cancel_check__")
+        assert callable(cancel_check)
+        deadline = time.time() + 10
+        while time.time() < deadline and not cancel_check():
+            time.sleep(0.02)
+        observed["cancelled"] = cancel_check()
+        raise ConnectionError("socket aborted by watchdog")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    with pytest.raises(TimeoutError):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert observed["cancelled"] is True
+
+
+def test_codex_transport_does_not_retry_after_watchdog_cancellation(monkeypatch):
+    """A forced-close transport error must not issue a second provider call."""
+    import httpx
+
+    from agent.codex_runtime import run_codex_stream
+
+    calls = {"create": 0}
+
+    def create(**kwargs):
+        calls["create"] += 1
+        assert "__hermes_request_cancel_check__" not in kwargs
+        raise httpx.RemoteProtocolError("watchdog closed stream")
+
+    agent = SimpleNamespace(
+        _ensure_primary_openai_client=lambda **kwargs: SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        ),
+        _interrupt_requested=False,
+        _fire_stream_delta=lambda text: None,
+        _fire_reasoning_delta=lambda text: None,
+        _client_log_context=lambda: "test",
+    )
+    payload = {
+        "model": "gpt-5.5",
+        "input": "hi",
+        "__hermes_request_cancel_check__": lambda: calls["create"] >= 1,
+    }
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        run_codex_stream(agent, payload)
+    assert calls["create"] == 1
+
+
+def test_event_idle_marks_request_cancelled_before_abort(tmp_path, monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "10")
+    monkeypatch.setenv("HERMES_CODEX_EVENT_STALE_TIMEOUT_SECONDS", "1")
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+    observed = {"cancelled": False}
+
+    def fake_idle(api_kwargs, client=None, on_first_delta=None):
+        cancel_check = api_kwargs["__hermes_request_cancel_check__"]
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
+        while not cancel_check():
+            time.sleep(0.02)
+        observed["cancelled"] = True
+        raise ConnectionError("socket aborted by idle watchdog")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_idle)
+
+    with pytest.raises(TimeoutError, match="after first byte"):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert observed["cancelled"] is True
+
+
+def test_wall_clock_stale_marks_request_cancelled_before_abort(tmp_path, monkeypatch):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "0")
+    monkeypatch.setattr(agent, "_compute_non_stream_stale_timeout", lambda *a, **k: 1.0)
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(agent, "_abort_request_openai_client", lambda *a, **k: None)
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+    observed = {"cancelled": False}
+
+    def fake_stale(api_kwargs, client=None, on_first_delta=None):
+        cancel_check = api_kwargs["__hermes_request_cancel_check__"]
+        while not cancel_check():
+            time.sleep(0.02)
+        observed["cancelled"] = True
+        raise ConnectionError("socket aborted by stale watchdog")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_stale)
+
+    with pytest.raises(TimeoutError, match="timed out"):
+        h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert observed["cancelled"] is True
+
+
+def test_codex_runtime_records_first_event_timestamp():
+    from agent.codex_runtime import run_codex_stream
+
+    event = SimpleNamespace(
+        type="response.completed",
+        response=SimpleNamespace(status="completed", usage=None, id="resp_1"),
+    )
+    stream = iter([event])
+    agent = SimpleNamespace(
+        _ensure_primary_openai_client=lambda **kwargs: SimpleNamespace(
+            responses=SimpleNamespace(create=lambda **kwargs: stream)
+        ),
+        _interrupt_requested=False,
+        _fire_stream_delta=lambda text: None,
+        _fire_reasoning_delta=lambda text: None,
+        _touch_activity=lambda message: None,
+        _client_log_context=lambda: "test",
+        _codex_stream_first_event_ts=None,
+        _codex_stream_last_event_ts=None,
+    )
+
+    run_codex_stream(agent, {"model": "gpt-5.5", "input": "hi"})
+    assert agent._codex_stream_first_event_ts is not None
+    assert agent._codex_stream_last_event_ts >= agent._codex_stream_first_event_ts
+
+
+def test_codex_runtime_drops_late_event_after_request_cancellation():
+    """A worker that outlives its watchdog must not publish activity into the
+    next request's timing state."""
+    from agent.codex_runtime import run_codex_stream
+
+    cancelled = {"value": False}
+    observed_events = []
+    provider_kwargs = {}
+
+    def event_stream():
+        cancelled["value"] = True
+        yield SimpleNamespace(
+            type="response.completed",
+            response=SimpleNamespace(status="completed", usage=None, id="late"),
+        )
+
+    def create(**kwargs):
+        provider_kwargs.update(kwargs)
+        return event_stream()
+
+    agent = SimpleNamespace(
+        _ensure_primary_openai_client=lambda **kwargs: SimpleNamespace(
+            responses=SimpleNamespace(create=create)
+        ),
+        _interrupt_requested=False,
+        _fire_stream_delta=lambda text: None,
+        _fire_reasoning_delta=lambda text: None,
+        _touch_activity=lambda message: None,
+        _client_log_context=lambda: "test",
+        _codex_stream_first_event_ts=None,
+        _codex_stream_last_event_ts=None,
+    )
+
+    with pytest.raises(InterruptedError, match="cancelled"):
+        run_codex_stream(
+            agent,
+            {
+                "model": "gpt-5.5",
+                "input": "hi",
+                "__hermes_request_cancel_check__": lambda: cancelled["value"],
+                "__hermes_request_event_callback__": observed_events.append,
+            },
+        )
+
+    assert observed_events == []
+    assert agent._codex_stream_first_event_ts is None
+    assert agent._codex_stream_last_event_ts is None
+    assert "__hermes_request_event_callback__" not in provider_kwargs
+
+
+def test_success_logs_safe_first_byte_telemetry(tmp_path, monkeypatch, caplog):
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(agent, "_close_request_openai_client", lambda *a, **k: None)
+
+    sentinel = SimpleNamespace(ok=True)
+
+    def fake_success(api_kwargs, client=None, on_first_delta=None):
+        event_callback = api_kwargs["__hermes_request_event_callback__"]
+        event_callback(time.monotonic())
+        return sentinel
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_success)
+    marker = "do-not-log-this-prompt"
+    with caplog.at_level(logging.INFO, logger="agent.chat_completion_helpers"):
+        response = h.interruptible_api_call(
+            agent, {"model": "gpt-5.5", "input": marker}
+        )
+
+    assert response is sentinel
+    telemetry = [r.getMessage() for r in caplog.records if "first event" in r.getMessage()]
+    assert len(telemetry) == 1
+    assert "first_event_latency=" in telemetry[0]
+    assert "ttfb=" not in telemetry[0]
+    assert "context=~" in telemetry[0]
+    assert marker not in telemetry[0]
+
+
 def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
     """With no env var set, the no-byte TTFB default is generous (120s), so a
     request whose first stream event is merely slow (~2s of backend admission /
@@ -133,7 +356,7 @@ def test_ttfb_default_tolerates_slow_first_event(tmp_path, monkeypatch):
         # well under the 120s default cutoff. Mark the first byte so the
         # no-byte detector sees activity, then return the response.
         time.sleep(2.0)
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         return sentinel
 
     monkeypatch.setattr(agent, "_run_codex_stream", fake_slow_first_event)
@@ -258,7 +481,7 @@ def test_ttfb_does_not_kill_when_events_flow(tmp_path, monkeypatch):
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
         # Bytes flowing: mark stream activity right away, then keep generating
         # past the 1s TTFB cutoff before returning a real response.
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         if on_first_delta:
             on_first_delta()
         time.sleep(2.0)
@@ -298,7 +521,7 @@ def test_event_idle_kills_after_first_event_then_silence(tmp_path, monkeypatch):
     stop = {"flag": False}
 
     def fake_stream(api_kwargs, client=None, on_first_delta=None):
-        agent._codex_stream_last_event_ts = time.time()
+        api_kwargs["__hermes_request_event_callback__"](time.monotonic())
         deadline = time.time() + 30
         while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
             time.sleep(0.02)
@@ -353,8 +576,8 @@ def test_ttfb_disabled_via_env_zero(tmp_path, monkeypatch):
 
 def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypatch):
     """Large Codex inputs can legitimately take longer than the small-request
-    first-byte cutoff before the first SSE frame. Preserve the full input and
-    wait instead of killing/retrying at TTFB."""
+    first-byte cutoff before the first SSE frame. Scale the TTFB timeout up
+    for those requests instead of killing/retrying at the small-request cutoff."""
     from agent import chat_completion_helpers as h
 
     agent = _make_codex_agent(tmp_path, monkeypatch)
@@ -384,6 +607,100 @@ def test_large_codex_request_waits_instead_of_ttfb_reconnect(tmp_path, monkeypat
     resp = h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
     assert resp is sentinel
     assert "codex_ttfb_kill" not in closes
+
+
+def test_large_codex_request_can_still_ttfb_reconnect_when_capped(tmp_path, monkeypatch):
+    """Large Codex requests should keep a finite TTFB watchdog instead of
+    disabling it entirely. A low max cap should still force an early reconnect."""
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_MAX_SECONDS", "1")
+
+    closes: list = []
+    dummy_client = SimpleNamespace()
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: dummy_client)
+    monkeypatch.setattr(
+        agent, "_abort_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+    monkeypatch.setattr(
+        agent, "_close_request_openai_client", lambda c, reason=None: closes.append(reason)
+    )
+
+    stop = {"flag": False}
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        deadline = time.time() + 30
+        while time.time() < deadline and not stop["flag"] and not agent._interrupt_requested:
+            time.sleep(0.02)
+        raise RuntimeError("connection closed")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    large_input = "x" * 44_000  # ~11k estimated tokens, above the large-request gate.
+    try:
+        with pytest.raises(TimeoutError) as excinfo:
+            h.interruptible_api_call(agent, {"model": "gpt-5.5", "input": large_input})
+        assert "TTFB threshold: 1s" in str(excinfo.value)
+        assert "codex_ttfb_kill" in closes
+    finally:
+        stop["flag"] = True
+
+
+def test_incident_scale_codex_request_keeps_finite_watchdog(tmp_path, monkeypatch):
+    """The observed 1.16M-token incident shape must still time out finitely.
+
+    This exercises the recursive estimator and the large-request watchdog with
+    a Responses API payload at the same estimated scale as the production
+    incident, without making a provider call.
+    """
+    from agent import chat_completion_helpers as h
+
+    agent = _make_codex_agent(tmp_path, monkeypatch)
+    monkeypatch.setenv("HERMES_CODEX_TTFB_TIMEOUT_SECONDS", "1")
+    monkeypatch.setenv("HERMES_CODEX_TTFB_MAX_SECONDS", "1")
+
+    incident_payload = {
+        "model": "gpt-5.5",
+        "input": [
+            {
+                "role": "tool",
+                "content": [
+                    {
+                        "type": "input_text",
+                        "text": "x" * 4_640_000,
+                    }
+                ],
+            }
+        ],
+    }
+    assert h.estimate_request_context_tokens(incident_payload) >= 1_160_000
+
+    closes: list[str | None] = []
+    monkeypatch.setattr(agent, "_create_request_openai_client", lambda **k: SimpleNamespace())
+    monkeypatch.setattr(
+        agent,
+        "_abort_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+    monkeypatch.setattr(
+        agent,
+        "_close_request_openai_client",
+        lambda c, reason=None: closes.append(reason),
+    )
+
+    def fake_hang(api_kwargs, client=None, on_first_delta=None):
+        cancel_check = api_kwargs["__hermes_request_cancel_check__"]
+        while not cancel_check():
+            time.sleep(0.02)
+        raise ConnectionError("watchdog closed incident-scale request")
+
+    monkeypatch.setattr(agent, "_run_codex_stream", fake_hang)
+
+    with pytest.raises(TimeoutError, match="TTFB threshold: 1s"):
+        h.interruptible_api_call(agent, incident_payload)
+    assert "codex_ttfb_kill" in closes
 
 
 def test_large_codex_request_strict_ttfb_env_still_reconnects(tmp_path, monkeypatch):

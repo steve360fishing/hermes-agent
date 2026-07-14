@@ -825,6 +825,21 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
     """
     import httpx as _httpx
 
+    request_kwargs = dict(api_kwargs)
+    cancel_check = request_kwargs.pop("__hermes_request_cancel_check__", None)
+    request_event_callback = request_kwargs.pop(
+        "__hermes_request_event_callback__", None
+    )
+
+    def _request_cancelled() -> bool:
+        if not callable(cancel_check):
+            return False
+        try:
+            return bool(cancel_check())
+        except Exception:
+            logger.debug("Codex request cancellation check raised", exc_info=True)
+            return False
+
     active_client = client or agent._ensure_primary_openai_client(reason="codex_stream_direct")
     max_stream_retries = 1
     # Accumulate streamed text so callers / compat shims can read it.
@@ -838,23 +853,35 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
         agent._fire_reasoning_delta(text)
 
     def _on_event(event: Any) -> None:
-        # TTFB watchdog and activity touch — runs once per SSE event.
-        agent._codex_stream_last_event_ts = time.time()
+        # A daemon worker can receive an event after its supervising request
+        # timed out. Reject that event before it can mutate shared agent state
+        # or contaminate a later request's watchdog.
+        if _request_cancelled():
+            raise InterruptedError("Codex stream request cancelled before event handling")
+        now = time.monotonic()
+        if callable(request_event_callback):
+            request_event_callback(now)
+        else:
+            if getattr(agent, "_codex_stream_first_event_ts", None) is None:
+                agent._codex_stream_first_event_ts = now
+            agent._codex_stream_last_event_ts = now
         agent._touch_activity("receiving stream response")
 
     def _interrupt_check() -> bool:
-        return bool(agent._interrupt_requested)
+        return bool(agent._interrupt_requested) or _request_cancelled()
 
     for attempt in range(max_stream_retries + 1):
-        if agent._interrupt_requested:
-            raise InterruptedError("Agent interrupted before Codex stream retry")
+        if agent._interrupt_requested or _request_cancelled():
+            raise InterruptedError("Codex stream request cancelled before retry")
 
-        stream_kwargs = dict(api_kwargs)
+        stream_kwargs = dict(request_kwargs)
         stream_kwargs["stream"] = True
 
         try:
             event_stream = active_client.responses.create(**stream_kwargs)
         except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+            if _request_cancelled():
+                raise InterruptedError("Codex stream request cancelled after transport abort") from exc
             if attempt < max_stream_retries:
                 logger.debug(
                     "Codex Responses stream connect failed (attempt %s/%s); retrying. %s error=%s",
@@ -881,6 +908,8 @@ def run_codex_stream(agent, api_kwargs: dict, client: Any = None, on_first_delta
                     interrupt_check=_interrupt_check,
                 )
             except (_httpx.RemoteProtocolError, _httpx.ReadTimeout, _httpx.ConnectError, ConnectionError) as exc:
+                if _request_cancelled():
+                    raise InterruptedError("Codex stream request cancelled after transport abort") from exc
                 if attempt < max_stream_retries:
                     logger.debug(
                         "Codex Responses stream transport failed mid-iteration "

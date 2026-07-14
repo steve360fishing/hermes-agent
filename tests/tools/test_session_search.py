@@ -16,6 +16,11 @@ from hermes_state import SessionDB
 from tools.session_search_tool import (
     SESSION_SEARCH_SCHEMA,
     _HIDDEN_SESSION_SOURCES,
+    _MESSAGE_CONTENT_MAX_CHARS,
+    _MESSAGE_CONTENT_SLICE_MAX_CHARS,
+    _SNIPPET_MAX_CHARS,
+    _TOOL_CALL_ARGUMENTS_MAX_CHARS,
+    _TOOL_CALLS_MAX_ITEMS,
     _format_timestamp,
     session_search,
 )
@@ -73,6 +78,10 @@ class TestSchema:
         assert "session_id" in params
         assert "around_message_id" in params
         assert "window" in params
+        # Exact bounded content recovery shape
+        assert "message_id" in params
+        assert "content_offset" in params
+        assert "content_limit" in params
         # Shared
         assert "role_filter" in params
 
@@ -105,6 +114,19 @@ class TestSchema:
         assert "direct source" in desc
         assert "session_search as secondary" in desc
         assert "not found" in desc
+
+    def test_schema_description_documents_bounded_recall_payloads(self):
+        desc = SESSION_SEARCH_SCHEMA["description"].lower()
+        assert "bounded" in desc
+        assert "compaction-summary" in desc
+        assert "omitted" in desc
+        assert "truncated" in desc
+        assert "metadata" in desc
+
+    def test_registry_persists_session_search_results_above_25k(self):
+        from tools.registry import registry
+
+        assert registry.get_max_result_size("session_search") == 25_000
 
 
 class TestHiddenSources:
@@ -294,6 +316,271 @@ class TestRoleFilter:
         # Should now match the tool message
         if result["count"] > 0:
             assert result["results"][0]["matched_role"] == "tool"
+
+
+class TestRecallPayloadSafety:
+    @pytest.mark.parametrize(
+        ("offset", "limit"),
+        [
+            (0, 100),
+            (7_990, 50),
+            (19_980, 100),
+        ],
+    )
+    def test_exact_message_content_slice_covers_start_middle_and_end(
+        self, db, offset, limit
+    ):
+        db.create_session("s_slice_boundaries", source="cli")
+        content = "".join(str(index % 10) for index in range(20_000))
+        message_id = db.append_message(
+            "s_slice_boundaries", role="user", content=content
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_slice_boundaries",
+                message_id=message_id,
+                content_offset=offset,
+                content_limit=limit,
+                db=db,
+            )
+        )
+
+        expected_end = min(len(content), offset + limit)
+        assert result["success"] is True
+        assert result["content"] == content[offset:expected_end]
+        assert result["next_content_offset"] == (
+            expected_end if expected_end < len(content) else None
+        )
+        assert result["has_more"] is (expected_end < len(content))
+
+    def test_exact_message_content_slice_recovers_truncated_tail(self, db):
+        db.create_session("s_large_tail", source="cli")
+        large = "head " + ("a" * _MESSAGE_CONTENT_MAX_CHARS) + "TAIL_MARKER"
+        message_id = db.append_message("s_large_tail", role="user", content=large)
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_large_tail",
+                message_id=message_id,
+                content_offset=_MESSAGE_CONTENT_MAX_CHARS,
+                content_limit=100,
+                db=db,
+            )
+        )
+
+        assert result["success"] is True
+        assert result["message_id"] == message_id
+        assert result["content_offset"] == _MESSAGE_CONTENT_MAX_CHARS
+        assert "TAIL_MARKER" in result["content"]
+        assert result["original_content_chars"] == len(large)
+        assert result["has_more"] is False
+        assert result["content_limit"] <= _MESSAGE_CONTENT_SLICE_MAX_CHARS
+
+    def test_exact_message_content_slice_serializes_structured_content(self, db):
+        db.create_session("s_structured_tail", source="cli")
+        structured = [{"type": "text", "text": "needle " + ("z" * 9000)}]
+        message_id = db.append_message(
+            "s_structured_tail", role="user", content=structured
+        )
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="s_structured_tail",
+                message_id=message_id,
+                content_offset=8000,
+                content_limit=2000,
+                db=db,
+            )
+        )
+
+        expected = json.dumps(structured, ensure_ascii=False)
+        assert result["success"] is True
+        assert result["content"] == expected[8000:10000]
+        assert result["original_content_chars"] == len(expected)
+
+    def test_exact_message_content_slice_rejects_wrong_session(self, db):
+        db.create_session("owner", source="cli")
+        db.create_session("other", source="cli")
+        message_id = db.append_message("owner", role="user", content="private tail")
+        db._conn.commit()
+
+        result = json.loads(
+            session_search(
+                session_id="other",
+                message_id=message_id,
+                content_offset=0,
+                db=db,
+            )
+        )
+
+        assert result["success"] is False
+        assert "not in session_id" in result["error"]
+
+    def test_discovery_labels_archived_compacted_message_as_superseded(self, db):
+        db.create_session("s_archive", source="cli")
+        db.append_message(
+            "s_archive",
+            role="user",
+            content="ARCHIVED_NEEDLE do this old instruction",
+        )
+        db.append_message("s_archive", role="assistant", content="old response")
+        db.archive_and_compact(
+            "s_archive",
+            [
+                {
+                    "role": "assistant",
+                    "content": "[CONTEXT COMPACTION — REFERENCE ONLY] New summary",
+                }
+            ],
+        )
+
+        result = json.loads(session_search(query="ARCHIVED_NEEDLE", limit=1, db=db))
+
+        assert result["success"] is True
+        messages = result["results"][0]["messages"]
+        archived = next(m for m in messages if "old instruction" in m["content"])
+        assert archived["historical_reference"] is True
+        assert archived["superseded_by_compaction"] is True
+        assert archived["content"].startswith("[Historical message")
+        assert result["results"][0]["historical_reference"] is True
+        assert result["results"][0]["superseded_by_compaction"] is True
+        assert result["results"][0]["snippet"].startswith("[Historical match")
+
+    def test_discovery_omits_context_compaction_summary_messages(self, db):
+        db.create_session("s_compacted", source="cli")
+        db.append_message("s_compacted", role="user", content="opener")
+        summary = (
+            "[CONTEXT COMPACTION — REFERENCE ONLY] Earlier turns were compacted.\n"
+            "needle ## Historical Remaining Work\n"
+            "stale task text "
+            + ("x" * 12000)
+        )
+        db.append_message("s_compacted", role="assistant", content=summary)
+        db.append_message("s_compacted", role="assistant", content="final decision")
+        db._conn.commit()
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert result["success"] is True
+        hit = result["results"][0]
+        all_messages = hit["bookend_start"] + hit["messages"] + hit["bookend_end"]
+        summary_messages = [
+            m for m in all_messages
+            if m.get("content_omitted") == "context_compaction_summary"
+        ]
+        assert summary_messages
+        assert all("Historical Remaining Work" not in m["content"] for m in all_messages)
+        assert all("stale task text" not in m["content"] for m in all_messages)
+        assert all("x" * 100 not in m["content"] for m in all_messages)
+        assert summary_messages[0]["original_content_chars"] == len(summary)
+        assert hit["snippet_omitted"] == "context_compaction_summary"
+        assert "Historical Remaining Work" not in hit["snippet"]
+        assert "stale task text" not in hit["snippet"]
+
+    def test_discovery_truncates_large_snippet(self, db):
+        db.create_session("s_large_snippet", source="cli")
+        huge_token = "needle" + ("a" * (_SNIPPET_MAX_CHARS + 2000))
+        db.append_message("s_large_snippet", role="user", content=huge_token)
+        db._conn.commit()
+
+        result = json.loads(session_search(query="needle*", limit=1, db=db))
+
+        assert result["success"] is True
+        hit = result["results"][0]
+        assert hit["snippet_truncated"] is True
+        assert hit["original_snippet_chars"] > _SNIPPET_MAX_CHARS
+        assert len(hit["snippet"]) < hit["original_snippet_chars"]
+        assert "session_search truncated" in hit["snippet"]
+
+    def test_discovery_truncates_large_message_content(self, db):
+        db.create_session("s_large", source="cli")
+        large = "needle " + ("a" * (_MESSAGE_CONTENT_MAX_CHARS + 2000))
+        db.append_message("s_large", role="user", content=large)
+        db._conn.commit()
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert result["success"] is True
+        anchor = result["results"][0]["messages"][0]
+        assert anchor["content_truncated"] is True
+        assert anchor["original_content_chars"] == len(large)
+        assert len(anchor["content"]) < len(large)
+        assert "session_search truncated" in anchor["content"]
+
+    def test_discovery_truncates_large_structured_message_content(self, db):
+        db.create_session("s_structured", source="cli")
+        structured = [
+            {
+                "type": "text",
+                "text": "needle " + ("m" * (_MESSAGE_CONTENT_MAX_CHARS + 2000)),
+            }
+        ]
+        expected_chars = len(json.dumps(structured, ensure_ascii=False))
+        db.append_message("s_structured", role="user", content=structured)
+        db._conn.commit()
+
+        result = json.loads(session_search(query="needle", limit=1, db=db))
+
+        assert result["success"] is True
+        anchor = result["results"][0]["messages"][0]
+        assert anchor["content_truncated"] is True
+        assert anchor["original_content_chars"] == expected_chars
+        assert isinstance(anchor["content"], str)
+        assert len(anchor["content"]) < expected_chars
+        assert "m" * (_MESSAGE_CONTENT_MAX_CHARS + 100) not in anchor["content"]
+        assert "session_search truncated" in anchor["content"]
+
+    def test_read_truncates_tool_call_arguments_and_count(self, db):
+        db.create_session("s_tools", source="cli")
+        tool_calls = [
+            {
+                "id": f"call_{i}",
+                "function": {
+                    "name": "session_search",
+                    "arguments": "{" + f'"query": "needle {i}", "blob": "' + ("z" * 4000) + '"}',
+                },
+            }
+            for i in range(_TOOL_CALLS_MAX_ITEMS + 2)
+        ]
+        db.append_message("s_tools", role="assistant", content="", tool_calls=tool_calls)
+        db._conn.commit()
+
+        result = json.loads(session_search(session_id="s_tools", db=db))
+
+        assert result["success"] is True
+        message = result["messages"][0]
+        assert len(message["tool_calls"]) == _TOOL_CALLS_MAX_ITEMS
+        assert message["tool_calls_truncated"] is True
+        assert message["original_tool_call_count"] == _TOOL_CALLS_MAX_ITEMS + 2
+        assert message["tool_call_arguments_truncated"] is True
+        args = message["tool_calls"][0]["function"]["arguments"]
+        assert len(args) < _TOOL_CALL_ARGUMENTS_MAX_CHARS + 200
+        assert "session_search truncated" in args
+
+    def test_read_truncates_top_level_tool_call_arguments(self, db):
+        db.create_session("s_top_level_tools", source="cli")
+        tool_calls = [
+            {
+                "name": "session_search",
+                "arguments": "{" + '"query": "needle", "blob": "' + ("z" * 4000) + '"}',
+            }
+        ]
+        db.append_message("s_top_level_tools", role="assistant", content="", tool_calls=tool_calls)
+        db._conn.commit()
+
+        result = json.loads(session_search(session_id="s_top_level_tools", db=db))
+
+        assert result["success"] is True
+        message = result["messages"][0]
+        assert message["tool_call_arguments_truncated"] is True
+        args = message["tool_calls"][0]["arguments"]
+        assert len(args) < _TOOL_CALL_ARGUMENTS_MAX_CHARS + 200
+        assert "z" * (_TOOL_CALL_ARGUMENTS_MAX_CHARS + 100) not in args
+        assert "session_search truncated" in args
 
 
 # =========================================================================

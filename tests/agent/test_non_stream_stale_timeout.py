@@ -97,6 +97,20 @@ def test_estimator_unknown_dict_fallback():
     assert estimate_request_context_tokens(payload) > 50
 
 
+def test_estimator_uses_wire_shape_instead_of_inflated_object_repr():
+    from agent.chat_completion_helpers import estimate_request_context_tokens
+
+    class WireItem:
+        def model_dump(self):
+            return {"role": "user", "content": "x" * 400}
+
+        def __str__(self):
+            return "duplicated-internal-state" * 20_000
+
+    tokens = estimate_request_context_tokens({"input": [WireItem()]})
+    assert 100 <= tokens < 500
+
+
 # ── default base + tier scaling ────────────────────────────────────────────
 
 
