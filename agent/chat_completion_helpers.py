@@ -1362,7 +1362,10 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         from agent.openrouter_fallback_guard import openrouter_fallback_activation_allowed
 
         allowed, guard_message = openrouter_fallback_activation_allowed(
-            agent, fb_provider, fb_model
+            agent,
+            fb_provider,
+            fb_model,
+            reason=reason,
         )
     except Exception as guard_error:
         logger.warning("OpenRouter fallback guard check failed: %s", guard_error)
@@ -1374,7 +1377,6 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
             fb_model,
             guard_message,
         )
-        unavailable.add(fb_key)
         return agent._try_activate_fallback(reason)
 
     # Skip entries that resolve to the current (provider, model) — falling

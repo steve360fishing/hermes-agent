@@ -16,7 +16,11 @@ _OPENROUTER_GPT55_MODELS = {"openai/gpt-5.5", "openai/gpt-5.5-pro"}
 
 
 def openrouter_fallback_activation_allowed(
-    agent: Any, provider: str, model: str
+    agent: Any,
+    provider: str,
+    model: str,
+    *,
+    reason: Any = None,
 ) -> tuple[bool, str]:
     provider_norm = _norm(provider)
     model_norm = _norm(model)
@@ -32,6 +36,12 @@ def openrouter_fallback_activation_allowed(
         return True, ""
     if model_norm != OPENROUTER_FALLBACK_MODEL:
         return True, ""
+    reason_norm = _norm(getattr(reason, "value", reason))
+    if reason_norm == "timeout":
+        return (
+            False,
+            "Automatic Grok incident fallback is blocked for transport timeout.",
+        )
     cap_message = fallback_cap_message_if_exhausted(
         agent, provider=provider_norm, model=model
     )

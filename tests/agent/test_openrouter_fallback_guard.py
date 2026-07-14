@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from types import SimpleNamespace
 
+from agent.error_classifier import FailoverReason
 from agent.openrouter_fallback_guard import (
     OPENROUTER_FALLBACK_MODEL,
     apply_openrouter_fallback_notice,
@@ -31,6 +32,20 @@ def _agent(**overrides):
 
 def test_incident_fallback_is_exactly_grok_45_via_openrouter() -> None:
     assert OPENROUTER_FALLBACK_MODEL == "x-ai/grok-4.5"
+
+
+def test_incident_grok_fallback_rejects_transport_timeout() -> None:
+    agent = _agent(_fallback_activated=False)
+
+    allowed, message = openrouter_fallback_activation_allowed(
+        agent,
+        "openrouter",
+        OPENROUTER_FALLBACK_MODEL,
+        reason=FailoverReason.timeout,
+    )
+
+    assert allowed is False
+    assert "timeout" in message.lower()
 
 
 def test_gpt55_is_blocked_while_configured_openrouter_fallbacks_remain_compatible(
