@@ -29,9 +29,13 @@ class _FakeTodoStore:
 class _FakeGuardrails:
     def __init__(self):
         self.reset_called = False
+        self.execution_contract = None
 
     def reset_for_turn(self):
         self.reset_called = True
+
+    def set_execution_contract(self, contract):
+        self.execution_contract = contract
 
 
 class _FakeAgent:
@@ -195,6 +199,64 @@ def test_task_id_passthrough():
     ctx = _build(agent, task_id="fixed-task")
     assert ctx.effective_task_id == "fixed-task"
     assert agent._current_task_id == "fixed-task"
+
+
+def test_request_contract_is_bound_and_reset_for_each_turn():
+    agent = _FakeAgent()
+
+    artifact = _build(
+        agent,
+        user_message="Return only a paste-ready GPT Image prompt.",
+        task_id="artifact-task",
+    )
+    assert artifact.task_execution_contract.lane == "artifact_only"
+    assert agent._task_execution_contract is artifact.task_execution_contract
+    assert agent._tool_guardrails.execution_contract is artifact.task_execution_contract
+
+    normal = _build(
+        agent,
+        user_message="Inspect the runtime and fix the service.",
+        task_id="normal-task",
+    )
+    assert normal.task_execution_contract.lane == "normal"
+    assert agent._task_execution_contract is normal.task_execution_contract
+    assert agent._tool_guardrails.execution_contract is normal.task_execution_contract
+
+
+def test_artifact_turn_bounds_prior_history_and_skips_external_prefetch():
+    agent = _FakeAgent()
+    agent._memory_manager = MagicMock()
+    history = [
+        {"role": "user", "content": "old " + "x" * 20_000},
+        {"role": "assistant", "content": "old answer"},
+        {"role": "assistant", "tool_calls": [{"id": "t1"}], "content": ""},
+        {"role": "tool", "tool_call_id": "t1", "content": "large private result"},
+        {"role": "assistant", "content": "recent summary"},
+    ]
+
+    ctx = _build(
+        agent,
+        user_message="Return only a paste-ready GPT Image prompt.",
+        task_id="artifact-task",
+        conversation_history=history,
+    )
+
+    assert all(message.get("role") != "tool" for message in ctx.messages)
+    assert sum(len(str(message.get("content", ""))) for message in ctx.messages) < 13_000
+    agent._memory_manager.prefetch_all.assert_not_called()
+
+
+def test_artifact_turn_skips_pre_llm_plugin_context():
+    agent = _FakeAgent()
+    with patch("hermes_cli.plugins.invoke_hook") as invoke_hook:
+        ctx = _build(
+            agent,
+            user_message="Return only a paste-ready GPT Image prompt.",
+            task_id="artifact-task",
+        )
+
+    assert ctx.plugin_user_context == ""
+    invoke_hook.assert_not_called()
 
 
 def test_persist_user_message_becomes_original():

@@ -5642,6 +5642,7 @@ class AIAgent:
         *,
         failed: bool,
     ) -> str:
+        function_result = self._tool_guardrails.bound_result(function_result)
         decision = self._tool_guardrails.after_call(
             tool_name,
             function_args,

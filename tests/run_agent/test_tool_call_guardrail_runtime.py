@@ -6,6 +6,7 @@ from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 from run_agent import AIAgent
+from agent.task_execution_contract import build_task_execution_contract
 
 
 def _make_tool_defs(*names: str) -> list[dict]:
@@ -236,6 +237,156 @@ def test_plugin_pre_tool_block_wins_without_counting_as_toolguard_block():
     mock_hfc.assert_not_called()
     assert "plugin policy" in messages[0]["content"]
     assert agent._tool_guardrails.before_call("web_search", args).action == "allow"
+
+
+def test_artifact_contract_blocks_sequential_tool_before_plugin_hook():
+    agent = _make_agent("terminal")
+    agent._tool_guardrails.set_execution_contract(
+        build_task_execution_contract(
+            "Return only a paste-ready image prompt.",
+            task_id="artifact-sequential",
+        )
+    )
+    tc = _mock_tool_call("terminal", json.dumps({"command": "pwd"}), "c-artifact")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "agent.tool_executor._apply_tool_request_middleware_for_agent",
+            return_value=({"command": "pwd"}, []),
+        ) as middleware,
+        patch("hermes_cli.plugins.resolve_pre_tool_block") as plugin_block,
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    middleware.assert_not_called()
+    plugin_block.assert_not_called()
+    mock_hfc.assert_not_called()
+    assert "artifact_tool_not_allowlisted" in messages[0]["content"]
+
+
+def test_artifact_contract_blocks_concurrent_tool_before_plugin_hook():
+    agent = _make_agent("terminal")
+    agent._tool_guardrails.set_execution_contract(
+        build_task_execution_contract(
+            "Return only a paste-ready image prompt.",
+            task_id="artifact-concurrent",
+        )
+    )
+    tc = _mock_tool_call("terminal", json.dumps({"command": "pwd"}), "c-artifact")
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "agent.tool_executor._apply_tool_request_middleware_for_agent",
+            return_value=({"command": "pwd"}, []),
+        ) as middleware,
+        patch("hermes_cli.plugins.resolve_pre_tool_block") as plugin_block,
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+    middleware.assert_not_called()
+    plugin_block.assert_not_called()
+    mock_hfc.assert_not_called()
+    assert "artifact_tool_not_allowlisted" in messages[0]["content"]
+
+
+def test_artifact_contract_rechecks_middleware_transformed_arguments():
+    agent = _make_agent("web_extract")
+    agent._tool_guardrails.set_execution_contract(
+        build_task_execution_contract(
+            "Open https://example.com once and return only a paste-ready prompt.",
+            task_id="artifact-middleware-recheck",
+        )
+    )
+    tc = _mock_tool_call(
+        "web_extract",
+        json.dumps({"url": "https://example.com"}),
+        "c-artifact",
+    )
+    msg = SimpleNamespace(content="", tool_calls=[tc])
+    messages = []
+
+    with (
+        patch(
+            "agent.tool_executor._apply_tool_request_middleware_for_agent",
+            return_value=({"url": "https://example.org/private"}, []),
+        ),
+        patch("hermes_cli.plugins.resolve_pre_tool_block") as plugin_block,
+        patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+    ):
+        agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+    plugin_block.assert_not_called()
+    mock_hfc.assert_not_called()
+    assert "artifact_lookup_not_explicit" in messages[0]["content"]
+
+
+def test_artifact_write_quota_blocks_before_middleware_in_both_paths():
+    for concurrent in (False, True):
+        agent = _make_agent("write_file")
+        contract = build_task_execution_contract(
+            "Return only a paste-ready prompt.",
+            task_id=f"artifact-write-quota-{concurrent}",
+        )
+        agent._tool_guardrails.set_execution_contract(contract)
+        assert contract.before_tool(
+            "write_file", {"path": contract.artifact_output_path, "content": "first"}
+        ).allowed
+        tc = _mock_tool_call(
+            "write_file",
+            json.dumps({"path": contract.artifact_output_path, "content": "private second"}),
+            "c-quota",
+        )
+        msg = SimpleNamespace(content="", tool_calls=[tc])
+        messages = []
+
+        with (
+            patch(
+                "agent.tool_executor._apply_tool_request_middleware_for_agent",
+                return_value=(
+                    {"path": contract.artifact_output_path, "content": "private second"},
+                    [],
+                ),
+            ) as middleware,
+            patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc,
+        ):
+            if concurrent:
+                agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+            else:
+                agent._execute_tool_calls_sequential(msg, messages, "task-1")
+
+        middleware.assert_not_called()
+        mock_hfc.assert_not_called()
+        assert "artifact_write_limit" in messages[0]["content"]
+
+
+def test_blocked_concurrent_artifact_nudge_tools_do_not_reset_counters():
+    for tool_name, counter_name in (
+        ("memory", "_turns_since_memory"),
+        ("skill_manage", "_iters_since_skill"),
+    ):
+        agent = _make_agent(tool_name)
+        agent._tool_guardrails.set_execution_contract(
+            build_task_execution_contract(
+                "Return only a paste-ready prompt.",
+                task_id=f"artifact-nudge-{tool_name}",
+            )
+        )
+        setattr(agent, counter_name, 7)
+        tc = _mock_tool_call(tool_name, "{}", f"c-{tool_name}")
+        msg = SimpleNamespace(content="", tool_calls=[tc])
+        messages = []
+
+        with patch("run_agent.handle_function_call", return_value="SHOULD_NOT_RUN") as mock_hfc:
+            agent._execute_tool_calls_concurrent(msg, messages, "task-1")
+
+        mock_hfc.assert_not_called()
+        assert getattr(agent, counter_name) == 7
 
 
 def test_default_run_conversation_warns_without_guardrail_halt():

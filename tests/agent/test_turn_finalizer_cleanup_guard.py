@@ -9,8 +9,11 @@ traceback and lost the whole turn.
 """
 
 import pytest
+import os
+from unittest.mock import patch
 
 from agent.turn_finalizer import finalize_turn
+from agent.task_execution_contract import build_task_execution_contract
 
 
 class _StubBudget:
@@ -40,9 +43,13 @@ class _StubAgent:
         self._interrupt_requested = False
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
+        self._task_execution_contract = None
+        self.sync_calls = 0
         self._response_was_previewed = False
         self._skill_nudge_interval = 0
         self._iters_since_skill = 0
+        self.valid_tool_names = set()
+        self.background_review_calls = 0
         for attr in (
             "session_input_tokens",
             "session_output_tokens",
@@ -97,7 +104,10 @@ class _StubAgent:
         pass
 
     def _sync_external_memory_for_turn(self, **k):
-        pass
+        self.sync_calls += 1
+
+    def _spawn_background_review(self, **k):
+        self.background_review_calls += 1
 
 
 def _run(
@@ -182,3 +192,65 @@ def test_text_response_on_last_allowed_call_is_completed():
     )
     assert result["final_response"] == "final report"
     assert result["completed"] is True
+
+
+def test_artifact_contract_telemetry_is_returned_without_prompt_content():
+    agent = _StubAgent(raise_in=())
+    agent._task_execution_contract = build_task_execution_contract(
+        "Return only a prompt using PRIVATE-SPONSOR-FACT.",
+        task_id="private-task-id",
+    )
+
+    with patch("hermes_cli.plugins.invoke_hook", return_value=[]) as invoke_hook:
+        result = _run(
+            agent,
+            final_response="final prompt",
+            api_call_count=1,
+            turn_exit_reason="text_response(finish_reason=stop)",
+        )
+
+    serialized = repr(result["task_execution"])
+    assert result["task_execution"]["lane"] == "artifact_only"
+    assert result["task_execution"]["decision_status"] == "completed"
+    assert "PRIVATE-SPONSOR-FACT" not in serialized
+    assert "private-task-id" not in serialized
+    assert agent.sync_calls == 0
+    invoke_hook.assert_not_called()
+
+
+def test_artifact_contract_suppresses_background_skill_review():
+    agent = _StubAgent(raise_in=())
+    agent._task_execution_contract = build_task_execution_contract(
+        "Return only a paste-ready prompt.",
+        task_id="artifact-background-review",
+    )
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = {"skill_manage"}
+
+    _run(
+        agent,
+        final_response="final prompt",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert agent.background_review_calls == 0
+
+
+def test_artifact_max_iteration_does_not_mutate_kanban_state():
+    agent = _StubAgent(raise_in=())
+    agent._task_execution_contract = build_task_execution_contract(
+        "Return only a paste-ready prompt.",
+        task_id="artifact-kanban",
+    )
+
+    with (
+        patch.dict(os.environ, {"HERMES_KANBAN_TASK": "t_artifact"}),
+        patch("hermes_cli.kanban_db.connect") as connect,
+        patch("hermes_cli.kanban_db._record_task_failure") as record_failure,
+    ):
+        _run(agent)
+
+    connect.assert_not_called()
+    record_failure.assert_not_called()
