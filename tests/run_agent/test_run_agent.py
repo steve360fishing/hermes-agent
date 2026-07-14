@@ -3654,6 +3654,26 @@ class TestHandleMaxIterations:
         assert len(result) > 0
         assert "summary" in result.lower()
 
+    def test_artifact_contract_is_retained_in_summary_request(self, agent):
+        from agent.task_execution_contract import build_task_execution_contract
+
+        agent.client.chat.completions.create.return_value = _mock_response(content="Summary")
+        agent._cached_system_prompt = "You are helpful."
+        agent._task_execution_contract = build_task_execution_contract(
+            "Return only a paste-ready image prompt.",
+            task_id="summary-artifact",
+        )
+
+        result = agent._handle_max_iterations(
+            [{"role": "user", "content": "Return only a prompt."}],
+            60,
+        )
+
+        assert result == "Summary"
+        sent = agent.client.chat.completions.create.call_args.kwargs["messages"]
+        assert sent[0]["role"] == "system"
+        assert "REQUEST EXECUTION CONTRACT (artifact_only" in sent[0]["content"]
+
     def test_api_failure_returns_error(self, agent):
         agent.client.chat.completions.create.side_effect = Exception("API down")
         agent._cached_system_prompt = "You are helpful."

@@ -11,10 +11,13 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from typing import TYPE_CHECKING, Any, Mapping
 
 from utils import safe_json_loads
 from agent.tool_result_classification import file_mutation_result_landed
+
+if TYPE_CHECKING:
+    from agent.task_execution_contract import TaskExecutionContract
 
 
 IDEMPOTENT_TOOL_NAMES = frozenset(
@@ -145,7 +148,7 @@ class ToolCallSignature:
 class ToolGuardrailDecision:
     """Decision returned by the tool-call guardrail controller."""
 
-    action: str = "allow"  # allow | warn | block | halt
+    action: str = "allow"  # allow | warn | deny | block | halt
     code: str = "allow"
     message: str = ""
     tool_name: str = ""
@@ -226,7 +229,42 @@ class ToolCallGuardrailController:
 
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
+        self._execution_contract: TaskExecutionContract | None = None
         self.reset_for_turn()
+
+    def set_execution_contract(self, contract: TaskExecutionContract | None) -> None:
+        """Bind the request-local policy evaluated before loop guardrails."""
+        self._execution_contract = contract
+
+    def bound_result(self, result: str | None) -> str:
+        if self._execution_contract is None:
+            return "" if result is None else str(result)
+        return self._execution_contract.bound_tool_result(result)
+
+    def preflight_request_contract(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+    ) -> ToolGuardrailDecision:
+        """Apply request-local shape checks before tool middleware."""
+        signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        if self._execution_contract is None:
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+        authorization = self._execution_contract.preflight_tool(tool_name, _coerce_args(args))
+        if authorization.allowed:
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
+        action = "block" if authorization.halt else "deny"
+        decision = ToolGuardrailDecision(
+            action=action,
+            code=authorization.code,
+            message=authorization.message,
+            tool_name=tool_name,
+            count=getattr(self._execution_contract, "_tool_calls", 0),
+            signature=signature,
+        )
+        if decision.should_halt:
+            self._halt_decision = decision
+        return decision
 
     def reset_for_turn(self) -> None:
         self._exact_failure_counts: dict[ToolCallSignature, int] = {}
@@ -240,6 +278,21 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        if self._execution_contract is not None:
+            authorization = self._execution_contract.before_tool(tool_name, _coerce_args(args))
+            if not authorization.allowed:
+                action = "block" if authorization.halt else "deny"
+                decision = ToolGuardrailDecision(
+                    action=action,
+                    code=authorization.code,
+                    message=authorization.message,
+                    tool_name=tool_name,
+                    count=getattr(self._execution_contract, "_tool_calls", 0),
+                    signature=signature,
+                )
+                if decision.should_halt:
+                    self._halt_decision = decision
+                return decision
         if not self.config.hard_stop_enabled:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
 

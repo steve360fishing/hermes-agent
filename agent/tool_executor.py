@@ -373,12 +373,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
             )
             continue
 
-        # Reset nudge counters only for a structurally valid invocation.
-        if function_name == "memory":
-            agent._turns_since_memory = 0
-        elif function_name == "skill_manage":
-            agent._iters_since_skill = 0
-
         # ── Tool Search unwrap ────────────────────────────────────────
         # When the model invokes the tool_call bridge, peel it open so
         # every downstream check (checkpointing, guardrails, plugin
@@ -414,13 +408,22 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
+        _request_contract_block: ToolGuardrailDecision | None = None
+        middleware_trace: list[dict[str, Any]] = []
+        if _ts_scope_block is None:
+            _request_contract_decision = agent._tool_guardrails.preflight_request_contract(
+                function_name, function_args
+            )
+            if not _request_contract_decision.allows_execution:
+                _request_contract_block = _request_contract_decision
+        if _ts_scope_block is None and _request_contract_block is None:
+            function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
 
         # ── Block evaluation (BEFORE checkpoint preflight) ───────────
         # We must know whether the tool will execute before touching
@@ -442,24 +445,27 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                 error_message=_ts_scope_block,
                 middleware_trace=list(middleware_trace),
             )
+        elif _request_contract_block is not None:
+            block_result = agent._guardrail_block_result(_request_contract_block)
+            blocked_by_guardrail = True
+            _emit_terminal_post_tool_call(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                result=block_result,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+                status="blocked",
+                error_type="guardrail_block",
+                error_message=getattr(_request_contract_block, "message", None)
+                or "Tool blocked by request contract",
+                middleware_trace=[],
+            )
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                block_message = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                block_message = None
-
-            if block_message is not None:
-                block_result = json.dumps({"error": block_message}, ensure_ascii=False)
+            guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
+            if not guardrail_decision.allows_execution:
+                block_result = agent._guardrail_block_result(guardrail_decision)
+                blocked_by_guardrail = True
                 _emit_terminal_post_tool_call(
                     agent,
                     function_name=function_name,
@@ -468,15 +474,28 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     effective_task_id=effective_task_id,
                     tool_call_id=getattr(tool_call, "id", "") or "",
                     status="blocked",
-                    error_type="plugin_block",
-                    error_message=block_message,
+                    error_type="guardrail_block",
+                    error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
                     middleware_trace=list(middleware_trace),
                 )
             else:
-                guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
-                if not guardrail_decision.allows_execution:
-                    block_result = agent._guardrail_block_result(guardrail_decision)
-                    blocked_by_guardrail = True
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    block_message = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                except Exception:
+                    block_message = None
+
+                if block_message is not None:
+                    block_result = json.dumps({"error": block_message}, ensure_ascii=False)
                     _emit_terminal_post_tool_call(
                         agent,
                         function_name=function_name,
@@ -485,13 +504,19 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         effective_task_id=effective_task_id,
                         tool_call_id=getattr(tool_call, "id", "") or "",
                         status="blocked",
-                        error_type="guardrail_block",
-                        error_message=getattr(guardrail_decision, "message", None) or "Tool blocked by guardrail policy",
+                        error_type="plugin_block",
+                        error_message=block_message,
                         middleware_trace=list(middleware_trace),
                     )
 
         # ── Checkpoint preflight (only for tools that will execute) ──
         if block_result is None:
+            # Reset nudge counters only when the tool is authorized to run.
+            if function_name == "memory":
+                agent._turns_since_memory = 0
+            elif function_name == "skill_manage":
+                agent._iters_since_skill = 0
+
             # Checkpoint for file-mutating tools
             if function_name in {"write_file", "patch"} and agent._checkpoint_mgr.enabled:
                 try:
@@ -1058,41 +1083,52 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
         except Exception:
             pass
 
-        function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
-            agent,
-            function_name=function_name,
-            function_args=function_args,
-            effective_task_id=effective_task_id,
-            tool_call_id=getattr(tool_call, "id", "") or "",
-        )
+        _request_contract_block: ToolGuardrailDecision | None = None
+        middleware_trace: list[dict[str, Any]] = []
+        if _ts_scope_block is None:
+            _request_contract_decision = agent._tool_guardrails.preflight_request_contract(
+                function_name, function_args
+            )
+            if not _request_contract_decision.allows_execution:
+                _request_contract_block = _request_contract_decision
+        if _ts_scope_block is None and _request_contract_block is None:
+            function_args, middleware_trace = _apply_tool_request_middleware_for_agent(
+                agent,
+                function_name=function_name,
+                function_args=function_args,
+                effective_task_id=effective_task_id,
+                tool_call_id=getattr(tool_call, "id", "") or "",
+            )
 
-        # Check plugin hooks for a block directive before executing.
+        # Request/tool guardrails run before plugin hooks so denied artifact
+        # calls cannot expose arguments to plugin code.
         _block_msg: Optional[str] = None
         _block_error_type = "plugin_block"
+        _guardrail_block_decision: ToolGuardrailDecision | None = None
         if _ts_scope_block is not None:
             _block_msg = _ts_scope_block
             _block_error_type = "tool_scope_block"
+        elif _request_contract_block is not None:
+            _guardrail_block_decision = _request_contract_block
         else:
-            try:
-                from hermes_cli.plugins import resolve_pre_tool_block
-                _block_msg = resolve_pre_tool_block(
-                    function_name,
-                    function_args,
-                    task_id=effective_task_id or "",
-                    session_id=getattr(agent, "session_id", "") or "",
-                    tool_call_id=getattr(tool_call, "id", "") or "",
-                    turn_id=getattr(agent, "_current_turn_id", "") or "",
-                    api_request_id=getattr(agent, "_current_api_request_id", "") or "",
-                    middleware_trace=list(middleware_trace),
-                )
-            except Exception:
-                pass
-
-        _guardrail_block_decision: ToolGuardrailDecision | None = None
-        if _block_msg is None:
             guardrail_decision = agent._tool_guardrails.before_call(function_name, function_args)
             if not guardrail_decision.allows_execution:
                 _guardrail_block_decision = guardrail_decision
+            else:
+                try:
+                    from hermes_cli.plugins import resolve_pre_tool_block
+                    _block_msg = resolve_pre_tool_block(
+                        function_name,
+                        function_args,
+                        task_id=effective_task_id or "",
+                        session_id=getattr(agent, "session_id", "") or "",
+                        tool_call_id=getattr(tool_call, "id", "") or "",
+                        turn_id=getattr(agent, "_current_turn_id", "") or "",
+                        api_request_id=getattr(agent, "_current_api_request_id", "") or "",
+                        middleware_trace=list(middleware_trace),
+                    )
+                except Exception:
+                    pass
 
         _execution_blocked = _block_msg is not None or _guardrail_block_decision is not None
 

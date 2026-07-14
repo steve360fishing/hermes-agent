@@ -513,11 +513,16 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
     if not isinstance(sp, str) or not sp:
         return active_system_prompt
     if api_messages and api_messages[0].get("role") == "system":
-        effective = sp
-        if agent.ephemeral_system_prompt:
-            effective = (effective + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective = _effective_request_system_prompt(agent, sp)
         api_messages[0]["content"] = effective
     return sp
+
+
+def _effective_request_system_prompt(agent, base_prompt: str) -> str:
+    """Append volatile operator guidance, then the request-local contract."""
+    from agent.task_execution_contract import effective_request_system_prompt
+
+    return effective_request_system_prompt(agent, base_prompt)
 
 
 def run_conversation(
@@ -844,9 +849,7 @@ def run_conversation(
         # every turn.  We send it as a single content string so the
         # bytes are byte-stable across turns and upstream prompt caches
         # stay warm.
-        effective_system = active_system_prompt or ""
-        if agent.ephemeral_system_prompt:
-            effective_system = (effective_system + "\n\n" + agent.ephemeral_system_prompt).strip()
+        effective_system = _effective_request_system_prompt(agent, active_system_prompt or "")
         if effective_system:
             api_messages = [{"role": "system", "content": effective_system}] + api_messages
 
