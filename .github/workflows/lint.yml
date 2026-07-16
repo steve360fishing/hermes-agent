@@ -158,3 +158,22 @@ jobs:
 
       - name: Run footgun checker
         run: python scripts/check-windows-footguns.py --all
+
+  execution-boundaries:
+    # Capability-reducing decisions must stay paired with their downstream
+    # enforcement and cleanup paths. New sites fail closed until reviewed and
+    # added to the checked-in registry.
+    name: Execution boundary registry (blocking)
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Python
+        uses: actions/setup-python@a309ff8b426b58ec0e2a45f0f869d46889d02405 # v5
+        with:
+          python-version: "3.11"
+
+      - name: Check execution boundary registry
+        run: python scripts/check_execution_boundaries.py

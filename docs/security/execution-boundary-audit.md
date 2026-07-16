@@ -1,0 +1,112 @@
+# Execution Boundary Audit
+
+This audit prevents capability-reducing policy decisions from drifting away
+from their enforcement, delivery, and cleanup paths. It covers the incident
+class where a request contract can authorize an output route that a later
+layer rejects, or where a turn-scoped restriction survives into another turn.
+
+## Coverage denominator
+
+`scripts/check_execution_boundaries.py` scans a conservative union of:
+
+- eight shipped Python entrypoints;
+- ten runtime roots that can be loaded dynamically by profiles, plugins,
+  providers, cron, gateways, or adapters; and
+- contract-specific semantic tokens in the files that implement each boundary.
+
+The checked-in registry currently classifies 225 source sites across five
+contract families:
+
+| Contract | Required roles |
+| --- | --- |
+| Artifact request | decision, propagation, enforcement, recovery |
+| Artifact delivery | allocation, validation, delivery, recovery |
+| Safe mode | decision, enforcement, lifecycle |
+| Incident fallback | decision, enforcement, recovery |
+| Cron restrictions | decision, enforcement, recovery |
+
+The scan is intentionally a conservative static boundary audit, not a claim
+that Python import analysis can enumerate every runtime plugin. CI fails when:
+
+- a discovered site has no registry disposition;
+- an entrypoint or dynamic root is removed from the denominator;
+- a registered symbol or identifier is stale;
+- a contract is missing a required role; or
+- the registry references a missing source path.
+
+Reviewed exclusions require a written rationale. New sites are never accepted
+implicitly.
+
+## Cross-layer lifecycle checks
+
+| Failure boundary | Required result | Regression proof |
+| --- | --- | --- |
+| Artifact allocation/preflight | Model is not invoked when no compatible writable root exists | `tests/run_agent/test_run_agent.py` artifact preflight cases |
+| Writer rejection | Contract is cleared and the next turn is unrestricted | `tests/agent/test_turn_finalizer_cleanup_guard.py` |
+| Delivery rejection | Contract is cleared; no silent inline substitution | finalizer cleanup and Telegram document tests |
+| Session reload | Request-local contract is rebuilt or cleared, never resurrected from history | `tests/agent/test_turn_context.py` |
+| TXT delivery | Filename, bytes, and MIME remain aligned through the real writer and mocked Telegram network boundary | task contract and Telegram document tests |
+| Protected path | Credentials, traversal, and symlink escapes remain denied | task contract and platform-base tests |
+| Incident fallback | Timeout policy cannot silently widen provider authority | OpenRouter fallback guard tests |
+| Cron restrictions | Job-local allowlists cannot bypass globally disabled toolsets | cron scheduler tests |
+
+## Findings and repairs
+
+### HOME identity mismatch
+
+On Windows, `os.path.expanduser("~")` prefers `USERPROFILE` even when Hermes is
+deliberately running under a different `HOME`. The delivery denylist could
+therefore evaluate a different home directory from the writer/runtime policy.
+The shared delivery validator now uses `HOME` when explicitly configured and
+falls back to platform expansion only when it is absent.
+
+### Control characters in MEDIA paths
+
+MEDIA tag normalization could retain NUL and other control characters long
+enough for a malformed path to enter the extraction list. Normalization now
+rejects every ASCII control character before path validation or delivery.
+
+### Cross-platform test gaps
+
+The affected tests assumed POSIX separators and unrestricted symlink creation.
+They now compare `Path.parts` and skip only when the operating system denies
+symlink creation. This keeps the security assertions meaningful on Linux and
+Windows.
+
+## Effective runtime manifest
+
+The checker can emit a sanitized manifest with `--manifest-out`. It records:
+
+- source commit and tree;
+- SHA-256 hashes for all shipped entrypoints; and
+- configured environment names and presence.
+
+Values for names containing key, token, secret, password, credential, or
+cookie are never emitted. The manifest is evidence, not configuration, and it
+does not mutate the runtime.
+
+## Live read-only snapshot (2026-07-16)
+
+- Container: `hermes-sportfish-newsletter`, running, restart count 0, OOM false.
+- Image source label: `a064a4fa896df69c9c069fa0dbe6cf77645ef624`.
+- `/opt/data` is a writable Docker volume.
+- `/opt/data/hermes-artifacts` exists as a `0700` directory owned by the Hermes
+  runtime user.
+- `/tmp/hermes-artifacts` is absent, so the reviewed persistent fallback is the
+  effective artifact root.
+- The live hashes for task-contract, turn-context, turn-finalizer,
+  platform-base, and Telegram adapter exactly match the canonical Git bytes at
+  the source label.
+- Only environment-variable names/presence were inspected; values were not
+  printed or stored.
+
+No live file, environment variable, container, provider, Telegram message, or
+session state was changed during this audit.
+
+## Deployment boundary
+
+Source merge, image build, VPS promotion/recreation, and a Telegram canary are
+separate gates. The post-deploy canary should create one harmless `.txt`
+document, verify its bytes and MIME metadata, deliver it once, and then prove a
+normal subsequent turn has ordinary tools. Any mismatch requires rollback to
+the previously recorded image without retrying the canary automatically.

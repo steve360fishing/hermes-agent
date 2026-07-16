@@ -2,6 +2,7 @@
 
 import os
 import time
+from pathlib import Path
 from unittest.mock import patch
 
 import pytest
@@ -1384,7 +1385,10 @@ class TestMediaDeliveryDefaultMode:
         workdir = fake_home / "work"
         workdir.mkdir()
         link = workdir / "innocent.pdf"
-        link.symlink_to(key)
+        try:
+            link.symlink_to(key)
+        except (OSError, NotImplementedError):
+            pytest.skip("symlinks are unavailable in this test environment")
         monkeypatch.setenv("HOME", str(fake_home))
         monkeypatch.setattr(
             "gateway.platforms.base._MEDIA_DELIVERY_DENIED_PREFIXES",
@@ -1805,11 +1809,11 @@ class TestMediaDeliveryDiagnosability:
 
     def test_canonical_cache_roots_present(self):
         from gateway.platforms.base import MEDIA_DELIVERY_SAFE_ROOTS
-        roots = {str(r) for r in MEDIA_DELIVERY_SAFE_ROOTS}
-        assert any(r.endswith("cache/images") for r in roots)
-        assert any(r.endswith("cache/documents") for r in roots)
+        roots = {Path(r).parts for r in MEDIA_DELIVERY_SAFE_ROOTS}
+        assert any(parts[-2:] == ("cache", "images") for parts in roots)
+        assert any(parts[-2:] == ("cache", "documents") for parts in roots)
         # Legacy layout still present.
-        assert any(r.endswith("image_cache") for r in roots)
+        assert any(parts[-1:] == ("image_cache",) for parts in roots)
 
 
 # ---------------------------------------------------------------------------

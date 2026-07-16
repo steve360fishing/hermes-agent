@@ -1049,6 +1049,20 @@ _MEDIA_DELIVERY_CACHE_SUBDIRS = (
 )
 
 
+def _runtime_user_home() -> Path:
+    """Return the process home consistently on POSIX and Windows.
+
+    ``ntpath.expanduser`` prefers USERPROFILE over HOME. Hermes containers and
+    tests intentionally use HOME as the runtime identity, so using expanduser
+    directly made the delivery denylist disagree with the writer/runtime view
+    on Windows.
+    """
+    configured = os.environ.get("HOME", "").strip()
+    if configured:
+        return Path(configured).expanduser()
+    return Path(os.path.expanduser("~"))
+
+
 def _profile_cache_roots() -> List[Path]:
     """Return per-profile canonical cache roots under the shared Hermes root.
 
@@ -1126,7 +1140,7 @@ def _media_delivery_strict_mode() -> bool:
 def _media_delivery_denied_paths() -> List[Path]:
     """Return absolute denylist paths under which delivery is never allowed."""
     denied = [Path(p) for p in _MEDIA_DELIVERY_DENIED_PREFIXES]
-    home = Path(os.path.expanduser("~"))
+    home = _runtime_user_home()
     for sub in _MEDIA_DELIVERY_DENIED_HOME_SUBPATHS:
         denied.append(home / sub)
     # The active Hermes profile and shared Hermes root both contain control
@@ -1197,7 +1211,7 @@ def _path_under_denied_prefix(resolved: Path) -> bool:
     credential location or another user's home.
     """
     try:
-        home = Path(os.path.expanduser("~")).resolve(strict=False)
+        home = _runtime_user_home().resolve(strict=False)
     except (OSError, RuntimeError, ValueError):
         home = None
     for denied in _media_delivery_denied_paths():
@@ -1493,6 +1507,8 @@ MEDIA_EXTENSIONLESS_TAG_RE = re.compile(
 
 def _normalize_media_tag_path(raw: str) -> str:
     path = str(raw or "").strip()
+    if any(ord(char) < 32 or ord(char) == 127 for char in path):
+        return ""
     if len(path) >= 2 and path[0] == path[-1] and path[0] in "`\"'":
         path = path[1:-1].strip()
     return path.lstrip("`\"'").rstrip("`\"',.;:)}]")
