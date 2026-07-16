@@ -160,15 +160,19 @@ class AuditReport:
 
 
 class _SymbolVisitor(ast.NodeVisitor):
-    def __init__(self, source: str) -> None:
-        self.source = source
+    def __init__(self, source: str, *, include_segments: bool = True) -> None:
+        self.lines = source.splitlines(keepends=True) if include_segments else []
+        self.include_segments = include_segments
         self.stack: list[str] = []
         self.symbols: list[tuple[str, ast.AST, str]] = []
 
     def _visit_symbol(self, node: ast.AST, name: str) -> None:
         self.stack.append(name)
         symbol = ".".join(self.stack)
-        segment = ast.get_source_segment(self.source, node) or ""
+        segment = ""
+        if self.include_segments:
+            end_line = getattr(node, "end_lineno", node.lineno)
+            segment = "".join(self.lines[node.lineno - 1 : end_line])
         self.symbols.append((symbol, node, segment))
         self.generic_visit(node)
         self.stack.pop()
@@ -242,7 +246,7 @@ def _all_symbols(repo_root: Path, relative_path: str) -> set[str]:
         tree = ast.parse(source, filename=relative_path)
     except (OSError, SyntaxError, UnicodeError):
         return set()
-    visitor = _SymbolVisitor(source)
+    visitor = _SymbolVisitor(source, include_segments=False)
     visitor.visit(tree)
     return {symbol for symbol, _node, _segment in visitor.symbols}
 
