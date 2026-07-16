@@ -1,0 +1,2092 @@
+{
+  "schema_version": 1,
+  "entrypoints": [
+    "cli.py",
+    "run_agent.py",
+    "batch_runner.py",
+    "mcp_serve.py",
+    "gateway/run.py",
+    "hermes_cli/main.py",
+    "tui_gateway/server.py",
+    "acp_adapter/server.py"
+  ],
+  "runtime_roots": [
+    "agent",
+    "gateway",
+    "hermes_cli",
+    "cron",
+    "tools",
+    "plugins",
+    "providers",
+    "tui_gateway",
+    "acp_adapter",
+    "acp_registry"
+  ],
+  "contracts": {
+    "artifact_request": [
+      "decision",
+      "propagation",
+      "enforcement",
+      "recovery"
+    ],
+    "artifact_delivery": [
+      "allocation",
+      "validation",
+      "delivery",
+      "recovery"
+    ],
+    "safe_mode": [
+      "decision",
+      "enforcement",
+      "lifecycle"
+    ],
+    "incident_fallback": [
+      "decision",
+      "enforcement",
+      "recovery"
+    ],
+    "cron_restrictions": [
+      "decision",
+      "enforcement",
+      "recovery"
+    ]
+  },
+  "manifest_environment_names": [
+    "HERMES_PROFILE",
+    "HERMES_HOME",
+    "HERMES_WRITE_SAFE_ROOT",
+    "HERMES_ARTIFACT_ROOT",
+    "HERMES_ARTIFACT_FALLBACK_ROOT",
+    "HERMES_SAFE_MODE",
+    "HERMES_MEDIA_DELIVERY_STRICT",
+    "OPENROUTER_API_KEY",
+    "TELEGRAM_BOT_TOKEN"
+  ],
+  "sites": [
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract",
+      "contract": "artifact_delivery",
+      "role": "allocation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract",
+      "disposition": "covered",
+      "rationale": "allocation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.before_tool",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.before_tool",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.preflight_tool",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.system_guidance",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.system_guidance",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_prepare_artifact_output",
+      "contract": "artifact_delivery",
+      "role": "allocation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_prepare_artifact_output",
+      "disposition": "covered",
+      "rationale": "allocation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:build_task_execution_contract",
+      "contract": "artifact_delivery",
+      "role": "allocation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "build_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "allocation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:validate_artifact_output_path",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "validate_artifact_output_path",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/turn_finalizer.py:_finalize_turn_impl",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/turn_finalizer.py",
+      "symbol": "_finalize_turn_impl",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "cron/scheduler.py:_send_media_via_adapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "cron/scheduler.py",
+      "symbol": "_send_media_via_adapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/kanban_watchers.py:GatewayKanbanWatchersMixin",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/kanban_watchers.py",
+      "symbol": "GatewayKanbanWatchersMixin",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/kanban_watchers.py:GatewayKanbanWatchersMixin._deliver_kanban_artifacts",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/kanban_watchers.py",
+      "symbol": "GatewayKanbanWatchersMixin._deliver_kanban_artifacts",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/kanban_watchers.py:GatewayKanbanWatchersMixin._kanban_notifier_watcher",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/kanban_watchers.py",
+      "symbol": "GatewayKanbanWatchersMixin._kanban_notifier_watcher",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/api_server.py:_resolve_media_to_data_urls",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "_resolve_media_to_data_urls",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/api_server.py:_resolve_media_to_data_urls._to_data_url",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "_resolve_media_to_data_urls._to_data_url",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter._mask_json_string_media",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter._mask_json_string_media",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter._process_message_background",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter._process_message_background",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.extract_local_files",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.extract_local_files",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.extract_media",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.extract_media",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.filter_local_delivery_paths",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.filter_local_delivery_paths",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.filter_media_delivery_paths",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.filter_media_delivery_paths",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.strip_media_directives_for_display",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.strip_media_directives_for_display",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter.validate_media_delivery_path",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter.validate_media_delivery_path",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:_media_delivery_allowed_roots",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_media_delivery_allowed_roots",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:_media_delivery_denied_paths",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_media_delivery_denied_paths",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:_media_delivery_strict_mode",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_media_delivery_strict_mode",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:_strip_media_directives",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_strip_media_directives",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:_strip_media_tag_directives",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_strip_media_tag_directives",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:_strip_media_tag_directives._strip_extensionless",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_strip_media_tag_directives._strip_extensionless",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/base.py:validate_media_delivery_path",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "validate_media_delivery_path",
+      "disposition": "covered",
+      "rationale": "validation boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/bluebubbles.py:BlueBubblesAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/bluebubbles.py",
+      "symbol": "BlueBubblesAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/bluebubbles.py:BlueBubblesAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/bluebubbles.py",
+      "symbol": "BlueBubblesAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/qqbot/adapter.py:QQAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/qqbot/adapter.py",
+      "symbol": "QQAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/qqbot/adapter.py:QQAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/qqbot/adapter.py",
+      "symbol": "QQAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/signal.py:SignalAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/signal.py",
+      "symbol": "SignalAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/signal.py:SignalAdapter._send_attachment",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/signal.py",
+      "symbol": "SignalAdapter._send_attachment",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/signal.py:SignalAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/signal.py",
+      "symbol": "SignalAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:WeixinAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "WeixinAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:WeixinAdapter.send",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "WeixinAdapter.send",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:WeixinAdapter.send._deliver_media",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "WeixinAdapter.send._deliver_media",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:WeixinAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "WeixinAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:WeixinAdapter.send_image",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "WeixinAdapter.send_image",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:WeixinAdapter.send_image_file",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "WeixinAdapter.send_image_file",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/weixin.py:send_weixin_direct",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/weixin.py",
+      "symbol": "send_weixin_direct",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/whatsapp_cloud.py:WhatsAppCloudAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/whatsapp_cloud.py",
+      "symbol": "WhatsAppCloudAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/whatsapp_cloud.py:WhatsAppCloudAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/whatsapp_cloud.py",
+      "symbol": "WhatsAppCloudAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/whatsapp_cloud.py:WhatsAppCloudAdapter.send_image",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/whatsapp_cloud.py",
+      "symbol": "WhatsAppCloudAdapter.send_image",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/yuanbao.py:MessageSender",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/yuanbao.py",
+      "symbol": "MessageSender",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/yuanbao.py:MessageSender.send_direct",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/yuanbao.py",
+      "symbol": "MessageSender.send_direct",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/yuanbao.py:YuanbaoAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/yuanbao.py",
+      "symbol": "YuanbaoAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/platforms/yuanbao.py:YuanbaoAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/yuanbao.py",
+      "symbol": "YuanbaoAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._deliver_media_from_response",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._deliver_media_from_response",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/stream_consumer.py:GatewayStreamConsumer",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/stream_consumer.py",
+      "symbol": "GatewayStreamConsumer",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/dingtalk/adapter.py:DingTalkAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/dingtalk/adapter.py",
+      "symbol": "DingTalkAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/dingtalk/adapter.py:DingTalkAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/dingtalk/adapter.py",
+      "symbol": "DingTalkAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/discord/adapter.py:DiscordAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/discord/adapter.py",
+      "symbol": "DiscordAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/discord/adapter.py:DiscordAdapter._forum_post_file",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/discord/adapter.py",
+      "symbol": "DiscordAdapter._forum_post_file",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/discord/adapter.py:DiscordAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/discord/adapter.py",
+      "symbol": "DiscordAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/email/adapter.py:EmailAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/email/adapter.py",
+      "symbol": "EmailAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/email/adapter.py:EmailAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/email/adapter.py",
+      "symbol": "EmailAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/feishu/adapter.py:FeishuAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/feishu/adapter.py",
+      "symbol": "FeishuAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/feishu/adapter.py:FeishuAdapter.send_animation",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/feishu/adapter.py",
+      "symbol": "FeishuAdapter.send_animation",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/feishu/adapter.py:FeishuAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/feishu/adapter.py",
+      "symbol": "FeishuAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/feishu/adapter.py:_standalone_send",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/feishu/adapter.py",
+      "symbol": "_standalone_send",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/google_chat/adapter.py:GoogleChatAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/google_chat/adapter.py",
+      "symbol": "GoogleChatAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/google_chat/adapter.py:GoogleChatAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/google_chat/adapter.py",
+      "symbol": "GoogleChatAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/matrix/adapter.py:MatrixAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/matrix/adapter.py",
+      "symbol": "MatrixAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/matrix/adapter.py:MatrixAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/matrix/adapter.py",
+      "symbol": "MatrixAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/mattermost/adapter.py:MattermostAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/mattermost/adapter.py",
+      "symbol": "MattermostAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/mattermost/adapter.py:MattermostAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/mattermost/adapter.py",
+      "symbol": "MattermostAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/photon/adapter.py:PhotonAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/photon/adapter.py",
+      "symbol": "PhotonAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/photon/adapter.py:PhotonAdapter._sidecar_send_attachment",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/photon/adapter.py",
+      "symbol": "PhotonAdapter._sidecar_send_attachment",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/photon/adapter.py:PhotonAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/photon/adapter.py",
+      "symbol": "PhotonAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/photon/adapter.py:_standalone_send",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/photon/adapter.py",
+      "symbol": "_standalone_send",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/simplex/adapter.py:SimplexAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/simplex/adapter.py",
+      "symbol": "SimplexAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/simplex/adapter.py:SimplexAdapter.send",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/simplex/adapter.py",
+      "symbol": "SimplexAdapter.send",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/simplex/adapter.py:SimplexAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/simplex/adapter.py",
+      "symbol": "SimplexAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/simplex/adapter.py:SimplexAdapter.send_video",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/simplex/adapter.py",
+      "symbol": "SimplexAdapter.send_video",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/slack/adapter.py:SlackAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/slack/adapter.py",
+      "symbol": "SlackAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/slack/adapter.py:SlackAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/slack/adapter.py",
+      "symbol": "SlackAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/teams/adapter.py:TeamsAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/teams/adapter.py",
+      "symbol": "TeamsAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/teams/adapter.py:TeamsAdapter._send_media_attachment",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/teams/adapter.py",
+      "symbol": "TeamsAdapter._send_media_attachment",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/teams/adapter.py:TeamsAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/teams/adapter.py",
+      "symbol": "TeamsAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter.send_image_file",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter.send_image_file",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter.send_voice",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter.send_voice",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/wecom/adapter.py:WeComAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/wecom/adapter.py",
+      "symbol": "WeComAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/wecom/adapter.py:WeComAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/wecom/adapter.py",
+      "symbol": "WeComAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/whatsapp/adapter.py:WhatsAppAdapter",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/whatsapp/adapter.py",
+      "symbol": "WhatsAppAdapter",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/whatsapp/adapter.py:WhatsAppAdapter.send_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/whatsapp/adapter.py",
+      "symbol": "WhatsAppAdapter.send_document",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "plugins/platforms/whatsapp/adapter.py:WhatsAppAdapter.send_image",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/whatsapp/adapter.py",
+      "symbol": "WhatsAppAdapter.send_image",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "tools/send_message_tool.py:_handle_send",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "tools/send_message_tool.py",
+      "symbol": "_handle_send",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "tools/send_message_tool.py:_matrix_send_core",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "tools/send_message_tool.py",
+      "symbol": "_matrix_send_core",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "tools/send_message_tool.py:_send_telegram",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "tools/send_message_tool.py",
+      "symbol": "_send_telegram",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "tools/yuanbao_tools.py:send_dm",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "tools/yuanbao_tools.py",
+      "symbol": "send_dm",
+      "disposition": "covered",
+      "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "agent/chat_completion_helpers.py:handle_max_iterations",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/chat_completion_helpers.py",
+      "symbol": "handle_max_iterations",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/conversation_loop.py:_clear_request_contract_after_turn",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/conversation_loop.py",
+      "symbol": "_clear_request_contract_after_turn",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/conversation_loop.py:_clear_request_contract_after_turn.wrapper",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/conversation_loop.py",
+      "symbol": "_clear_request_contract_after_turn.wrapper",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/conversation_loop.py:_effective_request_system_prompt",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/conversation_loop.py",
+      "symbol": "_effective_request_system_prompt",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/conversation_loop.py:run_conversation",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/conversation_loop.py",
+      "symbol": "run_conversation",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.before_tool",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.before_tool",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.bound_conversation_history",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.bound_conversation_history",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.bound_tool_result",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.bound_tool_result",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.preflight_tool",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:TaskExecutionContract.system_guidance",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "TaskExecutionContract.system_guidance",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_classify",
+      "contract": "artifact_request",
+      "role": "decision",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_classify",
+      "disposition": "covered",
+      "rationale": "decision boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:build_task_execution_contract",
+      "contract": "artifact_request",
+      "role": "decision",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "build_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "decision boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:clear_task_execution_contract",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "clear_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:effective_request_system_prompt",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "effective_request_system_prompt",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:ToolCallGuardrailController",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "ToolCallGuardrailController",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:ToolCallGuardrailController.__init__",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "ToolCallGuardrailController.__init__",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:ToolCallGuardrailController.before_call",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "ToolCallGuardrailController.before_call",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:ToolCallGuardrailController.bound_result",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "ToolCallGuardrailController.bound_result",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:ToolCallGuardrailController.preflight_request_contract",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "ToolCallGuardrailController.preflight_request_contract",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:ToolCallGuardrailController.set_execution_contract",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "ToolCallGuardrailController.set_execution_contract",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/turn_context.py:TurnContext",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/turn_context.py",
+      "symbol": "TurnContext",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/turn_context.py:build_turn_context",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/turn_context.py",
+      "symbol": "build_turn_context",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/turn_finalizer.py:_finalize_turn_impl",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/turn_finalizer.py",
+      "symbol": "_finalize_turn_impl",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/turn_finalizer.py:finalize_turn",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/turn_finalizer.py",
+      "symbol": "finalize_turn",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "acp_adapter/server.py:HermesACPAgent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "acp_adapter/server.py",
+      "symbol": "HermesACPAgent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "acp_adapter/server.py:HermesACPAgent._cmd_tools",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "acp_adapter/server.py",
+      "symbol": "HermesACPAgent._cmd_tools",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "acp_adapter/server.py:HermesACPAgent._register_session_mcp_servers",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "acp_adapter/server.py",
+      "symbol": "HermesACPAgent._register_session_mcp_servers",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "acp_adapter/session.py:SessionManager",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "acp_adapter/session.py",
+      "symbol": "SessionManager",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "acp_adapter/session.py:SessionManager._make_agent",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "acp_adapter/session.py",
+      "symbol": "SessionManager._make_agent",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "acp_adapter/session.py:_expand_acp_enabled_toolsets",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "acp_adapter/session.py",
+      "symbol": "_expand_acp_enabled_toolsets",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/agent_init.py:init_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/agent_init.py",
+      "symbol": "init_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/agent_runtime_helpers.py:invoke_tool",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/agent_runtime_helpers.py",
+      "symbol": "invoke_tool",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/agent_runtime_helpers.py:invoke_tool._execute",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/agent_runtime_helpers.py",
+      "symbol": "invoke_tool._execute",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/background_review.py:_run_review_in_thread",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/background_review.py",
+      "symbol": "_run_review_in_thread",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/memory_manager.py:inject_memory_provider_tools",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/memory_manager.py",
+      "symbol": "inject_memory_provider_tools",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/memory_manager.py:memory_provider_tools_enabled",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/memory_manager.py",
+      "symbol": "memory_provider_tools_enabled",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/tool_executor.py:_tool_search_scoped_names",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/tool_executor.py",
+      "symbol": "_tool_search_scoped_names",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/tool_executor.py:execute_tool_calls_sequential",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "agent/tool_executor.py",
+      "symbol": "execute_tool_calls_sequential",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/jobs.py:_compute_provider_model_snapshots",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "cron/jobs.py",
+      "symbol": "_compute_provider_model_snapshots",
+      "disposition": "covered",
+      "rationale": "decision boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/jobs.py:create_job",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "cron/jobs.py",
+      "symbol": "create_job",
+      "disposition": "covered",
+      "rationale": "decision boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/jobs.py:update_job",
+      "contract": "cron_restrictions",
+      "role": "recovery",
+      "path": "cron/jobs.py",
+      "symbol": "update_job",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "cron/scheduler.py",
+      "symbol": "_merge_mcp_into_per_job_toolsets",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/scheduler.py:_resolve_cron_disabled_toolsets",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "cron/scheduler.py",
+      "symbol": "_resolve_cron_disabled_toolsets",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/scheduler.py:_resolve_cron_enabled_toolsets",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "cron/scheduler.py",
+      "symbol": "_resolve_cron_enabled_toolsets",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "cron/scheduler.py:run_job",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "cron/scheduler.py",
+      "symbol": "run_job",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/platforms/api_server.py:APIServerAdapter",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "APIServerAdapter",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/platforms/api_server.py:APIServerAdapter._create_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "APIServerAdapter._create_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/platforms/api_server.py:APIServerAdapter._handle_toolsets",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/platforms/api_server.py",
+      "symbol": "APIServerAdapter._handle_toolsets",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._agent_config_signature",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._agent_config_signature",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._execute_mcp_reload",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._execute_mcp_reload",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._handle_message_with_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._handle_message_with_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_agent_inner",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_agent_inner",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_agent_inner.run_sync",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_agent_inner.run_sync",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task.run_sync",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task.run_sync",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/slash_commands.py:GatewaySlashCommandsMixin",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/slash_commands.py",
+      "symbol": "GatewaySlashCommandsMixin",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "gateway/slash_commands.py:GatewaySlashCommandsMixin._handle_compress_command",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/slash_commands.py",
+      "symbol": "GatewaySlashCommandsMixin._handle_compress_command",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/banner.py:build_welcome_banner",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/banner.py",
+      "symbol": "build_welcome_banner",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/cli_agent_setup_mixin.py:CLIAgentSetupMixin",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/cli_agent_setup_mixin.py",
+      "symbol": "CLIAgentSetupMixin",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/cli_agent_setup_mixin.py:CLIAgentSetupMixin._init_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/cli_agent_setup_mixin.py",
+      "symbol": "CLIAgentSetupMixin._init_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/cli_commands_mixin.py:CLICommandsMixin",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/cli_commands_mixin.py",
+      "symbol": "CLICommandsMixin",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/cli_commands_mixin.py:CLICommandsMixin._handle_background_command",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/cli_commands_mixin.py",
+      "symbol": "CLICommandsMixin._handle_background_command",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/cli_commands_mixin.py:CLICommandsMixin._handle_background_command.run_background",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/cli_commands_mixin.py",
+      "symbol": "CLICommandsMixin._handle_background_command.run_background",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/cli_commands_mixin.py:CLICommandsMixin._handle_tools_command",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/cli_commands_mixin.py",
+      "symbol": "CLICommandsMixin._handle_tools_command",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/doctor.py:_missing_api_key_toolsets_for_summary",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/doctor.py",
+      "symbol": "_missing_api_key_toolsets_for_summary",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/nous_subscription.py:apply_nous_managed_defaults",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/nous_subscription.py",
+      "symbol": "apply_nous_managed_defaults",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/oneshot.py:_run_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/oneshot.py",
+      "symbol": "_run_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/prompt_size.py:_build_inspection_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/prompt_size.py",
+      "symbol": "_build_inspection_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/setup.py:_blank_slate_minimal_toolsets",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/setup.py",
+      "symbol": "_blank_slate_minimal_toolsets",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/tools_config.py:_get_platform_tools",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/tools_config.py",
+      "symbol": "_get_platform_tools",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/tools_config.py:_print_tools_list",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/tools_config.py",
+      "symbol": "_print_tools_list",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/tools_config.py:_save_platform_tools",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/tools_config.py",
+      "symbol": "_save_platform_tools",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/tools_config.py:tools_command",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "hermes_cli/tools_config.py",
+      "symbol": "tools_command",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/web_server.py:CronJobCreate",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "hermes_cli/web_server.py",
+      "symbol": "CronJobCreate",
+      "disposition": "covered",
+      "rationale": "decision boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/web_server.py:_apply_model_assignment_sync",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "hermes_cli/web_server.py",
+      "symbol": "_apply_model_assignment_sync",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/web_server.py:_create_cron_job_sync",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "hermes_cli/web_server.py",
+      "symbol": "_create_cron_job_sync",
+      "disposition": "covered",
+      "rationale": "decision boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/web_server.py:_normalize_dashboard_cron_updates",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "hermes_cli/web_server.py",
+      "symbol": "_normalize_dashboard_cron_updates",
+      "disposition": "covered",
+      "rationale": "decision boundary for the cron restrictions contract."
+    },
+    {
+      "id": "hermes_cli/web_server.py:get_toolsets",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "hermes_cli/web_server.py",
+      "symbol": "get_toolsets",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "plugins/hermes-achievements/dashboard/plugin_api.py:analyze_messages",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "plugins/hermes-achievements/dashboard/plugin_api.py",
+      "symbol": "analyze_messages",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "plugins/platforms/feishu/feishu_comment.py:_run_comment_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "plugins/platforms/feishu/feishu_comment.py",
+      "symbol": "_run_comment_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/blueprints.py:BlueprintSpec",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/blueprints.py",
+      "symbol": "BlueprintSpec",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/blueprints.py:blueprint_to_job_spec",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/blueprints.py",
+      "symbol": "blueprint_to_job_spec",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/blueprints.py:export_blueprint",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/blueprints.py",
+      "symbol": "export_blueprint",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/blueprints.py:parse_blueprint",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/blueprints.py",
+      "symbol": "parse_blueprint",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/cronjob_tools.py:_format_job",
+      "contract": "cron_restrictions",
+      "role": "recovery",
+      "path": "tools/cronjob_tools.py",
+      "symbol": "_format_job",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/cronjob_tools.py:cronjob",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "tools/cronjob_tools.py",
+      "symbol": "cronjob",
+      "disposition": "covered",
+      "rationale": "decision boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/delegate_tool.py:_build_child_agent",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/delegate_tool.py",
+      "symbol": "_build_child_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/delegate_tool.py:_dump_subagent_timeout_diagnostic",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/delegate_tool.py",
+      "symbol": "_dump_subagent_timeout_diagnostic",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/mcp_tool.py:_reinject_post_build_tools",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/mcp_tool.py",
+      "symbol": "_reinject_post_build_tools",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/mcp_tool.py:refresh_agent_mcp_tools",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "tools/mcp_tool.py",
+      "symbol": "refresh_agent_mcp_tools",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tui_gateway/server.py:_",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "tui_gateway/server.py",
+      "symbol": "_",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tui_gateway/server.py:_background_agent_kwargs",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "tui_gateway/server.py",
+      "symbol": "_background_agent_kwargs",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tui_gateway/server.py:_ephemeral_preview_agent_kwargs",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "tui_gateway/server.py",
+      "symbol": "_ephemeral_preview_agent_kwargs",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tui_gateway/server.py:_load_enabled_toolsets",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "tui_gateway/server.py",
+      "symbol": "_load_enabled_toolsets",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tui_gateway/server.py:_make_agent",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "tui_gateway/server.py",
+      "symbol": "_make_agent",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the cron restrictions contract."
+    },
+    {
+      "id": "agent/agent_init.py:init_agent",
+      "contract": "incident_fallback",
+      "role": "propagation",
+      "path": "agent/agent_init.py",
+      "symbol": "init_agent",
+      "disposition": "covered",
+      "rationale": "propagation boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/agent_runtime_helpers.py:restore_primary_runtime",
+      "contract": "incident_fallback",
+      "role": "recovery",
+      "path": "agent/agent_runtime_helpers.py",
+      "symbol": "restore_primary_runtime",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/agent_runtime_helpers.py:switch_model",
+      "contract": "incident_fallback",
+      "role": "recovery",
+      "path": "agent/agent_runtime_helpers.py",
+      "symbol": "switch_model",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/chat_completion_helpers.py:try_activate_fallback",
+      "contract": "incident_fallback",
+      "role": "decision",
+      "path": "agent/chat_completion_helpers.py",
+      "symbol": "try_activate_fallback",
+      "disposition": "covered",
+      "rationale": "decision boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/conversation_loop.py:_sync_failover_system_message",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/conversation_loop.py",
+      "symbol": "_sync_failover_system_message",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/conversation_loop.py:run_conversation",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/conversation_loop.py",
+      "symbol": "run_conversation",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:_cap_fallback_output",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "_cap_fallback_output",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:_cap_message",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "_cap_message",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:_clear_cap_state",
+      "contract": "incident_fallback",
+      "role": "recovery",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "_clear_cap_state",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:_record_fallback_turn",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "_record_fallback_turn",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:apply_openrouter_fallback_notice",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "apply_openrouter_fallback_notice",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:fallback_cap_message_if_exhausted",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "fallback_cap_message_if_exhausted",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:is_emergency_openrouter_fallback_active",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "is_emergency_openrouter_fallback_active",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:openrouter_fallback_activation_allowed",
+      "contract": "incident_fallback",
+      "role": "decision",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "openrouter_fallback_activation_allowed",
+      "disposition": "covered",
+      "rationale": "decision boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:record_gateway_primary_route",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "record_gateway_primary_route",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:record_openrouter_fallback_activation",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "record_openrouter_fallback_activation",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:restore_openrouter_fallback_state",
+      "contract": "incident_fallback",
+      "role": "recovery",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "restore_openrouter_fallback_state",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/turn_finalizer.py:_finalize_turn_impl",
+      "contract": "incident_fallback",
+      "role": "recovery",
+      "path": "agent/turn_finalizer.py",
+      "symbol": "_finalize_turn_impl",
+      "disposition": "covered",
+      "rationale": "recovery boundary for the incident fallback contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_agent_inner",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_agent_inner",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_agent_inner.run_sync",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_agent_inner.run_sync",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "gateway/run.py:_apply_openrouter_fallback_notice_to_result",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "_apply_openrouter_fallback_notice_to_result",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/shell_hooks.py:register_from_config",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "agent/shell_hooks.py",
+      "symbol": "register_from_config",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the safe mode contract."
+    },
+    {
+      "id": "hermes_cli/main.py:_apply_safe_mode",
+      "contract": "safe_mode",
+      "role": "decision",
+      "path": "hermes_cli/main.py",
+      "symbol": "_apply_safe_mode",
+      "disposition": "covered",
+      "rationale": "decision boundary for the safe mode contract."
+    },
+    {
+      "id": "hermes_cli/main.py:_prepare_agent_startup",
+      "contract": "safe_mode",
+      "role": "lifecycle",
+      "path": "hermes_cli/main.py",
+      "symbol": "_prepare_agent_startup",
+      "disposition": "covered",
+      "rationale": "lifecycle boundary for the safe mode contract."
+    },
+    {
+      "id": "hermes_cli/main.py:cmd_chat",
+      "contract": "safe_mode",
+      "role": "decision",
+      "path": "hermes_cli/main.py",
+      "symbol": "cmd_chat",
+      "disposition": "covered",
+      "rationale": "decision boundary for the safe mode contract."
+    },
+    {
+      "id": "hermes_cli/plugins.py:PluginManager",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "hermes_cli/plugins.py",
+      "symbol": "PluginManager",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the safe mode contract."
+    },
+    {
+      "id": "hermes_cli/plugins.py:PluginManager.discover_and_load",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "hermes_cli/plugins.py",
+      "symbol": "PluginManager.discover_and_load",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the safe mode contract."
+    },
+    {
+      "id": "tools/mcp_tool.py:_load_mcp_config",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "tools/mcp_tool.py",
+      "symbol": "_load_mcp_config",
+      "disposition": "covered",
+      "rationale": "enforcement boundary for the safe mode contract."
+    }
+  ]
+}
