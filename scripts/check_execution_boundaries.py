@@ -247,9 +247,17 @@ def _all_symbols(repo_root: Path, relative_path: str) -> set[str]:
     return {symbol for symbol, _node, _segment in visitor.symbols}
 
 
-def validate_registry(repo_root: Path, registry: dict[str, Any]) -> list[str]:
+def validate_registry(
+    repo_root: Path,
+    registry: dict[str, Any],
+    *,
+    discovered_sites: Iterable[Site] | None = None,
+) -> list[str]:
     errors: list[str] = []
     symbol_cache: dict[str, set[str]] = {}
+    if discovered_sites is not None:
+        for discovered in discovered_sites:
+            symbol_cache.setdefault(discovered.path, set()).add(discovered.symbol)
     if registry.get("schema_version") != 1:
         errors.append("registry schema_version must be 1")
     entrypoints = registry.get("entrypoints", [])
@@ -286,9 +294,9 @@ def validate_registry(repo_root: Path, registry: dict[str, Any]) -> list[str]:
         if not isinstance(path, str) or not (repo_root / path).is_file():
             errors.append(f"{prefix}: missing path {path!r}")
             continue
-        if path not in symbol_cache:
+        if discovered_sites is None and path not in symbol_cache:
             symbol_cache[path] = _all_symbols(repo_root, path)
-        available_symbols = symbol_cache[path]
+        available_symbols = symbol_cache.get(path, set())
         if not isinstance(symbol, str) or symbol not in available_symbols:
             errors.append(f"{prefix}: missing symbol {path}:{symbol}")
         expected_id = f"{path}:{symbol}"
@@ -311,8 +319,8 @@ def validate_registry(repo_root: Path, registry: dict[str, Any]) -> list[str]:
 
 
 def audit_repository(repo_root: Path, registry: dict[str, Any]) -> AuditReport:
-    invalid = validate_registry(repo_root, registry)
     discovered = discover_sites(repo_root, registry.get("runtime_roots", RUNTIME_ROOTS))
+    invalid = validate_registry(repo_root, registry, discovered_sites=discovered)
     classified = {
         (site.get("contract"), f"{site.get('path')}:{site.get('symbol')}")
         for site in registry.get("sites", [])
