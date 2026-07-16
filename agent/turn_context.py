@@ -34,7 +34,12 @@ from agent.model_metadata import (
     estimate_messages_tokens_rough,
     estimate_request_tokens_rough,
 )
-from agent.task_execution_contract import ARTIFACT_ONLY, TaskExecutionContract, build_task_execution_contract
+from agent.task_execution_contract import (
+    ARTIFACT_ONLY,
+    TaskExecutionContract,
+    build_task_execution_contract,
+    clear_task_execution_contract,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -127,6 +132,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[str],
     persist_user_timestamp: Optional[float] = None,
+    task_execution_contract: TaskExecutionContract | None = None,
     *,
     restore_or_build_system_prompt,
     install_safe_stdio,
@@ -142,6 +148,10 @@ def build_turn_context(
     ``conversation_loop`` module are passed in explicitly to keep this module
     free of an import cycle with ``agent.conversation_loop``.
     """
+    # A prior turn may have exited before its normal finalizer. Expire any
+    # request-local restriction before deriving policy for this turn.
+    clear_task_execution_contract(agent)
+
     # Guard stdio against OSError from broken pipes (systemd/headless/daemon).
     install_safe_stdio()
 
@@ -221,7 +231,7 @@ def build_turn_context(
     agent._current_turn_id = turn_id
     agent._current_api_request_id = ""
     contract_message = persist_user_message if persist_user_message is not None else user_message
-    task_execution_contract = build_task_execution_contract(
+    task_execution_contract = task_execution_contract or build_task_execution_contract(
         contract_message,
         task_id=effective_task_id,
     )

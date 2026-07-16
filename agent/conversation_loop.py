@@ -25,6 +25,7 @@ import ssl
 import threading
 import time
 import uuid
+from functools import wraps
 from typing import Any, Dict, List, Optional
 
 from agent.codex_responses_adapter import _summarize_user_message_for_log
@@ -525,6 +526,20 @@ def _effective_request_system_prompt(agent, base_prompt: str) -> str:
     return effective_request_system_prompt(agent, base_prompt)
 
 
+def _clear_request_contract_after_turn(func):
+    @wraps(func)
+    def wrapper(agent, *args, **kwargs):
+        try:
+            return func(agent, *args, **kwargs)
+        finally:
+            from agent.task_execution_contract import clear_task_execution_contract
+
+            clear_task_execution_contract(agent)
+
+    return wrapper
+
+
+@_clear_request_contract_after_turn
 def run_conversation(
     agent,
     user_message: str,
@@ -570,6 +585,49 @@ def run_conversation(
         except Exception:
             pass
 
+    # Resolve file-artifact policy before any context compression, plugin, or
+    # provider work. A contradictory destination must fail without invoking a
+    # model or leaving a reduced-capability contract attached to the session.
+    from agent.task_execution_contract import (
+        build_task_execution_contract,
+        clear_task_execution_contract,
+    )
+
+    clear_task_execution_contract(agent)
+    task_id = task_id or str(uuid.uuid4())
+    _contract_message = (
+        persist_user_message if persist_user_message is not None else user_message
+    )
+    _prebuilt_task_contract = build_task_execution_contract(
+        _contract_message,
+        task_id=task_id,
+    )
+    if _prebuilt_task_contract.preflight_error:
+        _preflight_response = (
+            "I could not find a safe artifact destination. No file was written "
+            "or delivered, and normal capabilities remain available."
+        )
+        _preflight_telemetry = _prebuilt_task_contract.telemetry(
+            decision_status="failed"
+        )
+        _prebuilt_task_contract.deactivate()
+        return {
+            "final_response": _preflight_response,
+            "messages": [
+                {"role": "user", "content": str(_contract_message)},
+                {"role": "assistant", "content": _preflight_response},
+            ],
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "partial": False,
+            "interrupted": False,
+            "turn_exit_reason": "artifact_output_preflight_failed",
+            "task_execution": _preflight_telemetry,
+            "model": agent.model,
+            "provider": agent.provider,
+        }
+
     # ── Per-turn setup (the prologue) ──
     # All once-per-turn setup — stdio guarding, retry-counter resets, user
     # message sanitization, todo/nudge hydration, system-prompt restore-or-
@@ -578,23 +636,30 @@ def run_conversation(
     # ``build_turn_context``.  It mutates ``agent`` exactly as the inline code
     # did and returns the locals the loop below reads back.  See
     # ``agent/turn_context.py``.
-    _ctx = build_turn_context(
-        agent,
-        user_message,
-        system_message,
-        conversation_history,
-        task_id,
-        stream_callback,
-        persist_user_message,
-        persist_user_timestamp,
-        restore_or_build_system_prompt=_restore_or_build_system_prompt,
-        install_safe_stdio=_install_safe_stdio,
-        sanitize_surrogates=_sanitize_surrogates,
-        summarize_user_message_for_log=_summarize_user_message_for_log,
-        set_session_context=set_session_context,
-        set_current_write_origin=set_current_write_origin,
-        ra=_ra,
-    )
+    try:
+        _ctx = build_turn_context(
+            agent,
+            user_message,
+            system_message,
+            conversation_history,
+            task_id,
+            stream_callback,
+            persist_user_message,
+            persist_user_timestamp,
+            task_execution_contract=_prebuilt_task_contract,
+            restore_or_build_system_prompt=_restore_or_build_system_prompt,
+            install_safe_stdio=_install_safe_stdio,
+            sanitize_surrogates=_sanitize_surrogates,
+            summarize_user_message_for_log=_summarize_user_message_for_log,
+            set_session_context=set_session_context,
+            set_current_write_origin=set_current_write_origin,
+            ra=_ra,
+        )
+    except Exception:
+        from agent.task_execution_contract import clear_task_execution_contract
+
+        clear_task_execution_contract(agent)
+        raise
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message
     messages = _ctx.messages

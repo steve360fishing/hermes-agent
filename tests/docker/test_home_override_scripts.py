@@ -167,3 +167,68 @@ def test_stage2_repairs_profiles_and_cron_ownership(
         f"expected hermes-owned files after restart, got: {r.stdout!r} — "
         f"stage2 hook did not repair profiles/ and cron/ ownership"
     )
+
+
+def test_stage2_creates_private_persistent_artifact_root(
+    built_image: str, container_name: str,
+) -> None:
+    """Artifact delivery must always have a writer-approved persistent root."""
+    start_container(built_image, container_name)
+
+    r = docker_exec_sh(
+        container_name,
+        'stat -c "%U:%G:%a" /opt/data/hermes-artifacts',
+        timeout=5,
+    )
+
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "hermes:hermes:700"
+
+
+def test_stage2_repairs_warm_artifact_root_ownership(
+    built_image: str, container_name: str,
+) -> None:
+    start_container(built_image, container_name)
+    docker_exec(
+        container_name, "sh", "-c",
+        "rm -rf /opt/data/hermes-artifacts && "
+        "mkdir /opt/data/hermes-artifacts && "
+        "touch /opt/data/hermes-artifacts/root-owned.txt && "
+        "chmod 755 /opt/data/hermes-artifacts",
+        user="root", timeout=5,
+    )
+
+    restart_container(container_name)
+    r = docker_exec_sh(
+        container_name,
+        'stat -c "%U:%G:%a" /opt/data/hermes-artifacts && '
+        'stat -c "%U:%G" /opt/data/hermes-artifacts/root-owned.txt',
+        timeout=5,
+    )
+
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip().splitlines() == ["hermes:hermes:700", "hermes:hermes"]
+
+
+def test_stage2_refuses_symlinked_artifact_root(
+    built_image: str, container_name: str,
+) -> None:
+    start_container(built_image, container_name)
+    docker_exec(
+        container_name, "sh", "-c",
+        "rm -rf /opt/data/hermes-artifacts /tmp/artifact-outside && "
+        "mkdir /tmp/artifact-outside && chmod 755 /tmp/artifact-outside && "
+        "ln -s /tmp/artifact-outside /opt/data/hermes-artifacts",
+        user="root", timeout=5,
+    )
+
+    restart_container(container_name)
+    r = docker_exec_sh(
+        container_name,
+        'test -L /opt/data/hermes-artifacts && '
+        'stat -c "%a" /tmp/artifact-outside',
+        timeout=5,
+    )
+
+    assert r.returncode == 0, r.stderr
+    assert r.stdout.strip() == "755"

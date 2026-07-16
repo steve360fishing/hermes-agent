@@ -85,6 +85,16 @@ class TestToolMediaReWindowsPaths:
         assert match is not None, f"Should match: {media_tag}"
         assert match.group(1) == expected_path
 
+    @pytest.mark.parametrize("extension", ["txt", "md", "markdown"])
+    def test_runtime_pattern_uses_shared_text_artifact_extensions(self, extension):
+        from gateway.run import _TOOL_MEDIA_RE as runtime_pattern
+
+        path = f"/opt/data/hermes-artifacts/task/example.{extension}"
+        match = runtime_pattern.search(f"MEDIA:{path}")
+
+        assert match is not None
+        assert match.group(1) == path
+
     # ── Negative: invalid paths don't match ────────────────────────
 
     @pytest.mark.parametrize("text", [

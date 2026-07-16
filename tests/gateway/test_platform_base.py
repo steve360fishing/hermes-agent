@@ -613,7 +613,7 @@ class TestMediaExtensionAllowlistParity:
     MEDIA_DELIVERY_EXTS source of truth, and the strip is anchored to that set.
     """
 
-    DROPPED_BEFORE = ["md", "json", "yaml", "yml", "xml", "html", "htm",
+    DROPPED_BEFORE = ["md", "markdown", "json", "yaml", "yml", "xml", "html", "htm",
                       "tsv", "svg"]
 
     def test_previously_dropped_extensions_now_extract(self):
@@ -736,6 +736,19 @@ class TestMediaDeliveryPathValidation:
         self._patch_roots(monkeypatch, root)
 
         assert BasePlatformAdapter.validate_media_delivery_path(str(media_file)) == str(media_file.resolve())
+
+    def test_strict_mode_allows_nested_persistent_artifact_root(
+        self, tmp_path, monkeypatch
+    ):
+        root = tmp_path / "hermes-artifacts"
+        artifact = root / "correlation-id" / "example.txt"
+        artifact.parent.mkdir(parents=True)
+        artifact.write_bytes(b"exact text\n")
+        self._patch_roots(monkeypatch, root)
+
+        assert BasePlatformAdapter.validate_media_delivery_path(
+            str(artifact)
+        ) == str(artifact.resolve())
 
     def test_rejects_existing_file_outside_safe_root(self, tmp_path, monkeypatch):
         root = tmp_path / "media-cache"
