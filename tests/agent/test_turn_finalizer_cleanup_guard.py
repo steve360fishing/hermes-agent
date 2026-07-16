@@ -44,6 +44,16 @@ class _StubAgent:
         self._interrupt_message = None
         self._tool_guardrail_halt_decision = None
         self._task_execution_contract = None
+        self._tool_guardrails = type(
+            "Guardrails",
+            (),
+            {
+                "contract": None,
+                "set_execution_contract": lambda guard, value: setattr(
+                    guard, "contract", value
+                ),
+            },
+        )()
         self.sync_calls = 0
         self._response_was_previewed = False
         self._skill_nudge_interval = 0
@@ -215,7 +225,71 @@ def test_artifact_contract_telemetry_is_returned_without_prompt_content():
     assert "PRIVATE-SPONSOR-FACT" not in serialized
     assert "private-task-id" not in serialized
     assert agent.sync_calls == 0
+    assert agent._task_execution_contract is None
+    assert agent._tool_guardrails.contract is None
     invoke_hook.assert_not_called()
+
+
+def test_artifact_contract_is_cleared_when_finalizer_cleanup_reports_failures():
+    agent = _StubAgent(raise_in=("persist_session",))
+    contract = build_task_execution_contract(
+        "Return only a paste-ready prompt.", task_id="artifact-failure"
+    )
+    agent._task_execution_contract = contract
+    agent._tool_guardrails.set_execution_contract(contract)
+
+    result = _run(agent, final_response="partial prompt", api_call_count=1)
+
+    assert result["cleanup_errors"]
+    assert agent._task_execution_contract is None
+    assert agent._tool_guardrails.contract is None
+    assert contract.active is False
+
+
+def test_contract_is_cleared_even_if_finalizer_itself_raises():
+    agent = _StubAgent(raise_in=())
+    contract = build_task_execution_contract(
+        "Return only a paste-ready prompt.", task_id="artifact-finalizer-exception"
+    )
+    agent._task_execution_contract = contract
+    agent._tool_guardrails.set_execution_contract(contract)
+    agent._drain_pending_steer = lambda: (_ for _ in ()).throw(
+        RuntimeError("finalizer failure")
+    )
+
+    with pytest.raises(RuntimeError, match="finalizer failure"):
+        _run(agent, final_response="prompt", api_call_count=1)
+
+    assert contract.active is False
+    assert agent._task_execution_contract is None
+    assert agent._tool_guardrails.contract is None
+
+
+def test_successful_artifact_write_forces_exact_media_delivery_response(
+    monkeypatch, tmp_path
+):
+    agent = _StubAgent(raise_in=())
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = build_task_execution_contract(
+        "Create and deliver example.txt containing the supplied copy.",
+        task_id="artifact-delivery",
+    )
+    with open(contract.artifact_output_path, "wb") as artifact:
+        artifact.write(b"exact bytes\n")
+    agent._task_execution_contract = contract
+    agent._tool_guardrails.set_execution_contract(contract)
+    agent._turn_file_mutation_paths = {contract.artifact_output_path}
+
+    result = _run(
+        agent,
+        final_response="I wrote the file but forgot the attachment tag.",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["final_response"] == f"MEDIA:{contract.artifact_output_path}"
+    assert agent._task_execution_contract is None
 
 
 def test_artifact_contract_suppresses_background_skill_review():

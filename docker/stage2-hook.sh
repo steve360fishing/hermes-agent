@@ -371,6 +371,19 @@ as_hermes mkdir -p \
     "$HERMES_HOME/platforms/pairing" \
     "$HERMES_HOME/lazy-packages"
 
+# Text artifacts may contain private working copy. Keep the dedicated delivery
+# root owner-only while allowing the unprivileged gateway to write into it.
+# Refuse every symlink component before root-context mkdir/chown/chmod, and
+# repair ownership unconditionally so warm restarts self-heal root-owned files.
+ARTIFACT_ROOT="$HERMES_HOME/hermes-artifacts"
+if refuse_symlinked_path "artifact root setup" "$ARTIFACT_ROOT"; then
+    echo "[stage2] Warning: artifact delivery root is symlinked; artifact writes will fail closed"
+else
+    mkdir -p "$ARTIFACT_ROOT"
+    chown_hermes_tree "$ARTIFACT_ROOT"
+    chmod 700 "$ARTIFACT_ROOT" 2>/dev/null || true
+fi
+
 # --- Install-method stamp ---
 # The 'docker' stamp is baked into the immutable install tree at
 # /opt/hermes/.install_method (see Dockerfile), NOT written here into

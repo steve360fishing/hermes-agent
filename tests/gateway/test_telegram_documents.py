@@ -711,6 +711,34 @@ class TestSendDocument:
         assert call_kwargs["filename"] == "clean_data.csv"
 
     @pytest.mark.asyncio
+    async def test_send_txt_document_preserves_bytes_filename_and_mime_contract(
+        self, connected_adapter, tmp_path
+    ):
+        from gateway.platforms.base import SUPPORTED_DOCUMENT_TYPES
+
+        payload = b"Hermes TXT artifact canary\r\nbyte-for-byte\n"
+        test_file = tmp_path / "example.txt"
+        test_file.write_bytes(payload)
+        mock_msg = MagicMock(message_id=101)
+        captured = {}
+
+        async def _send_document(**kwargs):
+            captured.update(kwargs)
+            assert kwargs["document"].read() == payload
+            return mock_msg
+
+        connected_adapter._bot.send_document = AsyncMock(side_effect=_send_document)
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(test_file)
+        )
+
+        assert result.success is True
+        assert result.message_id == "101"
+        assert captured["filename"] == "example.txt"
+        assert SUPPORTED_DOCUMENT_TYPES[".txt"] == "text/plain"
+
+    @pytest.mark.asyncio
     async def test_send_document_file_not_found(self, connected_adapter):
         """Missing file returns error without calling Telegram API."""
         result = await connected_adapter.send_document(

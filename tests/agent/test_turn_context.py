@@ -15,6 +15,7 @@ import pytest
 
 from agent.context_compressor import ContextCompressor
 from agent.turn_context import TurnContext, build_turn_context
+from agent.task_execution_contract import build_task_execution_contract
 from hermes_state import SessionDB
 
 
@@ -177,6 +178,24 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+def test_subsequent_normal_turn_expires_stale_artifact_contract():
+    agent = _FakeAgent()
+    stale = build_task_execution_contract(
+        "Return only a paste-ready prompt.", task_id="stale-artifact-turn"
+    )
+    agent._task_execution_contract = stale
+    agent._tool_guardrails.set_execution_contract(stale)
+
+    _build(agent, user_message="Check the current runtime status.")
+
+    assert stale.active is False
+    assert agent._task_execution_contract.lane == "normal"
+    assert agent._tool_guardrails.execution_contract.lane == "normal"
+    assert agent._tool_guardrails.execution_contract.before_tool(
+        "terminal", {"command": "true"}
+    ).allowed is True
 
 
 def test_applies_agent_side_effects():

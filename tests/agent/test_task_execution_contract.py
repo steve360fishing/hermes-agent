@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
@@ -8,6 +11,7 @@ from agent.task_execution_contract import (
     ARTIFACT_ONLY,
     NORMAL,
     build_task_execution_contract,
+    validate_artifact_output_path,
 )
 from agent.conversation_loop import _effective_request_system_prompt
 from agent.tool_guardrails import ToolCallGuardrailController
@@ -29,7 +33,7 @@ def test_classifier_selects_artifact_only_for_explicit_text_artifacts(message):
     contract = _contract(message)
 
     assert contract.lane == ARTIFACT_ONLY
-    assert contract.policy_version == "artifact-only-v1"
+    assert contract.policy_version == "artifact-only-v2"
 
 
 @pytest.mark.parametrize(
@@ -60,6 +64,38 @@ def test_classifier_keeps_explicit_negative_constraints_in_artifact_lane(message
 )
 def test_classifier_fails_to_normal_for_ambiguous_or_operational_requests(message):
     assert _contract(message).lane == NORMAL
+
+
+def test_external_file_delivery_request_stays_in_normal_lane():
+    assert _contract("Send example.txt to the client by email.").lane == NORMAL
+    assert _contract("Draft an email explaining notes.md.").lane == NORMAL
+
+
+def test_negated_attachment_keeps_caption_in_chat_without_file_path():
+    contract = _contract("Do not attach report.txt; write the caption in chat.")
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.artifact_file_requested is False
+    assert contract.artifact_output_path == ""
+
+
+def test_research_plus_file_send_stays_in_normal_lane():
+    assert _contract("Send report.txt after research.").lane == NORMAL
+
+
+def test_same_requested_filename_gets_isolated_task_directories(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    first = _contract("Give me report.txt as a file.", task_id="session-a")
+    second = _contract("Give me report.txt as a file.", task_id="session-b")
+
+    assert Path(first.artifact_output_path).name == "report.txt"
+    assert Path(second.artifact_output_path).name == "report.txt"
+    assert first.artifact_output_path != second.artifact_output_path
+    assert first.artifact_root != second.artifact_root
 
 
 def test_classifier_is_deterministic_without_retaining_prompt_text():
@@ -112,7 +148,7 @@ def test_artifact_only_contract_rejects_multi_url_lookup_batches():
 
 
 def test_artifact_write_is_restricted_to_exact_generated_path_and_one_call():
-    contract = _contract("Return only a paste-ready image prompt.")
+    contract = _contract("Create and deliver example.txt containing safe text.")
 
     allowed = contract.before_tool(
         "write_file", {"path": contract.artifact_output_path, "content": "safe"}
@@ -120,13 +156,164 @@ def test_artifact_write_is_restricted_to_exact_generated_path_and_one_call():
     duplicate = contract.before_tool(
         "write_file", {"path": contract.artifact_output_path, "content": "safe"}
     )
-    arbitrary = _contract("Return only a paste-ready image prompt.").before_tool(
+    arbitrary = _contract("Create and deliver example.txt containing safe text.").before_tool(
         "write_file", {"path": "/opt/data/private.md", "content": "unsafe"}
     )
 
     assert allowed.allowed is True
     assert duplicate.code == "artifact_write_limit"
     assert arbitrary.code == "artifact_write_path_denied"
+
+
+def test_txt_request_preserves_safe_filename_extension_and_mime(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = _contract("Give me the copy as example.txt and deliver it as a file.")
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert Path(contract.artifact_output_path).name == "example.txt"
+    assert contract.artifact_extension == ".txt"
+    assert contract.artifact_mime_type == "text/plain"
+    assert contract.preflight_error == ""
+    assert f"MEDIA:{contract.artifact_output_path}" in contract.system_guidance
+
+
+def test_txt_bytes_round_trip_through_real_writer_stack(monkeypatch, tmp_path):
+    from tools.file_tools import write_file_tool
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Create and deliver example.txt containing the supplied copy.")
+    content = "line one\r\nline two\n"
+
+    authorization = contract.before_tool(
+        "write_file", {"path": contract.artifact_output_path, "content": content}
+    )
+    result = json.loads(
+        write_file_tool(
+            contract.artifact_output_path,
+            content,
+            task_id="artifact-writer-integration",
+        )
+    )
+
+    assert authorization.allowed is True
+    assert not result.get("error")
+    assert Path(contract.artifact_output_path).read_bytes() == content.encode("utf-8")
+
+
+def test_txt_request_without_filename_gets_stable_txt_name(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = _contract("Create and deliver a plain TXT file with this copy.")
+
+    assert Path(contract.artifact_output_path).name == f"artifact-{contract.correlation_id}.txt"
+    assert contract.artifact_mime_type == "text/plain"
+
+
+def test_markdown_request_still_uses_markdown_extension(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = _contract("Create release-notes.md as a Markdown file.")
+
+    assert Path(contract.artifact_output_path).name == "release-notes.md"
+    assert contract.artifact_mime_type == "text/markdown"
+
+
+def test_primary_root_rejected_by_writer_policy_selects_safe_fallback(
+    monkeypatch, tmp_path
+):
+    safe_root = tmp_path / "safe"
+    safe_root.mkdir()
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "outside"))
+    monkeypatch.setenv(
+        "HERMES_ARTIFACT_FALLBACK_ROOT", str(safe_root / "hermes-artifacts")
+    )
+
+    contract = _contract("Give me example.txt as a file.")
+
+    assert contract.preflight_error == ""
+    assert contract.artifact_route == "configured_fallback"
+    assert Path(contract.artifact_output_path).parent == (
+        safe_root / "hermes-artifacts" / contract.correlation_id
+    ).resolve()
+    assert validate_artifact_output_path(
+        contract.artifact_output_path, contract.artifact_root
+    ) is None
+
+
+def test_no_writable_safe_root_fails_preflight_without_contract_path(
+    monkeypatch, tmp_path
+):
+    safe_root_file = tmp_path / "not-a-directory"
+    safe_root_file.write_text("occupied", encoding="utf-8")
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root_file))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "outside"))
+    monkeypatch.setenv("HERMES_ARTIFACT_FALLBACK_ROOT", str(safe_root_file))
+
+    contract = _contract("Give me example.txt as a file.")
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.artifact_output_path == ""
+    assert contract.preflight_error == "artifact_output_unavailable"
+    assert "only permitted destination" not in contract.system_guidance
+
+
+def test_protected_or_symlink_escape_path_is_rejected_before_write(
+    monkeypatch, tmp_path
+):
+    safe_root = tmp_path / "safe"
+    outside = tmp_path / "outside"
+    safe_root.mkdir()
+    outside.mkdir()
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+
+    assert validate_artifact_output_path(str(outside / "secret.txt"), str(safe_root))
+
+    link = safe_root / "escape"
+    try:
+        link.symlink_to(outside, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable in this test environment")
+    assert validate_artifact_output_path(str(link / "secret.txt"), str(safe_root))
+
+
+def test_allocator_rejects_symlinked_artifact_root_even_inside_safe_root(
+    monkeypatch, tmp_path
+):
+    safe_root = tmp_path / "safe"
+    redirected = safe_root / "redirected"
+    safe_root.mkdir()
+    redirected.mkdir()
+    link = safe_root / "hermes-artifacts"
+    try:
+        link.symlink_to(redirected, target_is_directory=True)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable in this test environment")
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(safe_root))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "outside"))
+    monkeypatch.delenv("HERMES_ARTIFACT_FALLBACK_ROOT", raising=False)
+
+    contract = _contract("Give me example.txt as a file.")
+
+    assert contract.preflight_error == "artifact_output_unavailable"
+    assert contract.artifact_output_path == ""
+
+
+def test_requested_filename_is_safely_normalized_to_a_basename(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = _contract('Create "../../client notes.txt" as a TXT file.')
+
+    assert Path(contract.artifact_output_path).name == "client-notes.txt"
+    assert os.path.commonpath(
+        [contract.artifact_root, contract.artifact_output_path]
+    ) == contract.artifact_root
 
 
 def test_tool_output_is_bounded_across_the_request():

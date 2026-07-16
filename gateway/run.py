@@ -1075,17 +1075,9 @@ def _strip_auto_continue_noise(content: Any) -> Any:
 _JSON_MEDIA_TOOL_PATH_FIELDS = ("host_image", "image", "agent_visible_image")
 
 
-# Extension-anchored MEDIA: matcher for tool results. Mirrors the dispatch-site
-# pattern so a bare ``MEDIA:`` token in prose (no deliverable extension) is never
-# auto-appended. Kept local to the auto-append path; the producer-tool allowlist
-# below is the primary guard, this is the secondary precision guard.
-_TOOL_MEDIA_RE = re.compile(
-    r'MEDIA:((?:[A-Za-z]:[/\\]|/|~\/)\S+\.(?:png|jpe?g|gif|webp|'
-    r'mp4|mov|avi|mkv|webm|ogg|opus|mp3|wav|m4a|'
-    r'flac|epub|pdf|zip|rar|7z|docx?|xlsx?|pptx?|'
-    r'txt|csv|apk|ipa))',
-    re.IGNORECASE,
-)
+# Initialized after importing the platform base's single media extension
+# registry below. Functions defined here resolve the global only when called.
+_TOOL_MEDIA_RE: re.Pattern[str]
 
 
 def _collect_auto_append_media_tags(
@@ -1780,12 +1772,22 @@ from gateway.slash_commands import GatewaySlashCommandsMixin
 from gateway.platforms.base import (
     BasePlatformAdapter,
     EphemeralReply,
+    MEDIA_DELIVERY_EXTS,
     MessageEvent,
     MessageType,
     _prefix_within_utf16_limit,
     _reply_anchor_for_event,
     merge_pending_message_event,
     utf16_len,
+)
+
+_TOOL_MEDIA_EXT_ALTERNATION = "|".join(
+    re.escape(extension.lstrip("."))
+    for extension in sorted(MEDIA_DELIVERY_EXTS, key=len, reverse=True)
+)
+_TOOL_MEDIA_RE = re.compile(
+    rf"MEDIA:((?:[A-Za-z]:[/\\]|/|~/)\S+\.(?:{_TOOL_MEDIA_EXT_ALTERNATION}))",
+    re.IGNORECASE,
 )
 from gateway.restart import (
     DEFAULT_GATEWAY_RESTART_DRAIN_TIMEOUT,

@@ -990,6 +990,8 @@ MEDIA_DELIVERY_SAFE_ROOTS = (
     _HERMES_HOME / "cache" / "videos",
     _HERMES_HOME / "cache" / "documents",
     _HERMES_HOME / "cache" / "screenshots",
+    _HERMES_HOME / "hermes-artifacts",
+    _HERMES_ROOT / "hermes-artifacts",
 )
 
 # Default recency window for trusting freshly-produced files (seconds).
@@ -1333,6 +1335,7 @@ def _log_safe_path(path: str) -> str:
 SUPPORTED_DOCUMENT_TYPES = {
     ".pdf": "application/pdf",
     ".md": "text/markdown",
+    ".markdown": "text/markdown",
     ".txt": "text/plain",
     ".csv": "text/csv",
     ".log": "text/plain",
@@ -1437,7 +1440,7 @@ MEDIA_DELIVERY_EXTS: Tuple[str, ...] = (
     # Audio (delivered as voice/audio where supported)
     ".mp3", ".wav", ".ogg", ".opus", ".m4a", ".flac",
     # Documents (uploaded as file attachments)
-    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".epub",
+    ".pdf", ".docx", ".doc", ".odt", ".rtf", ".txt", ".md", ".markdown", ".epub",
     # Spreadsheets / data
     ".xlsx", ".xls", ".ods", ".csv", ".tsv", ".json", ".xml", ".yaml", ".yml",
     # Presentations

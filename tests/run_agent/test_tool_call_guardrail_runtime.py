@@ -330,7 +330,7 @@ def test_artifact_write_quota_blocks_before_middleware_in_both_paths():
     for concurrent in (False, True):
         agent = _make_agent("write_file")
         contract = build_task_execution_contract(
-            "Return only a paste-ready prompt.",
+            "Create and deliver example.txt containing the supplied copy.",
             task_id=f"artifact-write-quota-{concurrent}",
         )
         agent._tool_guardrails.set_execution_contract(contract)

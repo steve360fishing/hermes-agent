@@ -10,6 +10,7 @@ import inspect
 import io
 import json
 import logging
+import os
 import re
 import uuid
 from logging.handlers import RotatingFileHandler
@@ -3984,6 +3985,65 @@ class TestRunConversation:
         assert not agent.client.chat.completions.create.called
         assert "Ollama runtime context too small for Hermes tool use" in caplog.text
         assert "runtime_context=4096" in caplog.text
+
+    def test_artifact_preflight_failure_skips_model_and_clears_contract(
+        self, agent, tmp_path
+    ):
+        self._setup_agent(agent)
+        agent.compression_enabled = True
+        agent._compress_context = MagicMock()
+        blocked_root = tmp_path / "blocked-root"
+        blocked_root.write_text("not a directory", encoding="utf-8")
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_WRITE_SAFE_ROOT": str(blocked_root),
+                    "HERMES_ARTIFACT_ROOT": str(tmp_path / "outside"),
+                    "HERMES_ARTIFACT_FALLBACK_ROOT": str(blocked_root),
+                },
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Give me example.txt as a file.")
+
+        assert result["failed"] is True
+        assert result["completed"] is False
+        assert result["api_calls"] == 0
+        assert result["turn_exit_reason"] == "artifact_output_preflight_failed"
+        assert "safe artifact destination" in result["final_response"]
+        assert not agent.client.chat.completions.create.called
+        agent._compress_context.assert_not_called()
+        assert agent._task_execution_contract is None
+        assert agent._tool_guardrails._execution_contract is None
+
+    def test_turn_setup_exception_clears_request_local_contract(self, agent):
+        from agent.task_execution_contract import build_task_execution_contract
+
+        self._setup_agent(agent)
+
+        def _fail_after_contract_binding(*args, **kwargs):
+            contract = build_task_execution_contract(
+                "Return only a paste-ready prompt.", task_id="setup-exception"
+            )
+            agent._task_execution_contract = contract
+            agent._tool_guardrails.set_execution_contract(contract)
+            raise RuntimeError("setup failed")
+
+        with (
+            patch(
+                "agent.conversation_loop.build_turn_context",
+                side_effect=_fail_after_contract_binding,
+            ),
+            pytest.raises(RuntimeError, match="setup failed"),
+        ):
+            agent.run_conversation("Return only a paste-ready prompt.")
+
+        assert agent._task_execution_contract is None
+        assert agent._tool_guardrails._execution_contract is None
 
     def test_tool_calls_then_stop(self, agent):
         self._setup_agent(agent)

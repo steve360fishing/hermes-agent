@@ -27,7 +27,7 @@ import os
 from agent.codex_responses_adapter import _summarize_user_message_for_log
 
 
-def finalize_turn(
+def _finalize_turn_impl(
     agent,
     *,
     final_response,
@@ -52,6 +52,35 @@ def finalize_turn(
 
     task_contract = getattr(agent, "_task_execution_contract", None)
     artifact_only = getattr(task_contract, "lane", None) == "artifact_only"
+
+    # A successful artifact write must deterministically produce the gateway
+    # attachment directive; do not depend on the model remembering to echo it.
+    if artifact_only and getattr(task_contract, "artifact_file_requested", False):
+        artifact_path = getattr(task_contract, "artifact_output_path", "")
+        landed_paths = getattr(agent, "_turn_file_mutation_paths", None) or set()
+        try:
+            artifact_real = os.path.realpath(artifact_path)
+            landed_reals = {os.path.realpath(str(path)) for path in landed_paths}
+            from agent.task_execution_contract import validate_artifact_output_path
+
+            artifact_ready = (
+                artifact_real in landed_reals
+                and os.path.isfile(artifact_real)
+                and validate_artifact_output_path(
+                    artifact_real, getattr(task_contract, "artifact_root", "")
+                )
+                is None
+            )
+        except (OSError, ValueError):
+            artifact_ready = False
+        if artifact_ready:
+            final_response = f"MEDIA:{artifact_real}"
+            for message in reversed(messages):
+                if message.get("role") == "user":
+                    break
+                if message.get("role") == "assistant" and not message.get("tool_calls"):
+                    message["content"] = final_response
+                    break
 
     if final_response is None and (
         api_call_count >= agent.max_iterations
@@ -535,3 +564,42 @@ def finalize_turn(
             logger.warning("on_session_end hook failed: %s", exc)
 
     return result
+
+
+def finalize_turn(
+    agent,
+    *,
+    final_response,
+    api_call_count,
+    interrupted,
+    failed,
+    messages,
+    conversation_history,
+    effective_task_id,
+    turn_id,
+    user_message,
+    original_user_message,
+    _should_review_memory,
+    _turn_exit_reason,
+):
+    """Finalize a turn and always expire its request-local execution policy."""
+    try:
+        return _finalize_turn_impl(
+            agent,
+            final_response=final_response,
+            api_call_count=api_call_count,
+            interrupted=interrupted,
+            failed=failed,
+            messages=messages,
+            conversation_history=conversation_history,
+            effective_task_id=effective_task_id,
+            turn_id=turn_id,
+            user_message=user_message,
+            original_user_message=original_user_message,
+            _should_review_memory=_should_review_memory,
+            _turn_exit_reason=_turn_exit_reason,
+        )
+    finally:
+        from agent.task_execution_contract import clear_task_execution_contract
+
+        clear_task_execution_contract(agent)
