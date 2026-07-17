@@ -151,6 +151,68 @@ async def test_failed_provider_probe_does_not_write_false_heartbeat(monkeypatch)
 
 
 @pytest.mark.asyncio
+async def test_initial_start_polling_does_not_write_false_green():
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._app = MagicMock()
+    adapter._app.updater.start_polling = AsyncMock(return_value=None)
+    adapter._record_polling_liveness = MagicMock()
+
+    assert await adapter._start_polling_resilient(
+        drop_pending_updates=False, error_callback=None
+    )
+
+    adapter._record_polling_liveness.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_completed_empty_polling_receive_refreshes_marker(monkeypatch):
+    class FakeGetUpdatesRequest:
+        def __init__(self, **kwargs):
+            self.kwargs = kwargs
+
+        async def post(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", FakeGetUpdatesRequest)
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._webhook_mode = False
+    adapter._app = MagicMock()
+    adapter._app.updater.running = True
+    adapter._polling_error_task = None
+    adapter._record_polling_liveness = MagicMock()
+
+    request = tg_adapter._new_polling_liveness_request(
+        on_completed_receive=adapter._record_completed_polling_receive
+    )
+    assert await request.post("https://api.telegram.org/bot/token/getUpdates") == []
+
+    adapter._record_polling_liveness.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_wedged_receive_does_not_refresh_marker(monkeypatch):
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._fatal_error_code = None
+    adapter._app = MagicMock()
+    adapter._app.updater.running = True
+    adapter._app.bot.get_me = AsyncMock(return_value=MagicMock())
+    adapter._polling_error_task = None
+    adapter._polling_pending_stuck_count = 0
+    adapter._polling_not_running_count = 0
+    adapter._record_polling_liveness = MagicMock()
+    adapter._handle_polling_network_error = AsyncMock()
+    adapter.platform = tg_adapter.Platform.TELEGRAM
+
+    async def sleep_once(_seconds):
+        raise asyncio.CancelledError()
+
+    monkeypatch.setattr(tg_adapter.asyncio, "sleep", sleep_once)
+    await adapter._polling_heartbeat_loop()
+
+    adapter._record_polling_liveness.assert_not_called()
+
+
+@pytest.mark.asyncio
 async def test_pending_consumer_health_probe_cannot_refresh_marker():
     adapter = TelegramAdapter.__new__(TelegramAdapter)
     adapter._webhook_mode = False

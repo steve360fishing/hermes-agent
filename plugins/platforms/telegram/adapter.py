@@ -19,7 +19,7 @@ import stat
 import threading
 import warnings
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -367,6 +367,25 @@ def check_telegram_requirements() -> bool:
     HTTPXRequest = _HR
     TELEGRAM_AVAILABLE = True
     return True
+
+
+def _new_polling_liveness_request(
+    *, on_completed_receive: Callable[[], None], **kwargs: Any
+) -> Any:
+    """Build the dedicated getUpdates request with a completed-receive hook."""
+
+    class _PollingLivenessHTTPXRequest(HTTPXRequest):
+        async def post(self, *args: Any, **post_kwargs: Any) -> Any:
+            result = await super().post(*args, **post_kwargs)
+            try:
+                on_completed_receive()
+            except Exception:
+                # Marker recording is best-effort and must never disrupt PTB's
+                # receive loop after a valid Bot API response.
+                logger.debug("Telegram liveness receive hook failed", exc_info=True)
+            return result
+
+    return _PollingLivenessHTTPXRequest(**kwargs)
 
 
 # Matches every character that MarkdownV2 requires to be backslash-escaped
@@ -2329,8 +2348,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # probes see a non-zero queue while we believe we're polling, so
                 # a single in-flight update (consumed before the next probe)
                 # never trips recovery.
-                if await self._probe_pending_updates(bot, PROBE_TIMEOUT):
-                    self._record_polling_liveness()
+                await self._probe_pending_updates(bot, PROBE_TIMEOUT)
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
@@ -2521,6 +2539,11 @@ class TelegramAdapter(BasePlatformAdapter):
 
     def _record_inbound_polling_liveness(self) -> None:
         """Record an update PTB delivered through the active polling path."""
+        if self._can_refresh_polling_liveness():
+            self._record_polling_liveness()
+
+    def _record_completed_polling_receive(self) -> None:
+        """Record a completed successful getUpdates long-poll receive cycle."""
         if self._can_refresh_polling_liveness():
             self._record_polling_liveness()
 
@@ -3299,7 +3322,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     },
                 )
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _new_polling_liveness_request(
+                    on_completed_receive=self._record_completed_polling_receive,
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
@@ -3312,14 +3336,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 request = HTTPXRequest(
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _new_polling_liveness_request(
+                    on_completed_receive=self._record_completed_polling_receive,
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _new_polling_liveness_request(
+                    on_completed_receive=self._record_completed_polling_receive,
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 
@@ -3501,9 +3527,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
-                else:
-                    self._record_polling_liveness()
-            
+
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
