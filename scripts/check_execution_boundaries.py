@@ -59,9 +59,44 @@ REQUIRED_ARTIFACT_LIFECYCLE_EDGES = {
     ("finalizer", "stream_gateway_dispatch"),
     ("gateway_dispatch", "telegram_descriptor"),
     ("stream_gateway_dispatch", "telegram_descriptor"),
-    ("gateway_dispatch", "receipt_transition"),
-    ("stream_gateway_dispatch", "receipt_transition"),
     ("telegram_descriptor", "receipt_transition"),
+}
+REQUIRED_ARTIFACT_LIFECYCLE_TRANSITIONS = {
+    "artifact-delivery-writer-verifier": (
+        "writer_to_verifier",
+        "tools/file_tools.py:write_file_tool",
+        "agent/task_execution_contract.py:record_artifact_written",
+    ),
+    "artifact-delivery-verifier-finalizer": (
+        "verifier_to_finalizer",
+        "agent/task_execution_contract.py:record_artifact_written",
+        "agent/turn_finalizer.py:_finalize_turn_impl",
+    ),
+    "artifact-delivery-finalizer-gateway": (
+        "finalizer_to_gateway_dispatch",
+        "agent/turn_finalizer.py:_finalize_turn_impl",
+        "gateway/platforms/base.py:BasePlatformAdapter._process_message_background",
+    ),
+    "artifact-delivery-finalizer-stream-gateway": (
+        "finalizer_to_stream_gateway_dispatch",
+        "agent/turn_finalizer.py:_finalize_turn_impl",
+        "gateway/run.py:GatewayRunner._deliver_media_from_response",
+    ),
+    "artifact-delivery-gateway-telegram-descriptor": (
+        "gateway_dispatch_to_telegram_descriptor",
+        "gateway/platforms/base.py:BasePlatformAdapter._process_message_background",
+        "plugins/platforms/telegram/adapter.py:_open_verified_document_descriptor",
+    ),
+    "artifact-delivery-stream-gateway-telegram-descriptor": (
+        "stream_gateway_dispatch_to_telegram_descriptor",
+        "gateway/run.py:GatewayRunner._deliver_media_from_response",
+        "plugins/platforms/telegram/adapter.py:_open_verified_document_descriptor",
+    ),
+    "artifact-delivery-telegram-descriptor-receipt": (
+        "telegram_descriptor_to_receipt_transition",
+        "plugins/platforms/telegram/adapter.py:_open_verified_document_descriptor",
+        "agent/task_execution_contract.py:record_artifact_dispatch",
+    ),
 }
 
 LIFECYCLE_ROLE_TRANSITIONS: dict[str, set[tuple[str, str]]] = {
@@ -344,9 +379,11 @@ def validate_registry(
         if isinstance(edge, dict)
     }
     missing_edges = REQUIRED_ARTIFACT_LIFECYCLE_EDGES - lifecycle_edges
-    if missing_edges:
+    extra_edges = lifecycle_edges - REQUIRED_ARTIFACT_LIFECYCLE_EDGES
+    if missing_edges or extra_edges:
         errors.append(
-            f"artifact lifecycle missing edges {sorted(missing_edges)!r}"
+            "artifact lifecycle edges must equal the required graph "
+            f"(missing={sorted(missing_edges)!r}, extra={sorted(extra_edges)!r})"
         )
     entrypoints = registry.get("entrypoints", [])
     runtime_roots = registry.get("runtime_roots", [])
@@ -441,9 +478,12 @@ def validate_registry(
             continue
         role_transition = (str(source.get("role")), str(target.get("role")))
         expected_type = f"{role_transition[0]}_to_{role_transition[1]}"
-        if edge_type != expected_type:
+        if contract != "artifact_delivery" and edge_type != expected_type:
             errors.append(f"{prefix}: type must equal {expected_type!r}")
-        if role_transition not in LIFECYCLE_ROLE_TRANSITIONS[contract]:
+        if (
+            contract != "artifact_delivery"
+            and role_transition not in LIFECYCLE_ROLE_TRANSITIONS[contract]
+        ):
             errors.append(
                 f"{prefix}: invalid lifecycle role transition {role_transition[0]} -> {role_transition[1]} for {contract}"
             )
@@ -454,6 +494,14 @@ def validate_registry(
         if (edge[1], edge[0]) in contract_edges:
             errors.append(f"{prefix}: reverse transition endpoints {edge[0]} -> {edge[1]}")
         contract_edges.add(edge)
+
+    artifact_transitions = {
+        edge_id: (str(item.get("type")), str(item.get("from")), str(item.get("to")))
+        for edge_id, item in graph_by_id.items()
+        if item.get("contract") == "artifact_delivery"
+    }
+    if artifact_transitions != REQUIRED_ARTIFACT_LIFECYCLE_TRANSITIONS:
+        errors.append("artifact lifecycle transitions must equal the required semantic graph")
 
     relationship_roles: dict[str, set[str]] = {}
     lifecycle_edges: dict[str, set[tuple[str, str]]] = {}
@@ -510,14 +558,20 @@ def validate_registry(
             errors.append(f"{prefix}: reverse lifecycle edge {source_id} -> {target_id}")
         contract_edges.add(edge)
         role_transition = (str(source.get("role")), str(target.get("role")))
-        if role_transition not in LIFECYCLE_ROLE_TRANSITIONS[contract]:
+        if (
+            contract != "artifact_delivery"
+            and role_transition not in LIFECYCLE_ROLE_TRANSITIONS[contract]
+        ):
             errors.append(
                 f"{prefix}: invalid lifecycle role transition {role_transition[0]} -> {role_transition[1]} for {contract}"
             )
-        relationship_roles.setdefault(contract, set()).update(
-            {str(source.get("role")), str(target.get("role"))}
-        )
+        if contract != "artifact_delivery":
+            relationship_roles.setdefault(contract, set()).update(
+                {str(source.get("role")), str(target.get("role"))}
+            )
     for contract, required_roles in REQUIRED_CONTRACTS.items():
+        if contract == "artifact_delivery":
+            continue
         missing = set(required_roles) - relationship_roles.get(contract, set())
         if missing:
             errors.append(f"{contract}: lifecycle relationships missing roles {sorted(missing)}")

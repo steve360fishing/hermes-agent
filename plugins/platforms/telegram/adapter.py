@@ -6294,6 +6294,7 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
         if not self._bot:
+            _record_document_preflight_failure(file_path, "telegram_not_connected")
             return SendResult(success=False, error="Not connected")
 
         try:

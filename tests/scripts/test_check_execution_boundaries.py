@@ -130,6 +130,25 @@ def test_registry_requires_real_artifact_lifecycle_graph():
     assert any("artifact lifecycle" in error for error in errors)
 
 
+def test_registry_rejects_role_valid_but_semantically_wrong_artifact_endpoint_pair():
+    checker = _load_checker()
+    data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    broken = deepcopy(data)
+    for key in ("lifecycle_transition_graph", "lifecycle_relationships"):
+        relationship = next(
+            item
+            for item in broken[key]
+            if item["edge_id"] == "artifact-delivery-writer-verifier"
+        )
+        relationship["from"] = "agent/task_execution_contract.py:build_task_execution_contract"
+        relationship["to"] = "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool"
+        relationship["type"] = "allocation_to_validation"
+
+    errors = checker.validate_registry(REPO_ROOT, broken)
+
+    assert "artifact lifecycle transitions must equal the required semantic graph" in errors
+
+
 def test_registry_rejects_duplicate_reverse_and_invalid_lifecycle_edges():
     checker = _load_checker()
     data = json.loads(REGISTRY.read_text(encoding="utf-8"))

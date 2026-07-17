@@ -918,6 +918,45 @@ class TestSendDocument:
         assert "Not connected" in result.error
 
     @pytest.mark.asyncio
+    async def test_registered_document_not_connected_terminalizes_before_dispatch(
+        self, adapter, tmp_path, monkeypatch
+    ):
+        """No Telegram bot is a preflight failure, never an ambiguous attempt."""
+        from agent.task_execution_contract import (
+            build_task_execution_contract,
+            record_artifact_dispatch,
+            record_artifact_written,
+        )
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="telegram-not-connected",
+            platform="telegram",
+        )
+        artifact = Path(contract.artifact_output_path)
+        artifact.write_bytes(b"trusted")
+        assert record_artifact_written(contract) is True
+
+        result = await adapter.send_document(chat_id="12345", file_path=str(artifact))
+
+        assert result.success is False
+        assert result.error == "Not connected"
+        receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+        assert receipt["state"] == "failed_preflight"
+        assert receipt["error_code"] == "telegram_not_connected"
+        assert receipt["attempt_count"] == 0
+        # Both gateway dispatchers may record ambiguity after a failed result;
+        # a terminal preflight receipt must remain untouched and retry-free.
+        assert record_artifact_dispatch(
+            str(artifact), state="ambiguous", error_code="document_dispatch_failed"
+        ) is None
+        receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+        assert receipt["state"] == "failed_preflight"
+        assert receipt["attempt_count"] == 0
+
+    @pytest.mark.asyncio
     async def test_send_document_caption_truncated(self, connected_adapter, tmp_path):
         """Captions longer than 1024 chars are truncated."""
         test_file = tmp_path / "data.json"
