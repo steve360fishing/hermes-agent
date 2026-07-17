@@ -63,7 +63,7 @@ docker --version && docker compose version
 | 查看日志（跟踪） | `docker logs --tail 50 -f NAME` |
 | 进入容器 Shell | `docker exec -it NAME /bin/sh` |
 | 列出所有容器 | `docker ps -a` |
-| 构建镜像 | `docker build -t TAG .` |
+| 构建镜像 | `docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t TAG .` |
 | Compose 启动 | `docker compose up -d` |
 | Compose 停止 | `docker compose down` |
 | 磁盘使用情况 | `docker system df` |

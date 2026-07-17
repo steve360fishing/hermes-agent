@@ -47,7 +47,7 @@ docker --version && docker compose version
 | View logs (follow) | `docker logs --tail 50 -f NAME` |
 | Shell into container | `docker exec -it NAME /bin/sh` |
 | List all containers | `docker ps -a` |
-| Build image | `docker build -t TAG .` |
+| Build image | `docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t TAG .` |
 | Compose up | `docker compose up -d` |
 | Compose down | `docker compose down` |
 | Disk usage | `docker system df` |
