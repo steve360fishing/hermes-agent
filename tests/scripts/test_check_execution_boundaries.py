@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import importlib.util
+import copy
 import json
 import subprocess
 import sys
@@ -103,6 +104,27 @@ def test_registry_requires_lifecycle_relationships_between_registered_sites():
     errors = checker.validate_registry(REPO_ROOT, broken)
 
     assert any("lifecycle relationships" in error for error in errors)
+
+
+def test_registry_requires_real_artifact_lifecycle_graph():
+    checker = _load_checker()
+    data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    graph = data.get("lifecycle_graphs", {}).get("artifact_delivery", {})
+    nodes = {item.get("id") for item in graph.get("nodes", [])}
+    required_nodes = {
+        "writer",
+        "verifier",
+        "finalizer",
+        "gateway_dispatch",
+        "telegram_descriptor",
+        "receipt_transition",
+    }
+
+    assert required_nodes <= nodes
+    broken = copy.deepcopy(data)
+    broken["lifecycle_graphs"]["artifact_delivery"]["edges"] = []
+    errors = checker.validate_registry(REPO_ROOT, broken)
+    assert any("artifact lifecycle" in error for error in errors)
 
 
 def test_runtime_manifest_redacts_secret_values(tmp_path, monkeypatch):

@@ -9,6 +9,7 @@ We mock the telegram module at import time to avoid collection errors.
 """
 
 import asyncio
+import json
 import os
 import sys
 from pathlib import Path
@@ -795,6 +796,76 @@ class TestSendDocument:
         assert result.success is False
         assert result.error == "document_path_changed"
         connected_adapter._bot.send_document.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejects_same_inode_content_rewrite(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import build_task_execution_contract, record_artifact_written
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="same-inode-rewrite",
+            platform="telegram",
+        )
+        artifact = Path(contract.artifact_output_path)
+        artifact.write_bytes(b"trusted")
+        assert record_artifact_written(contract) is True
+        identity = artifact.stat().st_ino
+        with artifact.open("r+b") as stream:
+            stream.write(b"hostile")
+            stream.flush()
+            os.fsync(stream.fileno())
+        assert artifact.stat().st_ino == identity
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(artifact)
+        )
+
+        assert result.success is False
+        assert result.error == "document_receipt_mismatch"
+        connected_adapter._bot.send_document.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_document_retry_counts_each_transport_call(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import (
+            build_task_execution_contract,
+            record_artifact_dispatch,
+            record_artifact_written,
+        )
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="two-telegram-attempts",
+            platform="telegram",
+        )
+        artifact = Path(contract.artifact_output_path)
+        artifact.write_bytes(b"trusted")
+        assert record_artifact_written(contract) is True
+        assert record_artifact_dispatch(str(artifact), state="dispatching")
+        connected_adapter._should_retry_without_dm_topic_reply_anchor = MagicMock(
+            return_value=True
+        )
+        connected_adapter._bot.send_document = AsyncMock(
+            side_effect=[RuntimeError("stale topic"), MagicMock(message_id=202)]
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345",
+            file_path=str(artifact),
+            metadata={"telegram_dm_topic_reply_fallback": True},
+        )
+
+        assert result.success is True
+        assert connected_adapter._bot.send_document.await_count == 2
+        receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+        assert receipt["attempt_count"] == 2
 
     @pytest.mark.asyncio
     async def test_send_document_file_not_found(self, connected_adapter):

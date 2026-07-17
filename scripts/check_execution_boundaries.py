@@ -31,6 +31,39 @@ REQUIRED_CONTRACTS: dict[str, list[str]] = {
     "cron_restrictions": ["decision", "enforcement", "recovery"],
 }
 
+REQUIRED_ARTIFACT_LIFECYCLE_NODES = {
+    "writer": ("tools/file_tools.py", "write_file_tool"),
+    "verifier": ("agent/task_execution_contract.py", "record_artifact_written"),
+    "finalizer": ("agent/turn_finalizer.py", "_finalize_turn_impl"),
+    "gateway_dispatch": (
+        "gateway/platforms/base.py",
+        "BasePlatformAdapter._process_message_background",
+    ),
+    "stream_gateway_dispatch": (
+        "gateway/run.py",
+        "GatewayRunner._deliver_media_from_response",
+    ),
+    "telegram_descriptor": (
+        "plugins/platforms/telegram/adapter.py",
+        "_open_verified_document_descriptor",
+    ),
+    "receipt_transition": (
+        "agent/task_execution_contract.py",
+        "record_artifact_dispatch",
+    ),
+}
+REQUIRED_ARTIFACT_LIFECYCLE_EDGES = {
+    ("writer", "verifier"),
+    ("verifier", "finalizer"),
+    ("finalizer", "gateway_dispatch"),
+    ("finalizer", "stream_gateway_dispatch"),
+    ("gateway_dispatch", "telegram_descriptor"),
+    ("stream_gateway_dispatch", "telegram_descriptor"),
+    ("gateway_dispatch", "receipt_transition"),
+    ("stream_gateway_dispatch", "receipt_transition"),
+    ("telegram_descriptor", "receipt_transition"),
+}
+
 ENTRYPOINTS = (
     "cli.py",
     "run_agent.py",
@@ -77,7 +110,6 @@ DISCOVERY_RULES = (
         ),
         (
             "artifact_only",
-            "execution_contract",
             "_task_execution_contract",
             "set_execution_contract",
             "clear_task_execution_contract",
@@ -91,6 +123,7 @@ DISCOVERY_RULES = (
             "gateway/platforms/base.py",
             "gateway/run.py",
             "plugins/platforms/telegram/adapter.py",
+            "tools/file_tools.py",
         ),
         (
             "artifact_output_path",
@@ -99,6 +132,9 @@ DISCOVERY_RULES = (
             "media_delivery_safe_roots",
             "media_tag_cleanup_re",
             "send_document",
+            "write_registered_artifact",
+            "record_artifact_dispatch",
+            "_open_verified_document_descriptor",
         ),
     ),
     DiscoveryRule(
@@ -280,6 +316,27 @@ def validate_registry(
     symbol_cache: dict[str, set[str]] = {}
     if registry.get("schema_version") != 1:
         errors.append("registry schema_version must be 1")
+    lifecycle = registry.get("lifecycle_graphs", {}).get("artifact_delivery", {})
+    lifecycle_nodes = {
+        str(node.get("id")): (node.get("path"), node.get("symbol"))
+        for node in lifecycle.get("nodes", [])
+        if isinstance(node, dict)
+    }
+    for node_id, expected in REQUIRED_ARTIFACT_LIFECYCLE_NODES.items():
+        if lifecycle_nodes.get(node_id) != expected:
+            errors.append(
+                f"artifact lifecycle node {node_id!r} must equal {expected!r}"
+            )
+    lifecycle_edges = {
+        (str(edge.get("from")), str(edge.get("to")))
+        for edge in lifecycle.get("edges", [])
+        if isinstance(edge, dict)
+    }
+    missing_edges = REQUIRED_ARTIFACT_LIFECYCLE_EDGES - lifecycle_edges
+    if missing_edges:
+        errors.append(
+            f"artifact lifecycle missing edges {sorted(missing_edges)!r}"
+        )
     entrypoints = registry.get("entrypoints", [])
     runtime_roots = registry.get("runtime_roots", [])
     if entrypoints != list(ENTRYPOINTS):

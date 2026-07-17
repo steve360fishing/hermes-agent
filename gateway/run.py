@@ -13231,13 +13231,31 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             async def _deliver_document(file_path: str) -> bool:
                 """Do not let a false document result erase a MEDIA-only reply."""
-                correlation_id = None
-                try:
-                    from agent.task_execution_contract import record_artifact_dispatch
+                from agent.task_execution_contract import (
+                    ArtifactReceiptPersistenceError,
+                    record_artifact_dispatch,
+                    registered_artifact_correlation_id,
+                )
 
+                try:
                     correlation_id = record_artifact_dispatch(file_path, state="dispatching")
-                except Exception:
-                    pass
+                except ArtifactReceiptPersistenceError:
+                    correlation_id = registered_artifact_correlation_id(file_path)
+                    try:
+                        notice_result = await adapter.send(
+                            chat_id=event.source.chat_id,
+                            content="⚠️ Couldn't deliver the requested attachment."
+                            + (f" Reference: {correlation_id}." if correlation_id else ""),
+                            metadata=_thread_meta,
+                        )
+                    except Exception:
+                        notice_result = None
+                    if not getattr(notice_result, "success", False):
+                        logger.error(
+                            "[%s] Artifact preflight and failure-notice delivery both failed",
+                            adapter.name,
+                        )
+                    return False
                 try:
                     result = await adapter.send_document(
                         chat_id=event.source.chat_id,
@@ -13247,12 +13265,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     result = None
                 if getattr(result, "success", False):
-                    try:
-                        from agent.task_execution_contract import record_artifact_dispatch
-
-                        record_artifact_dispatch(file_path, state="delivered", message_id=getattr(result, "message_id", None))
-                    except Exception:
-                        pass
+                    record_artifact_dispatch(
+                        file_path,
+                        state="delivered",
+                        message_id=getattr(result, "message_id", None),
+                    )
                     return True
                 try:
                     notice_result = await adapter.send(
@@ -13264,20 +13281,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 except Exception:
                     notice_result = None
                 notice_ok = getattr(notice_result, "success", False)
-                try:
-                    from agent.task_execution_contract import record_artifact_dispatch
-
-                    correlation_id = record_artifact_dispatch(
-                        file_path,
-                        state="ambiguous",
-                        error_code=(
-                            str(getattr(result, "error", "document_dispatch_failed"))
-                            if notice_ok
-                            else "failure_notice_undelivered"
-                        ),
-                    ) or correlation_id
-                except Exception:
-                    pass
+                correlation_id = record_artifact_dispatch(
+                    file_path,
+                    state="ambiguous",
+                    error_code=(
+                        str(getattr(result, "error", "document_dispatch_failed"))
+                        if notice_ok
+                        else "failure_notice_undelivered"
+                    ),
+                ) or correlation_id
                 if not notice_ok:
                     logger.error(
                         "[%s] Artifact and failure-notice delivery both failed",

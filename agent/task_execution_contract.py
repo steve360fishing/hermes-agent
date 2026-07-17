@@ -16,8 +16,10 @@ import tempfile
 import threading
 import time
 import uuid
+from contextlib import contextmanager
 from dataclasses import dataclass, field
-from typing import Any, Mapping
+from pathlib import Path
+from typing import Any, Callable, Iterator, Mapping
 from urllib.parse import urlparse, urlunparse
 
 from agent.file_safety import get_safe_write_roots, is_write_denied
@@ -27,6 +29,9 @@ NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
 POLICY_VERSION = "artifact-only-v2"
 MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
+MAX_PENDING_ARTIFACTS = 16
+MAX_PENDING_ARTIFACT_BYTES = 128 * 1024 * 1024
+ARTIFACT_WRITTEN_TTL_SECONDS = 60 * 60
 _ARTIFACT_RECEIPT_LOCK = threading.RLock()
 _ARTIFACT_RECEIPTS: dict[str, "TaskExecutionContract"] = {}
 _TERMINAL_RECEIPT_STATES = frozenset({"delivered", "failed_preflight", "ambiguous"})
@@ -36,6 +41,15 @@ _ALLOWED_RECEIPT_TRANSITIONS = {
     "written": frozenset({"written", "dispatching", "failed_preflight", "ambiguous"}),
     "dispatching": frozenset({"dispatching", "delivered", "ambiguous"}),
 }
+_WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
+
+
+class ArtifactReceiptPersistenceError(OSError):
+    """Durable receipt state could not be read or committed."""
+
+
+class ArtifactPathSecurityError(OSError):
+    """A path could not be opened without traversing mutable aliases."""
 
 _SUPPORTED_ARTIFACT_TYPES = {
     ".txt": "text/plain",
@@ -133,6 +147,14 @@ class TaskExecutionContract:
     _started_at: float = field(default_factory=time.monotonic, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
     _artifact_identity: tuple[int, int] | None = field(default=None, repr=False)
+    _artifact_parent_chain: tuple[tuple[str, tuple[int, int]], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
+    _receipt_parent_chain: tuple[tuple[str, tuple[int, int]], ...] = field(
+        default_factory=tuple,
+        repr=False,
+    )
     active: bool = True
 
     @property
@@ -411,14 +433,18 @@ def build_task_execution_contract(
     preflight_error = ""
     artifact_id = uuid.uuid4().hex
     artifact_receipt_path = ""
+    artifact_parent_chain: tuple[tuple[str, tuple[int, int]], ...] = ()
+    receipt_parent_chain: tuple[tuple[str, tuple[int, int]], ...] = ()
     if lane == ARTIFACT_ONLY and file_requested:
         artifact_filename = _safe_artifact_filename(
             requested_filename, requested_extension, correlation_id
         )
         requested_extension = os.path.splitext(artifact_filename)[1].lower()
         artifact_mime_type = _SUPPORTED_ARTIFACT_TYPES[requested_extension]
-        if platform is not None and not platform_supports_document_delivery(platform):
+        if not platform_supports_document_delivery(platform):
             preflight_error = "artifact_delivery_unavailable"
+            lane = NORMAL
+            reason = "artifact_delivery_unavailable"
         prepared = None if preflight_error else _prepare_artifact_output(artifact_filename, artifact_id)
         if prepared is None:
             preflight_error = preflight_error or "artifact_output_unavailable"
@@ -431,6 +457,11 @@ def build_task_execution_contract(
                 preflight_error = "artifact_output_unavailable"
             else:
                 artifact_receipt_path = os.path.join(receipts_root, f"{artifact_id}.json")
+                try:
+                    artifact_parent_chain = _capture_parent_chain(artifact_root)
+                    receipt_parent_chain = _capture_parent_chain(receipts_root)
+                except OSError:
+                    preflight_error = "artifact_output_unavailable"
     explicit_urls = frozenset(
         filter(None, (_normalized_url(url.rstrip(".,);]")) for url in _URL.findall(text)))
     )
@@ -449,11 +480,21 @@ def build_task_execution_contract(
         artifact_file_requested=file_requested,
         preflight_error=preflight_error,
         explicit_urls=explicit_urls,
+        _artifact_parent_chain=artifact_parent_chain,
+        _receipt_parent_chain=receipt_parent_chain,
     )
     if contract.artifact_file_requested and not contract.preflight_error:
         with _ARTIFACT_RECEIPT_LOCK:
-            _ARTIFACT_RECEIPTS[_artifact_registry_key(contract.artifact_output_path)] = contract
-            _write_artifact_receipt_locked(contract, state="allocated")
+            key = _artifact_registry_key(contract.artifact_output_path)
+            _ARTIFACT_RECEIPTS[key] = contract
+            try:
+                _write_artifact_receipt_locked(contract, state="allocated")
+            except ArtifactReceiptPersistenceError:
+                _ARTIFACT_RECEIPTS.pop(key, None)
+                contract.preflight_error = "artifact_receipt_unavailable"
+                contract.lane = NORMAL
+    if contract.preflight_error and contract.artifact_root:
+        _cleanup_task_owned_artifact(contract)
     return contract
 
 
@@ -481,6 +522,223 @@ def _stat_identity(value: os.stat_result) -> tuple[int, int] | None:
     return device, inode
 
 
+def _is_reparse_or_symlink(value: os.stat_result) -> bool:
+    return stat.S_ISLNK(value.st_mode) or bool(
+        int(getattr(value, "st_file_attributes", 0) or 0)
+        & _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT
+    )
+
+
+def _absolute_path_components(path: str) -> list[str]:
+    absolute = os.path.abspath(os.path.expanduser(path))
+    drive, tail = os.path.splitdrive(absolute)
+    anchor = drive + os.sep if drive else os.sep
+    components = [anchor]
+    current = anchor
+    for part in tail.replace("/", os.sep).split(os.sep):
+        if not part:
+            continue
+        current = os.path.join(current, part)
+        components.append(current)
+    return components
+
+
+def _capture_parent_chain(path: str) -> tuple[tuple[str, tuple[int, int]], ...]:
+    chain: list[tuple[str, tuple[int, int]]] = []
+    for component in _absolute_path_components(path):
+        value = os.lstat(component)
+        identity = _stat_identity(value)
+        if (
+            identity is None
+            or _is_reparse_or_symlink(value)
+            or not stat.S_ISDIR(value.st_mode)
+        ):
+            raise ArtifactPathSecurityError("artifact_parent_unsafe")
+        chain.append((component, identity))
+    return tuple(chain)
+
+
+def _verify_parent_chain(
+    chain: tuple[tuple[str, tuple[int, int]], ...],
+) -> None:
+    if not chain:
+        raise ArtifactPathSecurityError("artifact_parent_unavailable")
+    for component, expected in chain:
+        value = os.lstat(component)
+        if (
+            _is_reparse_or_symlink(value)
+            or not stat.S_ISDIR(value.st_mode)
+            or _stat_identity(value) != expected
+        ):
+            raise ArtifactPathSecurityError("artifact_parent_changed")
+
+
+@contextmanager
+def _hold_windows_parent_chain(
+    chain: tuple[tuple[str, tuple[int, int]], ...],
+) -> Iterator[None]:
+    try:
+        import ctypes
+        from ctypes import wintypes
+
+        kernel32 = ctypes.WinDLL("kernel32", use_last_error=True)
+        create_file = kernel32.CreateFileW
+        create_file.argtypes = (
+            wintypes.LPCWSTR,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.LPVOID,
+            wintypes.DWORD,
+            wintypes.DWORD,
+            wintypes.HANDLE,
+        )
+        create_file.restype = wintypes.HANDLE
+        close_handle = kernel32.CloseHandle
+        close_handle.argtypes = (wintypes.HANDLE,)
+        close_handle.restype = wintypes.BOOL
+    except Exception as exc:  # pragma: no cover - platform import boundary
+        raise ArtifactPathSecurityError("artifact_secure_path_unavailable") from exc
+
+    handles: list[Any] = []
+    invalid = ctypes.c_void_p(-1).value
+    try:
+        for component, _expected in chain:
+            handle = create_file(
+                component,
+                0x80,  # FILE_READ_ATTRIBUTES
+                0x1 | 0x2,  # FILE_SHARE_READ | FILE_SHARE_WRITE; deliberately no DELETE
+                None,
+                3,  # OPEN_EXISTING
+                0x02000000 | 0x00200000,  # BACKUP_SEMANTICS | OPEN_REPARSE_POINT
+                None,
+            )
+            if handle in (None, invalid):
+                raise ArtifactPathSecurityError("artifact_secure_path_unavailable")
+            handles.append(handle)
+        _verify_parent_chain(chain)
+        yield None
+    finally:
+        for handle in reversed(handles):
+            close_handle(handle)
+
+
+@contextmanager
+def _hold_posix_parent_chain(
+    chain: tuple[tuple[str, tuple[int, int]], ...],
+) -> Iterator[int]:
+    if (
+        os.open not in getattr(os, "supports_dir_fd", set())
+        or not getattr(os, "O_NOFOLLOW", 0)
+        or not getattr(os, "O_DIRECTORY", 0)
+    ):
+        raise ArtifactPathSecurityError("artifact_secure_path_unavailable")
+    descriptors: list[int] = []
+    flags = (
+        os.O_RDONLY
+        | os.O_DIRECTORY
+        | os.O_NOFOLLOW
+        | getattr(os, "O_CLOEXEC", 0)
+    )
+    try:
+        try:
+            first_path, first_identity = chain[0]
+            current = os.open(first_path, flags)
+            descriptors.append(current)
+            if _stat_identity(os.fstat(current)) != first_identity:
+                raise ArtifactPathSecurityError("artifact_parent_changed")
+            for component, expected in chain[1:]:
+                name = os.path.basename(component.rstrip(os.sep))
+                current = os.open(name, flags, dir_fd=current)
+                descriptors.append(current)
+                opened = os.fstat(current)
+                if (
+                    _stat_identity(opened) != expected
+                    or not stat.S_ISDIR(opened.st_mode)
+                ):
+                    raise ArtifactPathSecurityError("artifact_parent_changed")
+        except ArtifactPathSecurityError:
+            raise
+        except OSError as exc:
+            raise ArtifactPathSecurityError("artifact_parent_changed") from exc
+        yield current
+    finally:
+        for descriptor in reversed(descriptors):
+            try:
+                os.close(descriptor)
+            except OSError:
+                pass
+
+
+@contextmanager
+def _hold_parent_chain(
+    chain: tuple[tuple[str, tuple[int, int]], ...],
+) -> Iterator[int | None]:
+    if os.name == "nt":
+        with _hold_windows_parent_chain(chain):
+            yield None
+    else:
+        with _hold_posix_parent_chain(chain) as descriptor:
+            yield descriptor
+
+
+def _leaf_lstat(path: str, parent_fd: int | None) -> os.stat_result:
+    if parent_fd is None:
+        return os.lstat(path)
+    return os.stat(
+        os.path.basename(path),
+        dir_fd=parent_fd,
+        follow_symlinks=False,
+    )
+
+
+def _open_leaf_descriptor(
+    path: str,
+    parent_fd: int | None,
+    *,
+    flags: int,
+    mode: int = 0o600,
+    must_exist: bool,
+) -> tuple[int, tuple[int, int]]:
+    before = None
+    if must_exist:
+        before = _leaf_lstat(path, parent_fd)
+        if _is_reparse_or_symlink(before) or not stat.S_ISREG(before.st_mode):
+            raise ArtifactPathSecurityError("artifact_not_regular")
+    open_flags = flags | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    target = path if parent_fd is None else os.path.basename(path)
+    fd = os.open(target, open_flags, mode, **({"dir_fd": parent_fd} if parent_fd is not None else {}))
+    try:
+        opened = os.fstat(fd)
+        identity = _stat_identity(opened)
+        after = _leaf_lstat(path, parent_fd)
+        if (
+            identity is None
+            or not stat.S_ISREG(opened.st_mode)
+            or _is_reparse_or_symlink(after)
+            or _stat_identity(after) != identity
+            or (before is not None and _stat_identity(before) != identity)
+        ):
+            raise ArtifactPathSecurityError("artifact_path_changed")
+        return fd, identity
+    except BaseException:
+        os.close(fd)
+        raise
+
+
+def open_path_descriptor_no_reparse(path: str) -> int:
+    """Open an arbitrary document through a no-follow parent chain."""
+    absolute = os.path.abspath(os.path.expanduser(path))
+    chain = _capture_parent_chain(os.path.dirname(absolute))
+    with _hold_parent_chain(chain) as parent_fd:
+        fd, _identity = _open_leaf_descriptor(
+            absolute,
+            parent_fd,
+            flags=os.O_RDONLY,
+            must_exist=True,
+        )
+        return fd
+
+
 def _artifact_error_code(exc: OSError, default: str) -> str:
     if isinstance(exc, FileExistsError):
         return "artifact_destination_exists"
@@ -490,43 +748,47 @@ def _artifact_error_code(exc: OSError, default: str) -> str:
     return default
 
 
+def _descriptor_bytes(fd: int) -> bytes:
+    os.lseek(fd, 0, os.SEEK_SET)
+    chunks: list[bytes] = []
+    remaining = MAX_ARTIFACT_BYTES + 1
+    while remaining > 0:
+        chunk = os.read(fd, min(1024 * 1024, remaining))
+        if not chunk:
+            break
+        chunks.append(chunk)
+        remaining -= len(chunk)
+    payload = b"".join(chunks)
+    if len(payload) > MAX_ARTIFACT_BYTES:
+        raise ArtifactPathSecurityError("artifact_oversize_or_changed")
+    return payload
+
+
 def _verified_artifact_bytes(contract: TaskExecutionContract) -> tuple[bytes, tuple[int, int]]:
     path = contract.artifact_output_path
-    before = os.lstat(path)
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise OSError("artifact_not_regular")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(path, flags)
+    with _hold_parent_chain(contract._artifact_parent_chain) as parent_fd:
+        fd, identity = _open_leaf_descriptor(
+            path,
+            parent_fd,
+            flags=os.O_RDONLY,
+            must_exist=True,
+        )
     try:
-        opened = os.fstat(fd)
-        identity = _stat_identity(opened)
-        if identity is None or _stat_identity(before) != identity:
-            raise OSError("artifact_path_changed")
-        after_open = os.lstat(path)
-        if stat.S_ISLNK(after_open.st_mode) or _stat_identity(after_open) != identity:
-            raise OSError("artifact_path_changed")
-        chunks: list[bytes] = []
-        remaining = MAX_ARTIFACT_BYTES + 1
-        while remaining > 0:
-            chunk = os.read(fd, min(1024 * 1024, remaining))
-            if not chunk:
-                break
-            chunks.append(chunk)
-            remaining -= len(chunk)
+        payload = _descriptor_bytes(fd)
         final_fd = os.fstat(fd)
-        final_path = os.lstat(path)
-        if _stat_identity(final_fd) != identity or _stat_identity(final_path) != identity:
-            raise OSError("artifact_path_changed")
-        payload = b"".join(chunks)
-        if len(payload) > MAX_ARTIFACT_BYTES or len(payload) != final_fd.st_size:
-            raise OSError("artifact_oversize_or_changed")
+        if _stat_identity(final_fd) != identity or len(payload) != final_fd.st_size:
+            raise ArtifactPathSecurityError("artifact_oversize_or_changed")
         return payload, identity
     finally:
         os.close(fd)
 
 
-def write_registered_artifact(path: str, content: str) -> tuple[bool, str, int]:
-    """Create one registered artifact through an exclusive, descriptor-pinned write."""
+def write_registered_artifact(
+    path: str,
+    content: str,
+    writer: Callable[[str, str], Any] | None = None,
+) -> tuple[bool, str, int]:
+    """Write through the terminal backend while pinning the delivery parent."""
     key = _artifact_registry_key(path)
     with _ARTIFACT_RECEIPT_LOCK:
         contract = _ARTIFACT_RECEIPTS.get(key)
@@ -536,56 +798,71 @@ def write_registered_artifact(path: str, content: str) -> tuple[bool, str, int]:
         return False, "artifact_write_path_denied", 0
     if not artifact_content_fits(content):
         return False, "artifact_write_too_large", 0
-    payload = content.encode("utf-8")
-    flags = (
-        os.O_WRONLY
-        | os.O_CREAT
-        | os.O_EXCL
-        | getattr(os, "O_BINARY", 0)
-        | getattr(os, "O_NOFOLLOW", 0)
-    )
-    fd: int | None = None
-    created_identity: tuple[int, int] | None = None
+    if writer is None:
+        return False, "artifact_backend_unavailable", 0
     try:
-        fd = os.open(contract.artifact_output_path, flags, 0o600)
-        opened = os.fstat(fd)
-        created_identity = _stat_identity(opened)
-        if created_identity is None or not stat.S_ISREG(opened.st_mode):
-            raise OSError("artifact_identity_unavailable")
-        visible = os.lstat(contract.artifact_output_path)
-        if stat.S_ISLNK(visible.st_mode) or _stat_identity(visible) != created_identity:
-            raise OSError("artifact_path_changed")
-        offset = 0
-        while offset < len(payload):
-            offset += os.write(fd, payload[offset:])
-        os.fsync(fd)
-        final_fd = os.fstat(fd)
-        final_path = os.lstat(contract.artifact_output_path)
-        if (
-            _stat_identity(final_fd) != created_identity
-            or _stat_identity(final_path) != created_identity
-            or final_fd.st_size != len(payload)
-        ):
-            raise OSError("artifact_path_changed")
-        contract._artifact_identity = created_identity
-        return True, "", len(payload)
+        with _hold_parent_chain(contract._artifact_parent_chain) as parent_fd:
+            created_identity = None
+            try:
+                _leaf_lstat(contract.artifact_output_path, parent_fd)
+            except FileNotFoundError:
+                pass
+            else:
+                raise FileExistsError("artifact_destination_exists")
+            backend_path = contract.artifact_output_path
+            if os.name != "nt":
+                proc_parent = f"/proc/{os.getpid()}/fd/{parent_fd}"
+                if not os.path.isdir(proc_parent):
+                    raise ArtifactPathSecurityError("artifact_secure_backend_unavailable")
+                backend_path = os.path.join(proc_parent, contract.artifact_filename)
+            try:
+                try:
+                    result = writer(backend_path, content)
+                except Exception as exc:
+                    raise OSError("artifact_backend_write_failed") from exc
+                result_dict = result.to_dict() if hasattr(result, "to_dict") else {}
+                if result_dict.get("error"):
+                    raise OSError("artifact_backend_write_failed")
+                fd, created_identity = _open_leaf_descriptor(
+                    contract.artifact_output_path,
+                    parent_fd,
+                    flags=os.O_RDONLY,
+                    must_exist=True,
+                )
+                try:
+                    payload = _descriptor_bytes(fd)
+                    if os.fstat(fd).st_size != len(payload):
+                        raise ArtifactPathSecurityError("artifact_oversize_or_changed")
+                finally:
+                    os.close(fd)
+                _verify_parent_chain(contract._artifact_parent_chain)
+                contract._artifact_identity = created_identity
+                return True, "", len(payload)
+            except OSError:
+                if created_identity is not None:
+                    try:
+                        current = _leaf_lstat(contract.artifact_output_path, parent_fd)
+                        if _stat_identity(current) == created_identity:
+                            if parent_fd is None:
+                                os.unlink(contract.artifact_output_path)
+                            else:
+                                os.unlink(contract.artifact_filename, dir_fd=parent_fd)
+                    except OSError:
+                        pass
+                raise
     except OSError as exc:
         return False, _artifact_error_code(exc, "artifact_write_failed"), 0
-    finally:
-        if fd is not None:
-            os.close(fd)
-        if created_identity is not None:
-            try:
-                current = os.lstat(contract.artifact_output_path)
-                if _stat_identity(current) == created_identity and contract._artifact_identity != created_identity:
-                    os.unlink(contract.artifact_output_path)
-            except OSError:
-                pass
 
 
 def is_registered_artifact_path(path: str) -> bool:
     with _ARTIFACT_RECEIPT_LOCK:
         return _artifact_registry_key(path) in _ARTIFACT_RECEIPTS
+
+
+def registered_artifact_correlation_id(path: str) -> str | None:
+    with _ARTIFACT_RECEIPT_LOCK:
+        contract = _ARTIFACT_RECEIPTS.get(_artifact_registry_key(path))
+        return contract.correlation_id if contract is not None else None
 
 
 def registered_artifact_identity_matches(path: str, opened: os.stat_result) -> bool:
@@ -598,6 +875,45 @@ def registered_artifact_identity_matches(path: str, opened: os.stat_result) -> b
             contract._artifact_identity is not None
             and contract._artifact_identity == _stat_identity(opened)
         )
+
+
+def open_registered_artifact_descriptor(path: str) -> int | None:
+    """Open a registered artifact and bind held bytes to its durable receipt."""
+    key = _artifact_registry_key(path)
+    with _ARTIFACT_RECEIPT_LOCK:
+        contract = _ARTIFACT_RECEIPTS.get(key)
+        if contract is None:
+            return None
+        receipt = _load_artifact_receipt_locked(contract, required=True)
+        if (
+            receipt.get("id") != contract.artifact_id
+            or receipt.get("path") != contract.artifact_output_path
+            or receipt.get("mime") != contract.artifact_mime_type
+            or receipt.get("state") not in {"written", "dispatching"}
+        ):
+            raise ArtifactPathSecurityError("artifact_receipt_mismatch")
+        with _hold_parent_chain(contract._artifact_parent_chain) as parent_fd:
+            fd, identity = _open_leaf_descriptor(
+                contract.artifact_output_path,
+                parent_fd,
+                flags=os.O_RDONLY,
+                must_exist=True,
+            )
+            try:
+                if contract._artifact_identity != identity:
+                    raise ArtifactPathSecurityError("artifact_path_changed")
+                payload = _descriptor_bytes(fd)
+                digest = hashlib.sha256(payload).hexdigest()
+                if (
+                    int(receipt.get("bytes", -1)) != len(payload)
+                    or receipt.get("sha256") != digest
+                ):
+                    raise ArtifactPathSecurityError("artifact_receipt_mismatch")
+                os.lseek(fd, 0, os.SEEK_SET)
+                return fd
+            except BaseException:
+                os.close(fd)
+                raise
 
 
 def record_artifact_written(contract: TaskExecutionContract) -> bool:
@@ -619,7 +935,10 @@ def record_artifact_written(contract: TaskExecutionContract) -> bool:
             sha256=hashlib.sha256(payload).hexdigest(),
             size=len(payload),
         )
+        _reconcile_artifact_store(os.path.dirname(contract.artifact_root))
         return True
+    except ArtifactReceiptPersistenceError:
+        raise
     except OSError as exc:
         finalize_artifact_contract(
             contract,
@@ -629,7 +948,14 @@ def record_artifact_written(contract: TaskExecutionContract) -> bool:
         return False
 
 
-def record_artifact_dispatch(path: str, *, state: str, message_id: Any = None, error_code: str = "") -> str | None:
+def record_artifact_dispatch(
+    path: str,
+    *,
+    state: str,
+    message_id: Any = None,
+    error_code: str = "",
+    transport_attempt: bool = False,
+) -> str | None:
     """Advance a registered artifact receipt without persisting user content."""
     cleanup_contract = None
     with _ARTIFACT_RECEIPT_LOCK:
@@ -642,6 +968,7 @@ def record_artifact_dispatch(path: str, *, state: str, message_id: Any = None, e
             state=state,
             message_id=message_id,
             error_code=error_code,
+            transport_attempt=transport_attempt,
         )
         if receipt.get("state") in _TERMINAL_RECEIPT_STATES:
             _ARTIFACT_RECEIPTS.pop(key, None)
@@ -675,6 +1002,7 @@ def _write_artifact_receipt(
     size: int | None = None,
     message_id: Any = None,
     error_code: str = "",
+    transport_attempt: bool = False,
 ) -> dict[str, Any]:
     with _ARTIFACT_RECEIPT_LOCK:
         return _write_artifact_receipt_locked(
@@ -684,7 +1012,48 @@ def _write_artifact_receipt(
             size=size,
             message_id=message_id,
             error_code=error_code,
+            transport_attempt=transport_attempt,
         )
+
+
+def _load_artifact_receipt_locked(
+    contract: TaskExecutionContract,
+    *,
+    required: bool,
+) -> dict[str, Any]:
+    if not contract.artifact_receipt_path:
+        if required:
+            raise ArtifactReceiptPersistenceError("artifact_receipt_missing")
+        return {}
+    try:
+        with _hold_parent_chain(contract._receipt_parent_chain) as parent_fd:
+            fd, _identity = _open_leaf_descriptor(
+                contract.artifact_receipt_path,
+                parent_fd,
+                flags=os.O_RDONLY,
+                must_exist=True,
+            )
+            try:
+                raw = bytearray()
+                while len(raw) <= 64 * 1024:
+                    chunk = os.read(fd, min(8192, 64 * 1024 + 1 - len(raw)))
+                    if not chunk:
+                        break
+                    raw.extend(chunk)
+                if len(raw) > 64 * 1024:
+                    raise ArtifactReceiptPersistenceError("artifact_receipt_unreadable")
+                receipt = json.loads(raw.decode("utf-8"))
+            finally:
+                os.close(fd)
+    except FileNotFoundError:
+        if required:
+            raise ArtifactReceiptPersistenceError("artifact_receipt_missing")
+        return {}
+    except (OSError, ValueError, TypeError) as exc:
+        raise ArtifactReceiptPersistenceError("artifact_receipt_unreadable") from exc
+    if not isinstance(receipt, dict):
+        raise ArtifactReceiptPersistenceError("artifact_receipt_unreadable")
+    return receipt
 
 
 def _write_artifact_receipt_locked(
@@ -695,15 +1064,14 @@ def _write_artifact_receipt_locked(
     size: int | None = None,
     message_id: Any = None,
     error_code: str = "",
+    transport_attempt: bool = False,
 ) -> dict[str, Any]:
     if not contract.artifact_receipt_path:
-        return {}
-    prior: dict[str, Any] = {}
-    try:
-        with open(contract.artifact_receipt_path, "r", encoding="utf-8") as source:
-            prior = json.load(source)
-    except (OSError, ValueError):
-        pass
+        raise ArtifactReceiptPersistenceError("artifact_receipt_missing")
+    prior = _load_artifact_receipt_locked(
+        contract,
+        required=state != "allocated",
+    )
     prior_state = str(prior.get("state", ""))
     if prior_state in _TERMINAL_RECEIPT_STATES:
         return prior
@@ -718,23 +1086,180 @@ def _write_artifact_receipt_locked(
         "mime": contract.artifact_mime_type,
         "state": state,
         "attempt_count": int(prior.get("attempt_count", 0))
-        + (1 if state == "dispatching" and prior_state != "dispatching" else 0),
+        + (1 if state == "dispatching" and transport_attempt else 0),
         "platform_message_id": str(message_id) if message_id is not None else prior.get("platform_message_id", ""),
         "error_code": error_code,
+        "updated_at": int(time.time()),
     }
-    try:
-        fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=contract.artifact_root)
-        with os.fdopen(fd, "w", encoding="utf-8") as destination:
-            json.dump(receipt, destination, sort_keys=True, separators=(",", ":"))
-            destination.flush()
-            os.fsync(destination.fileno())
-        os.replace(temporary, contract.artifact_receipt_path)
-    except OSError:
+    temporary_name = f".receipt-{uuid.uuid4().hex}.tmp"
+    receipt_parent = os.path.dirname(contract.artifact_receipt_path)
+    receipt_name = os.path.basename(contract.artifact_receipt_path)
+    with _hold_parent_chain(contract._receipt_parent_chain) as parent_fd:
+        temporary_path = os.path.join(receipt_parent, temporary_name)
+        target = temporary_path if parent_fd is None else temporary_name
+        open_kwargs = {"dir_fd": parent_fd} if parent_fd is not None else {}
+        fd = -1
         try:
-            os.unlink(temporary)
-        except (OSError, UnboundLocalError):
-            pass
+            fd = os.open(
+                target,
+                os.O_WRONLY
+                | os.O_CREAT
+                | os.O_EXCL
+                | getattr(os, "O_BINARY", 0)
+                | getattr(os, "O_NOFOLLOW", 0),
+                0o600,
+                **open_kwargs,
+            )
+            payload = json.dumps(
+                receipt,
+                sort_keys=True,
+                separators=(",", ":"),
+            ).encode("utf-8")
+            offset = 0
+            while offset < len(payload):
+                offset += os.write(fd, payload[offset:])
+            os.fsync(fd)
+            os.close(fd)
+            fd = -1
+            if parent_fd is None:
+                os.replace(temporary_path, contract.artifact_receipt_path)
+            else:
+                if os.rename not in getattr(os, "supports_dir_fd", set()):
+                    raise ArtifactPathSecurityError("artifact_secure_path_unavailable")
+                os.rename(
+                    temporary_name,
+                    receipt_name,
+                    src_dir_fd=parent_fd,
+                    dst_dir_fd=parent_fd,
+                )
+            temporary_name = ""
+            if parent_fd is not None:
+                os.fsync(parent_fd)
+        except OSError as exc:
+            try:
+                if fd >= 0:
+                    os.close(fd)
+            except OSError:
+                pass
+            try:
+                if temporary_name:
+                    if parent_fd is None:
+                        os.unlink(temporary_path)
+                    else:
+                        os.unlink(temporary_name, dir_fd=parent_fd)
+            except OSError:
+                pass
+            raise ArtifactReceiptPersistenceError("artifact_receipt_persistence_failed") from exc
     return receipt
+
+
+def _orphan_contract_from_receipt(
+    artifact_base: str,
+    receipt_path: str,
+    receipt: Mapping[str, Any],
+) -> TaskExecutionContract | None:
+    artifact_id = str(receipt.get("id", ""))
+    output = os.path.abspath(str(receipt.get("path", "")))
+    if not re.fullmatch(r"[0-9a-f]{32}", artifact_id):
+        return None
+    root = os.path.abspath(os.path.join(artifact_base, artifact_id))
+    if os.path.dirname(output) != root or os.path.basename(root) != artifact_id:
+        return None
+    extension = os.path.splitext(output)[1].lower()
+    if extension not in _SUPPORTED_ARTIFACT_TYPES:
+        return None
+    try:
+        chain = _capture_parent_chain(root)
+        receipt_chain = _capture_parent_chain(os.path.dirname(receipt_path))
+    except OSError:
+        return None
+    contract = TaskExecutionContract(
+        lane=NORMAL,
+        decision_reason="artifact_reconciliation",
+        correlation_id=str(receipt.get("turn", "")),
+        artifact_output_path=output,
+        artifact_id=artifact_id,
+        artifact_root=root,
+        artifact_receipt_path=receipt_path,
+        artifact_filename=os.path.basename(output),
+        artifact_extension=extension,
+        artifact_mime_type=str(receipt.get("mime", "")),
+        artifact_route="reconciled",
+        artifact_file_requested=True,
+        _artifact_parent_chain=chain,
+        _receipt_parent_chain=receipt_chain,
+    )
+    try:
+        payload, identity = _verified_artifact_bytes(contract)
+    except OSError:
+        return None
+    if (
+        len(payload) != int(receipt.get("bytes", -1))
+        or hashlib.sha256(payload).hexdigest() != receipt.get("sha256")
+    ):
+        return None
+    contract._artifact_identity = identity
+    return contract
+
+
+def _reconcile_artifact_store(artifact_base: str) -> None:
+    """Bound abandoned written artifacts without retrying provider delivery."""
+    artifact_base = os.path.abspath(artifact_base)
+    receipts_root = os.path.join(artifact_base, ".receipts")
+    try:
+        receipt_paths = list(Path(receipts_root).glob("*.json"))
+    except OSError:
+        return
+    records: list[tuple[int, str, dict[str, Any], Path]] = []
+    now = time.time()
+    for receipt_path in receipt_paths:
+        try:
+            receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+            modified = receipt_path.stat().st_mtime_ns
+        except (OSError, ValueError, TypeError):
+            continue
+        if not isinstance(receipt, dict) or receipt.get("state") not in {"written", "dispatching"}:
+            continue
+        records.append((modified, str(receipt.get("id", "")), receipt, receipt_path))
+    records.sort(key=lambda item: (item[0], item[1]))
+
+    selected: dict[str, tuple[dict[str, Any], Path, str]] = {}
+    for modified, artifact_id, receipt, receipt_path in records:
+        age = max(0.0, now - (modified / 1_000_000_000))
+        if age > ARTIFACT_WRITTEN_TTL_SECONDS:
+            terminal_state = "ambiguous" if receipt.get("state") == "dispatching" else "failed_preflight"
+            selected[artifact_id] = (receipt, receipt_path, terminal_state)
+
+    pending = [item for item in records if item[1] not in selected and item[2].get("state") == "written"]
+    pending_bytes = sum(max(0, int(item[2].get("bytes", 0) or 0)) for item in pending)
+    while len(pending) > MAX_PENDING_ARTIFACTS or pending_bytes > MAX_PENDING_ARTIFACT_BYTES:
+        _modified, artifact_id, receipt, receipt_path = pending.pop(0)
+        pending_bytes -= max(0, int(receipt.get("bytes", 0) or 0))
+        selected[artifact_id] = (receipt, receipt_path, "failed_preflight")
+
+    cleanup: list[TaskExecutionContract] = []
+    with _ARTIFACT_RECEIPT_LOCK:
+        for _artifact_id, (receipt, receipt_path, terminal_state) in selected.items():
+            path = str(receipt.get("path", ""))
+            key = _artifact_registry_key(path)
+            contract = _ARTIFACT_RECEIPTS.get(key)
+            if contract is None:
+                contract = _orphan_contract_from_receipt(
+                    artifact_base,
+                    str(receipt_path),
+                    receipt,
+                )
+            if contract is None:
+                continue
+            _write_artifact_receipt_locked(
+                contract,
+                state=terminal_state,
+                error_code="artifact_dispatch_abandoned",
+            )
+            _ARTIFACT_RECEIPTS.pop(key, None)
+            cleanup.append(contract)
+    for contract in cleanup:
+        _cleanup_task_owned_artifact(contract)
 
 
 def _cleanup_task_owned_artifact(contract: TaskExecutionContract) -> None:
@@ -744,6 +1269,10 @@ def _cleanup_task_owned_artifact(contract: TaskExecutionContract) -> None:
         return
     output = os.path.abspath(contract.artifact_output_path)
     if os.path.dirname(output) != root:
+        return
+    try:
+        _verify_parent_chain(contract._artifact_parent_chain)
+    except OSError:
         return
     if contract._artifact_identity is not None:
         try:
@@ -768,22 +1297,25 @@ def _trusted_request_text(text: str) -> str:
 def clear_task_execution_contract(agent: Any) -> None:
     """Clear and expire any policy left by the previous request."""
     contract = getattr(agent, "_task_execution_contract", None)
+    persistence_error: ArtifactReceiptPersistenceError | None = None
     if contract is not None:
         key = _artifact_registry_key(getattr(contract, "artifact_output_path", ""))
         with _ARTIFACT_RECEIPT_LOCK:
             registered = _ARTIFACT_RECEIPTS.get(key) is contract
-            receipt = {}
             try:
-                with open(contract.artifact_receipt_path, "r", encoding="utf-8") as source:
-                    receipt = json.load(source)
-            except (OSError, ValueError, TypeError):
-                pass
+                receipt = _load_artifact_receipt_locked(contract, required=registered)
+            except ArtifactReceiptPersistenceError as exc:
+                receipt = {}
+                persistence_error = exc
         if registered and receipt.get("state") == "allocated":
-            finalize_artifact_contract(
-                contract,
-                state="failed_preflight",
-                error_code="artifact_turn_ended_before_write",
-            )
+            try:
+                finalize_artifact_contract(
+                    contract,
+                    state="failed_preflight",
+                    error_code="artifact_turn_ended_before_write",
+                )
+            except ArtifactReceiptPersistenceError as exc:
+                persistence_error = exc
         deactivate = getattr(contract, "deactivate", None)
         if callable(deactivate):
             deactivate()
@@ -792,6 +1324,8 @@ def clear_task_execution_contract(agent: Any) -> None:
     setter = getattr(guardrails, "set_execution_contract", None)
     if callable(setter):
         setter(None)
+    if persistence_error is not None:
+        raise persistence_error
 
 
 def validate_artifact_output_path(path: str, artifact_root: str) -> str | None:
@@ -835,6 +1369,7 @@ def _prepare_artifact_output(
                 os.chmod(resolved_base, 0o700)
             except OSError:
                 pass
+            _reconcile_artifact_store(resolved_base)
             task_root = os.path.join(resolved_base, correlation_id)
             if _path_has_symlink_component(task_root):
                 continue
@@ -866,12 +1401,14 @@ def _prepare_artifact_output(
 
 
 def _path_has_symlink_component(path: str) -> bool:
-    """Reject a candidate when any existing path component is a symlink."""
+    """Reject a candidate when any existing component is a symlink/reparse point."""
     current = os.path.abspath(os.path.expanduser(path))
     while True:
         try:
-            if os.path.lexists(current) and os.path.islink(current):
-                return True
+            if os.path.lexists(current):
+                value = os.lstat(current)
+                if _is_reparse_or_symlink(value):
+                    return True
         except (OSError, ValueError):
             return True
         parent = os.path.dirname(current)

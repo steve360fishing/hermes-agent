@@ -59,31 +59,40 @@ def _document_stat_identity(value: os.stat_result) -> tuple[int, int] | None:
 
 
 def _open_verified_document_descriptor(file_path: str) -> int:
-    """Open once and prove the visible path names that same regular file."""
-    before = os.lstat(file_path)
-    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
-        raise _UnsafeDocumentPath("document_path_unsafe")
-    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
-    fd = os.open(file_path, flags)
+    """Open once through a pinned parent chain and verify any durable receipt."""
     try:
-        opened = os.fstat(fd)
-        identity = _document_stat_identity(opened)
-        if identity is None or _document_stat_identity(before) != identity:
-            raise _UnsafeDocumentPath("document_path_changed")
-        try:
-            from agent.task_execution_contract import registered_artifact_identity_matches
+        from agent.task_execution_contract import (
+            ArtifactPathSecurityError,
+            ArtifactReceiptPersistenceError,
+            open_path_descriptor_no_reparse,
+            open_registered_artifact_descriptor,
+        )
 
-            if not registered_artifact_identity_matches(file_path, opened):
-                raise _UnsafeDocumentPath("document_path_changed")
-        except ImportError:
-            pass
-        after_open = os.lstat(file_path)
-        if stat.S_ISLNK(after_open.st_mode) or _document_stat_identity(after_open) != identity:
-            raise _UnsafeDocumentPath("document_path_changed")
-        return fd
-    except BaseException:
-        os.close(fd)
-        raise
+        registered_fd = open_registered_artifact_descriptor(file_path)
+        if registered_fd is not None:
+            return registered_fd
+        return open_path_descriptor_no_reparse(file_path)
+    except ArtifactReceiptPersistenceError as exc:
+        raise _UnsafeDocumentPath("document_receipt_unavailable") from exc
+    except ArtifactPathSecurityError as exc:
+        code = str(exc)
+        if code == "artifact_receipt_mismatch":
+            code = "document_receipt_mismatch"
+        elif code.startswith("artifact_parent") or code.startswith("artifact_secure"):
+            code = "document_parent_unsafe"
+        elif code.startswith("artifact_"):
+            code = "document_path_changed"
+        raise _UnsafeDocumentPath(code) from exc
+
+
+def _record_document_transport_attempt(file_path: str) -> None:
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    record_artifact_dispatch(
+        file_path,
+        state="dispatching",
+        transport_attempt=True,
+    )
 
 
 def _consume_abandoned_task(task: asyncio.Task) -> None:
@@ -1182,9 +1191,12 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[int],
         media_label: str,
         reset_media: Optional[Any] = None,
+        before_attempt: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
         try:
+            if before_attempt is not None:
+                before_attempt()
             return await send_fn(**send_kwargs)
         except Exception as send_err:
             if not self._should_retry_without_dm_topic_reply_anchor(
@@ -1202,6 +1214,8 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if reset_media is not None:
                 reset_media()
+            if before_attempt is not None:
+                before_attempt()
             retry_kwargs = dict(send_kwargs)
             retry_kwargs["reply_to_message_id"] = None
             retry_kwargs.pop("message_thread_id", None)
@@ -6272,6 +6286,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         reply_to_id,
                         "document",
                         reset_media=lambda: f.seek(0),
+                        before_attempt=lambda: _record_document_transport_attempt(file_path),
                     )
             finally:
                 if fd is not None:

@@ -332,6 +332,7 @@ def test_artifact_write_quota_blocks_before_middleware_in_both_paths():
         contract = build_task_execution_contract(
             "Create and deliver example.txt containing the supplied copy.",
             task_id=f"artifact-write-quota-{concurrent}",
+            platform="telegram",
         )
         agent._tool_guardrails.set_execution_contract(contract)
         assert contract.before_tool(

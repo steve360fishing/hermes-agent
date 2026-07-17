@@ -37,30 +37,31 @@ _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
 def _artifact_dispatch_start(path: str) -> str | None:
-    try:
-        from agent.task_execution_contract import record_artifact_dispatch
+    from agent.task_execution_contract import record_artifact_dispatch
 
-        return record_artifact_dispatch(path, state="dispatching")
-    except Exception:
-        return None
+    return record_artifact_dispatch(path, state="dispatching")
 
 
 def _artifact_dispatch_delivered(path: str, message_id) -> None:
-    try:
-        from agent.task_execution_contract import record_artifact_dispatch
+    from agent.task_execution_contract import record_artifact_dispatch
 
-        record_artifact_dispatch(path, state="delivered", message_id=message_id)
-    except Exception:
-        pass
+    record_artifact_dispatch(path, state="delivered", message_id=message_id)
 
 
 def _artifact_dispatch_failed(path: str, error_code: str) -> str | None:
-    try:
-        from agent.task_execution_contract import record_artifact_dispatch
+    from agent.task_execution_contract import record_artifact_dispatch
 
-        return record_artifact_dispatch(path, state="ambiguous", error_code=str(error_code or "document_dispatch_failed"))
-    except Exception:
-        return None
+    return record_artifact_dispatch(
+        path,
+        state="ambiguous",
+        error_code=str(error_code or "document_dispatch_failed"),
+    )
+
+
+def _artifact_correlation_for_path(path: str) -> str | None:
+    from agent.task_execution_contract import registered_artifact_correlation_id
+
+    return registered_artifact_correlation_id(path)
 
 
 def _safe_artifact_delivery_failure(correlation_id: str | None) -> str:
@@ -5203,7 +5204,7 @@ class BasePlatformAdapter(ABC):
                             notice_ok = await _send_artifact_failure_notice(
                                 self,
                                 chat_id=event.source.chat_id,
-                                correlation_id=None,
+                                correlation_id=_artifact_correlation_for_path(media_path),
                                 metadata=_final_thread_metadata,
                             )
                             _artifact_dispatch_failed(

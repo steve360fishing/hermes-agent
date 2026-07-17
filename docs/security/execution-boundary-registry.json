@@ -144,7 +144,212 @@
       "invariant": "Cron policy recovery updates the persisted restriction rather than expanding defaults."
     }
   ],
+  "lifecycle_graphs": {
+    "artifact_delivery": {
+      "nodes": [
+        {
+          "id": "writer",
+          "path": "tools/file_tools.py",
+          "symbol": "write_file_tool"
+        },
+        {
+          "id": "verifier",
+          "path": "agent/task_execution_contract.py",
+          "symbol": "record_artifact_written"
+        },
+        {
+          "id": "finalizer",
+          "path": "agent/turn_finalizer.py",
+          "symbol": "_finalize_turn_impl"
+        },
+        {
+          "id": "gateway_dispatch",
+          "path": "gateway/platforms/base.py",
+          "symbol": "BasePlatformAdapter._process_message_background"
+        },
+        {
+          "id": "stream_gateway_dispatch",
+          "path": "gateway/run.py",
+          "symbol": "GatewayRunner._deliver_media_from_response"
+        },
+        {
+          "id": "telegram_descriptor",
+          "path": "plugins/platforms/telegram/adapter.py",
+          "symbol": "_open_verified_document_descriptor"
+        },
+        {
+          "id": "receipt_transition",
+          "path": "agent/task_execution_contract.py",
+          "symbol": "record_artifact_dispatch"
+        }
+      ],
+      "edges": [
+        {"from": "writer", "to": "verifier"},
+        {"from": "verifier", "to": "finalizer"},
+        {"from": "finalizer", "to": "gateway_dispatch"},
+        {"from": "finalizer", "to": "stream_gateway_dispatch"},
+        {"from": "gateway_dispatch", "to": "telegram_descriptor"},
+        {"from": "stream_gateway_dispatch", "to": "telegram_descriptor"},
+        {"from": "gateway_dispatch", "to": "receipt_transition"},
+        {"from": "stream_gateway_dispatch", "to": "receipt_transition"},
+        {"from": "telegram_descriptor", "to": "receipt_transition"}
+      ]
+    }
+  },
   "sites": [
+    {
+      "id": "tools/file_tools.py:write_file_tool",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "tools/file_tools.py",
+      "symbol": "write_file_tool",
+      "disposition": "covered",
+      "rationale": "Canonical writer entrypoint that preserves the selected terminal backend before artifact verification."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_verified_artifact_bytes",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_verified_artifact_bytes",
+      "disposition": "covered",
+      "rationale": "Descriptor and parent-chain validation boundary for written artifact bytes."
+    },
+    {
+      "id": "agent/task_execution_contract.py:write_registered_artifact",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "write_registered_artifact",
+      "disposition": "covered",
+      "rationale": "Pins the task-owned parent while the terminal backend writes the registered artifact."
+    },
+    {
+      "id": "agent/task_execution_contract.py:open_registered_artifact_descriptor",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "open_registered_artifact_descriptor",
+      "disposition": "covered",
+      "rationale": "Binds a held delivery descriptor to the durable written receipt hash and byte count."
+    },
+    {
+      "id": "agent/task_execution_contract.py:record_artifact_written",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "record_artifact_written",
+      "disposition": "covered",
+      "rationale": "Persists the verified written byte identity before gateway delivery."
+    },
+    {
+      "id": "agent/task_execution_contract.py:record_artifact_dispatch",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "record_artifact_dispatch",
+      "disposition": "covered",
+      "rationale": "Durably records gateway and actual Telegram transport transitions."
+    },
+    {
+      "id": "agent/task_execution_contract.py:finalize_artifact_contract",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "finalize_artifact_contract",
+      "disposition": "covered",
+      "rationale": "Persists terminal failure before registry eviction and bounded cleanup."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_write_artifact_receipt_locked",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_write_artifact_receipt_locked",
+      "disposition": "covered",
+      "rationale": "Atomic fail-closed receipt persistence boundary."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_orphan_contract_from_receipt",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_orphan_contract_from_receipt",
+      "disposition": "covered",
+      "rationale": "Reconstructs only hash-matching task-owned artifacts for startup reconciliation."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_cleanup_task_owned_artifact",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_cleanup_task_owned_artifact",
+      "disposition": "covered",
+      "rationale": "Identity-bounded cleanup boundary that never recursively deletes user content."
+    },
+    {
+      "id": "agent/task_execution_contract.py:clear_task_execution_contract",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "clear_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "Clears request-local policy while preserving stale durable state on persistence failure."
+    },
+    {
+      "id": "gateway/platforms/base.py:_artifact_dispatch_start",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_artifact_dispatch_start",
+      "disposition": "covered",
+      "rationale": "Non-streaming gateway dispatch transition boundary."
+    },
+    {
+      "id": "gateway/platforms/base.py:_artifact_dispatch_delivered",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_artifact_dispatch_delivered",
+      "disposition": "covered",
+      "rationale": "Non-streaming durable delivery completion boundary."
+    },
+    {
+      "id": "gateway/platforms/base.py:_artifact_dispatch_failed",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_artifact_dispatch_failed",
+      "disposition": "covered",
+      "rationale": "Non-streaming ambiguous delivery recovery boundary."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._deliver_media_from_response._deliver_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._deliver_media_from_response._deliver_document",
+      "disposition": "covered",
+      "rationale": "Streaming document delivery and safe failure-notice boundary."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:_open_verified_document_descriptor",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "_open_verified_document_descriptor",
+      "disposition": "covered",
+      "rationale": "Telegram descriptor open boundary linked to the durable receipt."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:_record_document_transport_attempt",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "_record_document_transport_attempt",
+      "disposition": "covered",
+      "rationale": "Counts each actual Telegram Bot API document transport call."
+    },
     {
       "id": "agent/task_execution_contract.py:TaskExecutionContract",
       "contract": "artifact_delivery",
@@ -198,69 +403,6 @@
       "symbol": "_write_artifact_receipt",
       "disposition": "covered",
       "rationale": "delivery receipt state is part of the artifact delivery contract."
-    },
-    {
-      "id": "agent/task_execution_contract.py:_write_artifact_receipt_locked",
-      "contract": "artifact_delivery",
-      "role": "delivery",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "_write_artifact_receipt_locked",
-      "disposition": "covered",
-      "rationale": "serialized receipt transitions preserve delivery lifecycle integrity."
-    },
-    {
-      "id": "agent/task_execution_contract.py:_verified_artifact_bytes",
-      "contract": "artifact_delivery",
-      "role": "validation",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "_verified_artifact_bytes",
-      "disposition": "covered",
-      "rationale": "descriptor-pinned byte verification prevents artifact path substitution."
-    },
-    {
-      "id": "agent/task_execution_contract.py:_cleanup_task_owned_artifact",
-      "contract": "artifact_delivery",
-      "role": "recovery",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "_cleanup_task_owned_artifact",
-      "disposition": "covered",
-      "rationale": "identity-bound cleanup closes the artifact lifecycle without broad deletion."
-    },
-    {
-      "id": "agent/task_execution_contract.py:clear_task_execution_contract",
-      "contract": "artifact_delivery",
-      "role": "recovery",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "clear_task_execution_contract",
-      "disposition": "covered",
-      "rationale": "turn-scoped artifact restrictions and registry state are cleared during recovery."
-    },
-    {
-      "id": "agent/task_execution_contract.py:finalize_artifact_contract",
-      "contract": "artifact_delivery",
-      "role": "recovery",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "finalize_artifact_contract",
-      "disposition": "covered",
-      "rationale": "terminal delivery outcomes trigger bounded artifact cleanup and registry eviction."
-    },
-    {
-      "id": "agent/task_execution_contract.py:write_registered_artifact",
-      "contract": "artifact_delivery",
-      "role": "delivery",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "write_registered_artifact",
-      "disposition": "covered",
-      "rationale": "the canonical writer binds artifact bytes to the validated allocation."
-    },
-    {
-      "id": "agent/task_execution_contract.py:record_artifact_written",
-      "contract": "artifact_delivery",
-      "role": "delivery",
-      "path": "agent/task_execution_contract.py",
-      "symbol": "record_artifact_written",
-      "disposition": "covered",
-      "rationale": "artifact byte verification advances the delivery lifecycle."
     },
     {
       "id": "agent/task_execution_contract.py:build_task_execution_contract",
@@ -702,15 +844,6 @@
       "symbol": "GatewayRunner._deliver_media_from_response",
       "disposition": "covered",
       "rationale": "delivery boundary for the artifact delivery contract."
-    },
-    {
-      "id": "gateway/run.py:GatewayRunner._deliver_media_from_response._deliver_document",
-      "contract": "artifact_delivery",
-      "role": "delivery",
-      "path": "gateway/run.py",
-      "symbol": "GatewayRunner._deliver_media_from_response._deliver_document",
-      "disposition": "covered",
-      "rationale": "document dispatch and receipt updates are reviewed as one delivery boundary."
     },
     {
       "id": "gateway/run.py:GatewayRunner._run_background_task",

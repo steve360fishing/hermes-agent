@@ -1666,7 +1666,12 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
         )
 
         if is_registered_artifact_path(path):
-            success, error, bytes_written = write_registered_artifact(path, content)
+            file_ops = _get_file_ops(task_id)
+            success, error, bytes_written = write_registered_artifact(
+                path,
+                content,
+                writer=file_ops.write_file,
+            )
             if not success:
                 return tool_error(error)
             resolved = os.path.abspath(os.path.expanduser(path))

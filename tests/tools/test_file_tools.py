@@ -6,8 +6,12 @@ handling without requiring a running terminal environment.
 
 import json
 import logging
+import os
+import subprocess
 from pathlib import Path
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from tools.file_tools import (
     PATCH_SCHEMA,
@@ -67,6 +71,19 @@ class TestReadFileHandler:
 
 
 class TestWriteFileHandler:
+    @staticmethod
+    def _local_backend_writer():
+        backend = MagicMock()
+
+        def write(path, content):
+            Path(path).write_text(content, encoding="utf-8", newline="")
+            result = MagicMock()
+            result.to_dict.return_value = {"bytes_written": len(content.encode("utf-8"))}
+            return result
+
+        backend.write_file.side_effect = write
+        return backend
+
     @patch("tools.file_tools._get_file_ops")
     def test_writes_content(self, mock_get):
         mock_ops = MagicMock()
@@ -99,6 +116,100 @@ class TestWriteFileHandler:
         assert result["error"] == "artifact_destination_exists"
         assert contract.artifact_output_path not in result["error"]
         assert swapped.read_text(encoding="utf-8") == "attacker"
+
+    @patch("tools.file_tools._get_file_ops")
+    def test_registered_artifact_uses_terminal_backend(self, mock_get, tmp_path, monkeypatch):
+        from agent.task_execution_contract import build_task_execution_contract
+        from tools.file_tools import write_file_tool
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="backend-writer",
+            platform="telegram",
+        )
+        backend = self._local_backend_writer()
+        mock_get.return_value = backend
+
+        result = json.loads(
+            write_file_tool(contract.artifact_output_path, "backend bytes", task_id="backend-writer")
+        )
+
+        assert "error" not in result
+        backend.write_file.assert_called_once()
+        backend_path, backend_content = backend.write_file.call_args.args
+        assert Path(backend_path).name == contract.artifact_filename
+        assert backend_content == "backend bytes"
+        assert Path(contract.artifact_output_path).read_bytes() == b"backend bytes"
+
+    @patch("tools.file_tools._get_file_ops")
+    @pytest.mark.skipif(os.name == "nt", reason="POSIX parent symlink semantics")
+    def test_registered_artifact_rejects_posix_parent_symlink_swap(
+        self, mock_get, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import build_task_execution_contract
+        from tools.file_tools import write_file_tool
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="parent-symlink",
+            platform="telegram",
+        )
+        root = Path(contract.artifact_root)
+        original = root.with_name(root.name + "-original")
+        attacker = tmp_path / "attacker"
+        attacker.mkdir()
+        root.rename(original)
+        root.symlink_to(attacker, target_is_directory=True)
+        mock_get.return_value = self._local_backend_writer()
+
+        result = json.loads(write_file_tool(contract.artifact_output_path, "hostile"))
+
+        assert result["error"] == "artifact_parent_changed"
+        assert not (attacker / contract.artifact_filename).exists()
+        mock_get.return_value.write_file.assert_not_called()
+
+    @patch("tools.file_tools._get_file_ops")
+    @pytest.mark.skipif(os.name != "nt", reason="Windows junction semantics")
+    def test_registered_artifact_rejects_windows_parent_junction_swap(
+        self, mock_get, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import build_task_execution_contract
+        from tools.file_tools import write_file_tool
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="parent-junction",
+            platform="telegram",
+        )
+        root = Path(contract.artifact_root)
+        original = root.with_name(root.name + "-original")
+        attacker = tmp_path / "attacker"
+        attacker.mkdir()
+        root.rename(original)
+        junction = subprocess.run(
+            ["cmd", "/c", "mklink", "/J", str(root), str(attacker)],
+            capture_output=True,
+            text=True,
+            timeout=10,
+        )
+        if junction.returncode != 0:
+            pytest.skip("junction creation is unavailable")
+        mock_get.return_value = self._local_backend_writer()
+        try:
+            result = json.loads(write_file_tool(contract.artifact_output_path, "hostile"))
+        finally:
+            if root.exists():
+                os.rmdir(root)
+
+        assert result["error"] == "artifact_parent_changed"
+        assert not (attacker / contract.artifact_filename).exists()
+        mock_get.return_value.write_file.assert_not_called()
 
     @patch("tools.file_tools._get_file_ops")
     def test_permission_error_returns_error_json_without_error_log(self, mock_get, caplog):

@@ -277,6 +277,7 @@ def test_successful_artifact_write_forces_exact_media_delivery_response(
     contract = build_task_execution_contract(
         "Create and deliver example.txt containing the supplied copy.",
         task_id="artifact-delivery",
+        platform="telegram",
     )
     with open(contract.artifact_output_path, "wb") as artifact:
         artifact.write(b"exact bytes\n")
