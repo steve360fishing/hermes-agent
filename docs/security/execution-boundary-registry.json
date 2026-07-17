@@ -200,6 +200,60 @@
       "rationale": "delivery receipt state is part of the artifact delivery contract."
     },
     {
+      "id": "agent/task_execution_contract.py:_write_artifact_receipt_locked",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_write_artifact_receipt_locked",
+      "disposition": "covered",
+      "rationale": "serialized receipt transitions preserve delivery lifecycle integrity."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_verified_artifact_bytes",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_verified_artifact_bytes",
+      "disposition": "covered",
+      "rationale": "descriptor-pinned byte verification prevents artifact path substitution."
+    },
+    {
+      "id": "agent/task_execution_contract.py:_cleanup_task_owned_artifact",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_cleanup_task_owned_artifact",
+      "disposition": "covered",
+      "rationale": "identity-bound cleanup closes the artifact lifecycle without broad deletion."
+    },
+    {
+      "id": "agent/task_execution_contract.py:clear_task_execution_contract",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "clear_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "turn-scoped artifact restrictions and registry state are cleared during recovery."
+    },
+    {
+      "id": "agent/task_execution_contract.py:finalize_artifact_contract",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "finalize_artifact_contract",
+      "disposition": "covered",
+      "rationale": "terminal delivery outcomes trigger bounded artifact cleanup and registry eviction."
+    },
+    {
+      "id": "agent/task_execution_contract.py:write_registered_artifact",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "write_registered_artifact",
+      "disposition": "covered",
+      "rationale": "the canonical writer binds artifact bytes to the validated allocation."
+    },
+    {
       "id": "agent/task_execution_contract.py:record_artifact_written",
       "contract": "artifact_delivery",
       "role": "delivery",
