@@ -6,7 +6,8 @@ and exercise it via ``docker run``. They skip when Docker is unavailable
 
 Override the image with ``HERMES_TEST_IMAGE`` env var to point at a pre-built
 image (faster local iteration); otherwise the ``built_image`` fixture builds
-the repo's Dockerfile once per session.
+the repo's Dockerfile once per session with the checkout revision explicitly
+passed as ``HERMES_GIT_SHA``.
 
 """
 from __future__ import annotations
@@ -60,8 +61,15 @@ def built_image() -> str:
     repo_root = os.path.abspath(
         os.path.join(os.path.dirname(__file__), "..", ".."),
     )
+    revision = subprocess.run(
+        ["git", "rev-parse", "HEAD"], cwd=repo_root,
+        check=True, capture_output=True, text=True, timeout=10,
+    ).stdout.strip()
     result = subprocess.run(
-        ["docker", "build", "-t", IMAGE_TAG, repo_root],
+        [
+            "docker", "build", "-t", IMAGE_TAG,
+            "--build-arg", f"HERMES_GIT_SHA={revision}", repo_root,
+        ],
         capture_output=True, text=True, timeout=1200,
     )
     assert result.returncode == 0, (

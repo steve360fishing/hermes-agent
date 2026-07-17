@@ -240,14 +240,17 @@ RUN mkdir -p /opt/hermes/bin && \
 # banner.get_git_banner_state() try the baked SHA first, then fall back
 # to live `git rev-parse` for source installs (unchanged behaviour).
 #
-# The arg is optional — local `docker build` without --build-arg simply
-# omits the file, and the runtime falls back to live-git lookup.  CI
-# (.github/workflows/docker.yml) passes ${{ github.sha }} so
-# every published image has it.
-ARG HERMES_GIT_SHA=
-RUN if [ -n "${HERMES_GIT_SHA}" ]; then \
-        printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha; \
-    fi
+# Every image must carry an exact source revision. Production CI passes
+# `${{ github.sha }}`; local development builds must deliberately pass the
+# checkout revision, for example:
+#   docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t hermes .
+#
+# Fail closed on missing or malformed values rather than publishing an image
+# whose baked build-info and OCI provenance disagree or are unverifiable.
+ARG HERMES_GIT_SHA
+RUN printf '%s\n' "${HERMES_GIT_SHA}" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' && \
+    printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha
+LABEL org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 
 # ---------- s6-overlay service wiring ----------
 # Static services declared at build time: main-hermes + dashboard.

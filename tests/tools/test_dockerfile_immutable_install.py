@@ -78,6 +78,16 @@ def test_dockerfile_bakes_code_scoped_install_method_stamp() -> None:
     assert shim_block, "install-method stamp must be in the shim-wiring RUN block"
 
 
+def test_dockerfile_requires_and_labels_a_valid_source_revision() -> None:
+    """Published images must bind baked build info to OCI provenance."""
+    text = _dockerfile_text()
+
+    assert "ARG HERMES_GIT_SHA\n" in text
+    assert "ARG HERMES_GIT_SHA=" not in text
+    assert "grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$'" in text
+    assert "LABEL org.opencontainers.image.revision=\"${HERMES_GIT_SHA}\"" in text
+
+
 def test_dockerfile_redirects_lazy_installs_to_durable_target() -> None:
     """Immutable image seals the venv but redirects lazy installs to the
     writable data volume, so opt-in backends still install at first use
