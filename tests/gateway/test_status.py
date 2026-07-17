@@ -29,10 +29,19 @@ def test_safe_mode_transport_gap_has_a_degraded_readiness_contract() -> None:
     }
 
 
-def test_safe_mode_transport_reports_ready_only_when_telegram_connected() -> None:
-    assert status.safe_mode_transport_readiness(telegram_connected=True) == {
+def test_safe_mode_transport_reports_ready_only_after_receive_evidence() -> None:
+    assert status.safe_mode_transport_readiness(
+        telegram_connected=True, telegram_receive_healthy=True
+    ) == {
         "readiness": "ready",
         "readiness_diagnostic": "safe_mode_telegram_ready",
+    }
+
+
+def test_safe_mode_connected_but_recovering_transport_is_degraded() -> None:
+    assert status.safe_mode_transport_readiness(telegram_connected=True) == {
+        "readiness": "degraded",
+        "readiness_diagnostic": "safe_mode_telegram_recovering",
     }
 
 

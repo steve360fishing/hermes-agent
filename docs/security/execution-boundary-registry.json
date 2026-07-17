@@ -239,6 +239,33 @@
       "rationale": "Reconstructs only hash-matching task-owned artifacts for startup reconciliation."
     },
     {
+      "id": "agent/task_execution_contract.py:reconcile_artifact_receipts",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "reconcile_artifact_receipts",
+      "disposition": "covered",
+      "rationale": "Bounded startup and periodic receipt reconciliation only scans existing trusted roots under the receipt lock."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner.start",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner.start",
+      "disposition": "covered",
+      "rationale": "Gateway lifecycle invokes startup receipt recovery and owns the five-minute cancellable reconciliation task."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._reconcile_artifact_receipts_periodically",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._reconcile_artifact_receipts_periodically",
+      "disposition": "covered",
+      "rationale": "Cancellable five-minute loop prevents abandoned receipt cleanup from depending on a subsequent artifact request."
+    },
+    {
       "id": "agent/task_execution_contract.py:_cleanup_task_owned_artifact",
       "contract": "artifact_delivery",
       "role": "recovery",
@@ -2298,6 +2325,42 @@
       "symbol": "register_from_config",
       "disposition": "covered",
       "rationale": "enforcement boundary for the safe mode contract."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter",
+      "contract": "safe_mode",
+      "role": "lifecycle",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter",
+      "disposition": "reviewed_exclusion",
+      "rationale": "Class container inherits the safe-mode receive-readiness boundary from its concrete liveness methods."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter._publish_safe_mode_receive_readiness",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter._publish_safe_mode_receive_readiness",
+      "disposition": "covered",
+      "rationale": "Publishes ready only when the polling updater and real receive evidence are both present."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter._record_completed_polling_receive",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter._record_completed_polling_receive",
+      "disposition": "covered",
+      "rationale": "Completed polling receives supply the evidence required to leave recovering readiness."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter._record_inbound_polling_liveness",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter._record_inbound_polling_liveness",
+      "disposition": "covered",
+      "rationale": "Inbound polling updates supply the evidence required to leave recovering readiness."
     },
     {
       "id": "hermes_cli/main.py:_apply_safe_mode",

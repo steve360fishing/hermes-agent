@@ -13,6 +13,12 @@ The owning gateway path must publish
 `gateway.status.safe_mode_transport_readiness()` after its first runtime-status
 write whenever `HERMES_SAFE_MODE=1`.
 
+Telegram is `ready` only after its polling updater is running and it has
+observed a real receive-path event (an inbound update or completed `getUpdates`
+cycle). A bootstrap `start_polling()` result, including a background-recovery
+state after a transient failure, remains `degraded` with the
+`safe_mode_telegram_recovering` diagnostic.
+
 Cached gateway agents must call
 `agent.agent_runtime_helpers.fallback_cap_message_after_primary_eligibility(agent)`
 at `gateway/run.py`'s pre-`run_conversation` fallback-cap check (currently near

@@ -679,6 +679,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # error_callback ever fires and the gateway silently stops receiving
         # messages with the process still alive (#55769).
         self._polling_not_running_count: int = 0
+        # A successful start_polling() only proves bootstrap. Safe-mode
+        # readiness additionally requires an actual receive-path observation.
+        self._polling_receive_evidence: bool = False
         # After sustained reconnect storms the PTB httpx pool can return
         # SendResult(success=True) for sends that never actually transmit.
         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
@@ -2537,15 +2540,45 @@ class TelegramAdapter(BasePlatformAdapter):
         updater = getattr(app, "updater", None) if app is not None else None
         return updater is not None and bool(getattr(updater, "running", False))
 
+    @property
+    def has_healthy_polling_receive(self) -> bool:
+        """Whether polling has current receive evidence and a running updater."""
+        return bool(
+            getattr(self, "_polling_receive_evidence", False)
+            and self._can_refresh_polling_liveness()
+        )
+
+    def _publish_safe_mode_receive_readiness(self) -> None:
+        """Promote safe-mode readiness only after receive-path proof exists."""
+        if os.getenv("HERMES_SAFE_MODE", "").strip().lower() not in {
+            "1", "true", "yes", "on"
+        }:
+            return
+        try:
+            from gateway.status import safe_mode_transport_readiness, write_runtime_status
+
+            write_runtime_status(
+                **safe_mode_transport_readiness(
+                    telegram_connected=self.is_connected,
+                    telegram_receive_healthy=self.has_healthy_polling_receive,
+                )
+            )
+        except Exception:
+            logger.debug("[%s] Safe-mode receive readiness write failed", self.name, exc_info=True)
+
     def _record_inbound_polling_liveness(self) -> None:
         """Record an update PTB delivered through the active polling path."""
         if self._can_refresh_polling_liveness():
+            self._polling_receive_evidence = True
             self._record_polling_liveness()
+            self._publish_safe_mode_receive_readiness()
 
     def _record_completed_polling_receive(self) -> None:
         """Record a completed successful getUpdates long-poll receive cycle."""
         if self._can_refresh_polling_liveness():
+            self._polling_receive_evidence = True
             self._record_polling_liveness()
+            self._publish_safe_mode_receive_readiness()
 
     def _disarm_ptb_retry_loop(self) -> None:
         """Synchronously stop PTB's internal polling retry loop.

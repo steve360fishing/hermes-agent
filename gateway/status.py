@@ -879,13 +879,18 @@ def record_profile_reconciliation_failure(reason: str) -> None:
 
 
 def safe_mode_transport_readiness(
-    *, telegram_connected: bool = False
+    *, telegram_connected: bool = False, telegram_receive_healthy: bool = False
 ) -> dict[str, str]:
     """Return truthful readiness for the bundled safe-mode Telegram transport."""
-    if telegram_connected:
+    if telegram_connected and telegram_receive_healthy:
         return {
             "readiness": "ready",
             "readiness_diagnostic": "safe_mode_telegram_ready",
+        }
+    if telegram_connected:
+        return {
+            "readiness": "degraded",
+            "readiness_diagnostic": "safe_mode_telegram_recovering",
         }
     return {
         "readiness": "degraded",

@@ -165,6 +165,28 @@ async def test_initial_start_polling_does_not_write_false_green():
 
 
 @pytest.mark.asyncio
+async def test_polling_bootstrap_failure_stays_unhealthy_until_recovery_receives():
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._webhook_mode = False
+    adapter._polling_receive_evidence = False
+    adapter._polling_error_task = None
+    adapter._app = MagicMock()
+    adapter._app.updater.running = True
+    adapter._record_polling_liveness = MagicMock()
+    adapter._publish_safe_mode_receive_readiness = MagicMock()
+
+    assert adapter.has_healthy_polling_receive is False
+    adapter._record_completed_polling_receive()
+    assert adapter.has_healthy_polling_receive is True
+    adapter._publish_safe_mode_receive_readiness.assert_called_once_with()
+
+    recovery = MagicMock()
+    recovery.done.return_value = False
+    adapter._polling_error_task = recovery
+    assert adapter.has_healthy_polling_receive is False
+
+
+@pytest.mark.asyncio
 async def test_completed_empty_polling_receive_refreshes_marker(monkeypatch):
     class FakeGetUpdatesRequest:
         def __init__(self, **kwargs):

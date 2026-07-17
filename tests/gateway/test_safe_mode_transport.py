@@ -1,4 +1,6 @@
+import asyncio
 from types import SimpleNamespace
+from unittest.mock import MagicMock
 
 from gateway.config import Platform, PlatformConfig
 
@@ -39,3 +41,27 @@ def test_safe_mode_rejects_non_recovery_transports(monkeypatch):
     )
 
     assert result is None
+
+
+def test_periodic_artifact_reconciliation_waits_between_ticks(monkeypatch):
+    from gateway.run import GatewayRunner
+    import agent.task_execution_contract as contract_module
+
+    runner = _runner()
+    runner._running = True
+    reconciler = MagicMock()
+    monkeypatch.setattr(contract_module, "reconcile_artifact_receipts", reconciler)
+
+    intervals = 0
+
+    async def one_interval(interval):
+        nonlocal intervals
+        assert interval == 300
+        intervals += 1
+        if intervals == 2:
+            runner._running = False
+
+    monkeypatch.setattr(asyncio, "sleep", one_interval)
+    asyncio.run(runner._reconcile_artifact_receipts_periodically(300))
+
+    reconciler.assert_called_once_with()

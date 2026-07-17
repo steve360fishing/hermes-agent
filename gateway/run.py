@@ -6726,6 +6726,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return True
 
+    async def _reconcile_artifact_receipts_periodically(self, interval: float) -> None:
+        """Run bounded receipt recovery until gateway shutdown cancels this task."""
+        from agent.task_execution_contract import reconcile_artifact_receipts
+
+        while self._running:
+            await asyncio.sleep(interval)
+            if self._running:
+                reconcile_artifact_receipts()
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -6733,6 +6742,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        try:
+            from agent.task_execution_contract import reconcile_artifact_receipts
+
+            # Recover abandoned durable receipts even when no later artifact
+            # request arrives. The reconciler only touches existing roots.
+            reconcile_artifact_receipts()
+        except Exception:
+            logger.warning("Startup artifact receipt reconciliation failed", exc_info=True)
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -7264,6 +7281,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        try:
+            from agent.task_execution_contract import (
+                ARTIFACT_RECEIPT_RECONCILE_INTERVAL_SECONDS,
+                reconcile_artifact_receipts,
+            )
+
+            artifact_reconciler = asyncio.create_task(
+                self._reconcile_artifact_receipts_periodically(
+                    ARTIFACT_RECEIPT_RECONCILE_INTERVAL_SECONDS
+                )
+            )
+            self._background_tasks.add(artifact_reconciler)
+            artifact_reconciler.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.warning("Artifact receipt reconciliation could not be started", exc_info=True)
         if os.getenv("HERMES_SAFE_MODE", "").strip().lower() in {
             "1", "true", "yes", "on",
         }:
@@ -7277,9 +7309,20 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 readiness = safe_mode_transport_readiness(
                     telegram_connected=bool(
                         telegram_adapter and telegram_adapter.is_connected
-                    )
+                    ),
+                    telegram_receive_healthy=bool(
+                        telegram_adapter
+                        and getattr(telegram_adapter, "has_healthy_polling_receive", False)
+                    ),
                 )
                 write_runtime_status(**readiness)
+                if readiness["readiness"] != "ready":
+                    self._update_platform_runtime_status(
+                        Platform.TELEGRAM.value,
+                        platform_state="recovering",
+                        error_code="telegram_receive_unproven",
+                        error_message="Telegram polling recovery is active; receive evidence is not yet available.",
+                    )
             except Exception:
                 logger.warning(
                     "Safe mode transport readiness could not be published",

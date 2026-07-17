@@ -576,6 +576,54 @@ def test_startup_reconciliation_expires_durable_orphan(monkeypatch, tmp_path):
     assert not Path(old.artifact_root).exists()
 
 
+def test_startup_reconciliation_terminalizes_crash_after_dispatching(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import (
+        _ARTIFACT_RECEIPTS,
+        reconcile_artifact_receipts,
+        record_artifact_dispatch,
+        record_artifact_written,
+    )
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    contract = _contract("Give me crash.txt as a file.", task_id="dispatch-crash")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+    assert record_artifact_dispatch(contract.artifact_output_path, state="dispatching")
+    old_time = time.time() - 7200
+    os.utime(contract.artifact_receipt_path, (old_time, old_time))
+    _ARTIFACT_RECEIPTS.pop(os.path.normcase(os.path.abspath(contract.artifact_output_path)), None)
+    monkeypatch.setattr(contract_module, "ARTIFACT_WRITTEN_TTL_SECONDS", 3600)
+
+    reconcile_artifact_receipts()
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "ambiguous"
+    assert receipt["error_code"] == "artifact_dispatch_abandoned"
+    assert not Path(contract.artifact_root).exists()
+
+
+def test_periodic_reconciliation_leaves_receipt_before_ttl(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import reconcile_artifact_receipts, record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    contract = _contract("Give me fresh.txt as a file.", task_id="periodic-fresh")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+    monkeypatch.setattr(contract_module, "ARTIFACT_WRITTEN_TTL_SECONDS", 3600)
+
+    reconcile_artifact_receipts()
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "written"
+    assert Path(contract.artifact_root).exists()
+
+
 def test_file_artifact_mode_rejects_missing_platform(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
     monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))

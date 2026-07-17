@@ -32,6 +32,7 @@ MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
 MAX_PENDING_ARTIFACTS = 16
 MAX_PENDING_ARTIFACT_BYTES = 128 * 1024 * 1024
 ARTIFACT_WRITTEN_TTL_SECONDS = 60 * 60
+ARTIFACT_RECEIPT_RECONCILE_INTERVAL_SECONDS = 5 * 60
 _ARTIFACT_RECEIPT_LOCK = threading.RLock()
 _ARTIFACT_RECEIPTS: dict[str, "TaskExecutionContract"] = {}
 _TERMINAL_RECEIPT_STATES = frozenset({"delivered", "failed_preflight", "ambiguous"})
@@ -1263,6 +1264,19 @@ def _reconcile_artifact_store(artifact_base: str) -> None:
             cleanup.append(contract)
     for contract in cleanup:
         _cleanup_task_owned_artifact(contract)
+
+
+def reconcile_artifact_receipts() -> None:
+    """Reconcile existing receipt roots without creating new artifact directories."""
+    with _ARTIFACT_RECEIPT_LOCK:
+        for root, _route in _artifact_root_candidates():
+            try:
+                resolved = os.path.abspath(os.path.expanduser(root))
+                if not os.path.isdir(resolved) or _path_has_symlink_component(resolved):
+                    continue
+                _reconcile_artifact_store(os.path.realpath(resolved))
+            except OSError:
+                continue
 
 
 def _cleanup_task_owned_artifact(contract: TaskExecutionContract) -> None:
