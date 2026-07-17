@@ -216,6 +216,23 @@ async def test_completed_empty_polling_receive_refreshes_marker(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_callable_request_factory_retains_completed_receive_hook(monkeypatch):
+    class FactoryRequest:
+        async def post(self, *args, **kwargs):
+            return []
+
+    monkeypatch.setattr(tg_adapter, "HTTPXRequest", lambda **_kwargs: FactoryRequest())
+    completed = MagicMock()
+
+    request = tg_adapter._new_polling_liveness_request(
+        on_completed_receive=completed
+    )
+
+    assert await request.post("https://api.telegram.org/bot/token/getUpdates") == []
+    completed.assert_called_once_with()
+
+
+@pytest.mark.asyncio
 async def test_wedged_receive_does_not_refresh_marker(monkeypatch):
     adapter = TelegramAdapter.__new__(TelegramAdapter)
     adapter._fatal_error_code = None

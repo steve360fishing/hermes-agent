@@ -374,18 +374,35 @@ def _new_polling_liveness_request(
 ) -> Any:
     """Build the dedicated getUpdates request with a completed-receive hook."""
 
+    def record_completed_receive() -> None:
+        try:
+            on_completed_receive()
+        except Exception:
+            # Marker recording is best-effort and must never disrupt PTB's
+            # receive loop after a valid Bot API response.
+            logger.debug("Telegram liveness receive hook failed", exc_info=True)
+
     if not isinstance(HTTPXRequest, type):
-        return HTTPXRequest(**kwargs)
+        request = HTTPXRequest(**kwargs)
+        original_post = request.post
+
+        async def post_with_liveness(*args: Any, **post_kwargs: Any) -> Any:
+            result = await original_post(*args, **post_kwargs)
+            record_completed_receive()
+            return result
+
+        try:
+            request.post = post_with_liveness
+        except (AttributeError, TypeError) as exc:
+            raise TypeError(
+                "Telegram getUpdates request factory returned an unhookable request"
+            ) from exc
+        return request
 
     class _PollingLivenessHTTPXRequest(HTTPXRequest):
         async def post(self, *args: Any, **post_kwargs: Any) -> Any:
             result = await super().post(*args, **post_kwargs)
-            try:
-                on_completed_receive()
-            except Exception:
-                # Marker recording is best-effort and must never disrupt PTB's
-                # receive loop after a valid Bot API response.
-                logger.debug("Telegram liveness receive hook failed", exc_info=True)
+            record_completed_receive()
             return result
 
     return _PollingLivenessHTTPXRequest(**kwargs)
