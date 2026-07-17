@@ -1306,6 +1306,20 @@ def restore_primary_runtime(agent) -> bool:
         logger.warning("Failed to restore primary runtime: %s", e)
         return False
 
+
+def fallback_cap_message_after_primary_eligibility(agent) -> str | None:
+    """Return a fallback cap only after a cached agent rechecks its primary.
+
+    Gateway caches can retain an exhausted fallback from the prior turn while
+    the primary credential becomes eligible again. Restore first so a stale
+    fallback cap never blocks a newly healthy primary route.
+    """
+    if bool(getattr(agent, "_fallback_activated", False)):
+        agent._restore_primary_runtime()
+    from agent.openrouter_fallback_guard import fallback_cap_message_if_exhausted
+
+    return fallback_cap_message_if_exhausted(agent)
+
 # Which error types indicate a transient transport failure worth
 # one more attempt with a rebuilt client / connection pool.
 _TRANSIENT_TRANSPORT_ERRORS = frozenset({
@@ -3235,6 +3249,7 @@ __all__ = [
     "try_recover_primary_transport",
     "drop_thinking_only_and_merge_users",
     "restore_primary_runtime",
+    "fallback_cap_message_after_primary_eligibility",
     "extract_reasoning",
     "dump_api_request_debug",
     "anthropic_prompt_cache_policy",

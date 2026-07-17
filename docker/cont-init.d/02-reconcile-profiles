@@ -24,9 +24,18 @@
 # and swallows the failure).
 set -e
 
+record_profile_reconciliation_failure() {
+    reason="$1"
+    echo "reconcile: readiness degraded (${reason}); continuing recovery startup" >&2
+    /opt/hermes/.venv/bin/python -c "from gateway.status import record_profile_reconciliation_failure; record_profile_reconciliation_failure('${reason}')" \
+        2>/dev/null || echo "reconcile: unable to persist readiness diagnostic" >&2
+}
+
 # Make the dynamic scandir hermes-writable. The directory itself
 # starts root-owned by s6-overlay.
-chown hermes:hermes /run/service 2>/dev/null || true
+if ! chown hermes:hermes /run/service 2>/dev/null; then
+    record_profile_reconciliation_failure permission_denied
+fi
 
 # Make the svscan control FIFO hermes-writable so s6-svscanctl -a
 # / -an work for the hermes user. The FIFO is created by s6-svscan
@@ -37,11 +46,16 @@ chown hermes:hermes /run/service 2>/dev/null || true
 if [ -d /run/service/.s6-svscan ]; then
     for entry in control lock; do
         if [ -e "/run/service/.s6-svscan/$entry" ]; then
-            chown hermes:hermes "/run/service/.s6-svscan/$entry" 2>/dev/null || true
+            if ! chown hermes:hermes "/run/service/.s6-svscan/$entry" 2>/dev/null; then
+                record_profile_reconciliation_failure permission_denied
+            fi
         fi
     done
 fi
 
 # Skip the drop when already non-root.
 [ "$(id -u)" = 0 ] || exec /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
-exec s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot
+if ! s6-setuidgid hermes /opt/hermes/.venv/bin/python -m hermes_cli.container_boot; then
+    record_profile_reconciliation_failure registration_unavailable
+    exit 0
+fi

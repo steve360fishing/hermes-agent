@@ -531,3 +531,13 @@ class TestRestartLoopGuard:
         rlg.check_and_record(3, 60, now=1001.0)
         rlg.clear()
         assert rlg.check_and_record(3, 60, now=1002.0) is False
+
+    def test_stale_or_future_generation_state_cannot_suppress_recovery(self):
+        import gateway.restart_loop_guard as rlg
+
+        path = rlg._state_path()
+        path.parent.mkdir(parents=True, exist_ok=True)
+        path.write_text('{"generation":"old", "boots":[999999.0, 999999.0, 999999.0]}')
+
+        assert rlg.check_and_record(3, 60, now=1000.0) is False
+        assert rlg._load_boots() == [1000.0]

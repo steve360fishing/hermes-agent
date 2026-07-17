@@ -34,6 +34,24 @@ def test_incident_fallback_is_exactly_grok_45_via_openrouter() -> None:
     assert OPENROUTER_FALLBACK_MODEL == "x-ai/grok-4.5"
 
 
+def test_cached_fallback_cap_rechecks_primary_before_blocking() -> None:
+    from agent.agent_runtime_helpers import (
+        fallback_cap_message_after_primary_eligibility,
+    )
+
+    agent = _agent(_openrouter_fallback_turns=99)
+
+    def restore_primary() -> bool:
+        agent._fallback_activated = False
+        agent.provider = "openai-codex"
+        agent.model = "gpt-5.6-sol"
+        return True
+
+    agent._restore_primary_runtime = restore_primary
+
+    assert fallback_cap_message_after_primary_eligibility(agent) is None
+
+
 def test_incident_grok_fallback_rejects_transport_timeout() -> None:
     agent = _agent(_fallback_activated=False)
 

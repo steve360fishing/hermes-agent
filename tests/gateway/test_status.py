@@ -9,6 +9,26 @@ from types import SimpleNamespace
 from gateway import status
 
 
+def test_profile_reconciliation_permission_failure_marks_readiness_degraded(
+    tmp_path, monkeypatch
+):
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+
+    status.record_profile_reconciliation_failure("permission_denied")
+
+    payload = status.read_runtime_status()
+    assert payload is not None
+    assert payload["readiness"] == "degraded"
+    assert payload["readiness_diagnostic"] == "profile_reconciliation_permission_denied"
+
+
+def test_safe_mode_transport_gap_has_a_degraded_readiness_contract() -> None:
+    assert status.safe_mode_transport_readiness() == {
+        "readiness": "degraded",
+        "readiness_diagnostic": "safe_mode_transport_not_wired",
+    }
+
+
 class TestGatewayPidState:
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

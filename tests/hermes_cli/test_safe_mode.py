@@ -51,6 +51,47 @@ def test_cmd_chat_safe_mode_sets_env_before_startup(monkeypatch):
 
     assert captured["ignore_user_config"] is True
     assert captured["ignore_rules"] is True
+    assert captured["toolsets"] == []
+    assert captured["skills"] == []
+    assert "model" not in captured
+    assert "provider" not in captured
+
+
+def test_env_safe_mode_is_applied_before_tui_config_resolution(monkeypatch):
+    """The environment form must have the same early isolation as the flag."""
+    import hermes_cli.main as main_mod
+
+    args = types.SimpleNamespace(safe_mode=False, cli=False, tui=False)
+    monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+    monkeypatch.setattr(sys, "stdin", types.SimpleNamespace(isatty=lambda: True))
+    monkeypatch.setattr(sys, "stdout", types.SimpleNamespace(isatty=lambda: True))
+
+    config = types.ModuleType("hermes_cli.config")
+
+    def poisoned_load_config():
+        raise AssertionError("safe mode must not load config to choose the UI")
+
+    setattr(config, "load_config", poisoned_load_config)
+    monkeypatch.setitem(sys.modules, "hermes_cli.config", config)
+
+    main_mod._apply_safe_mode(args)
+    assert main_mod._resolve_use_tui(args) is False
+    assert args.safe_mode is True
+
+
+def test_safe_mode_ignores_poisoned_user_and_project_config(monkeypatch, tmp_path):
+    """Safe mode uses built-in defaults rather than either config file."""
+    import cli
+
+    hermes_home = tmp_path / ".hermes"
+    hermes_home.mkdir()
+    (hermes_home / "config.yaml").write_text("display:\n  interface: tui\n")
+    monkeypatch.setattr(cli, "_hermes_home", hermes_home)
+    monkeypatch.setenv("HERMES_SAFE_MODE", "1")
+
+    config = cli.load_cli_config()
+
+    assert config["display"].get("interface") != "tui"
 
 
 def test_prepare_agent_startup_applies_safe_mode_before_plugin_discovery(monkeypatch):

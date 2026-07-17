@@ -2248,9 +2248,8 @@ def _resolve_use_tui(args) -> bool:
 
 def cmd_chat(args):
     """Run interactive chat CLI."""
-    use_tui = _resolve_use_tui(args)
-
     _apply_safe_mode(args)
+    use_tui = _resolve_use_tui(args)
 
     # Resolve --continue into --resume with the latest session or by name
     continue_val = getattr(args, "continue_last", None)
@@ -2352,11 +2351,12 @@ def cmd_chat(args):
         except Exception:
             pass
 
-    # Sync bundled skills on every CLI launch (fast -- skips unchanged skills)
-    try:
-        _sync_bundled_skills_for_startup()
-    except Exception:
-        pass
+    # Safe mode deliberately avoids all skill loading/synchronization.
+    if not getattr(args, "safe_mode", False):
+        try:
+            _sync_bundled_skills_for_startup()
+        except Exception:
+            pass
 
     # --yolo: bypass all dangerous command approvals.
     # Also set in main() before _prepare_agent_startup() — that is the
@@ -2410,10 +2410,10 @@ def cmd_chat(args):
 
     # Build kwargs from args
     kwargs = {
-        "model": args.model,
-        "provider": getattr(args, "provider", None),
-        "toolsets": args.toolsets,
-        "skills": getattr(args, "skills", None),
+        "model": None if getattr(args, "safe_mode", False) else args.model,
+        "provider": None if getattr(args, "safe_mode", False) else getattr(args, "provider", None),
+        "toolsets": [] if getattr(args, "safe_mode", False) else args.toolsets,
+        "skills": [] if getattr(args, "safe_mode", False) else getattr(args, "skills", None),
         "verbose": getattr(args, "verbose", None),
         "quiet": getattr(args, "quiet", False),
         "query": args.query,
@@ -12491,8 +12491,12 @@ def _prepare_agent_startup(args) -> None:
 
 
 def _apply_safe_mode(args) -> None:
-    if not getattr(args, "safe_mode", False):
+    enabled = getattr(args, "safe_mode", False) or os.environ.get("HERMES_SAFE_MODE") == "1"
+    if not enabled:
         return
+    # Normalize both entry points before anything config-dependent loads. This
+    # makes HERMES_SAFE_MODE=1 equivalent to --safe-mode for every launcher.
+    setattr(args, "safe_mode", True)
     os.environ["HERMES_SAFE_MODE"] = "1"
     os.environ["HERMES_IGNORE_USER_CONFIG"] = "1"
     os.environ["HERMES_IGNORE_RULES"] = "1"
