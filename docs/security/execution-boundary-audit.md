@@ -16,7 +16,7 @@ layer rejects, or where a turn-scoped restriction survives into another turn.
   runtime root; and
 - contract-specific semantic tokens in those files.
 
-The checked-in registry currently classifies all 253 discoverable source sites
+The checked-in registry currently classifies all 276 discoverable source sites
 across five contract families. The checker recomputes that union without
 intersecting a semantic match with a contract rule's path list, and the
 regression floor prevents the denominator from falling below 225 unless the

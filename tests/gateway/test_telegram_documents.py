@@ -766,7 +766,10 @@ class TestSendDocument:
         )
 
         assert result.success is False
-        assert result.error == "document_path_changed"
+        expected_error = (
+            "document_path_changed" if os.name == "nt" else "document_parent_unsafe"
+        )
+        assert result.error == expected_error
         connected_adapter._bot.send_document.assert_not_awaited()
 
     @pytest.mark.asyncio

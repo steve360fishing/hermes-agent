@@ -374,6 +374,9 @@ def _new_polling_liveness_request(
 ) -> Any:
     """Build the dedicated getUpdates request with a completed-receive hook."""
 
+    if not isinstance(HTTPXRequest, type):
+        return HTTPXRequest(**kwargs)
+
     class _PollingLivenessHTTPXRequest(HTTPXRequest):
         async def post(self, *args: Any, **post_kwargs: Any) -> Any:
             result = await super().post(*args, **post_kwargs)

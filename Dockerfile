@@ -248,7 +248,8 @@ RUN mkdir -p /opt/hermes/bin && \
 # Fail closed on missing or malformed values rather than publishing an image
 # whose baked build-info and OCI provenance disagree or are unverifiable.
 ARG HERMES_GIT_SHA
-RUN printf '%s\n' "${HERMES_GIT_SHA}" | grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$' && \
+RUN case "${HERMES_GIT_SHA}" in (*[!0-9a-f]*|"") exit 1;; esac && \
+    { [ "${#HERMES_GIT_SHA}" -eq 40 ] || [ "${#HERMES_GIT_SHA}" -eq 64 ]; } && \
     printf '%s\n' "${HERMES_GIT_SHA}" > /opt/hermes/.hermes_build_sha
 LABEL org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 

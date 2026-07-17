@@ -84,7 +84,9 @@ def test_dockerfile_requires_and_labels_a_valid_source_revision() -> None:
 
     assert "ARG HERMES_GIT_SHA\n" in text
     assert "ARG HERMES_GIT_SHA=" not in text
-    assert "grep -Eq '^[0-9a-f]{40}([0-9a-f]{24})?$'" in text
+    assert 'case "${HERMES_GIT_SHA}" in (*[!0-9a-f]*|"") exit 1;; esac' in text
+    assert '[ "${#HERMES_GIT_SHA}" -eq 40 ]' in text
+    assert '[ "${#HERMES_GIT_SHA}" -eq 64 ]' in text
     assert "LABEL org.opencontainers.image.revision=\"${HERMES_GIT_SHA}\"" in text
 
 
