@@ -52,6 +52,28 @@ def _finalize_turn_impl(
 
     task_contract = getattr(agent, "_task_execution_contract", None)
     artifact_only = getattr(task_contract, "lane", None) == "artifact_only"
+    stale_artifact_reference = (
+        not artifact_only
+        and bool(final_response)
+        and callable(getattr(task_contract, "references_expired_artifact", None))
+        and task_contract.references_expired_artifact(final_response)
+    )
+    if stale_artifact_reference:
+        logger.error(
+            "Blocked expired request-local artifact path from a normal turn"
+        )
+        final_response = (
+            "The expired attachment route was blocked and cleared. "
+            "Normal capabilities remain available; please retry the current request."
+        )
+        failed = True
+        _turn_exit_reason = "expired_artifact_path_reuse_blocked"
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                break
+            if message.get("role") == "assistant" and not message.get("tool_calls"):
+                message["content"] = final_response
+                break
 
     # A successful artifact write must deterministically produce the gateway
     # attachment directive; do not depend on the model remembering to echo it.

@@ -16381,7 +16381,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 pass
 
     @staticmethod
-    def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> None:
+    def _init_cached_agent_for_turn(agent: Any, interrupt_depth: int) -> Any:
         """Reset per-turn state on a cached agent before a new turn starts.
 
         Both _last_activity_ts and _last_activity_desc are only reset for
@@ -16394,7 +16394,36 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         idle for 29 min would otherwise trip the watchdog before the new
         turn makes its first API call (#9051).
         """
+        detached_contract = None
         if interrupt_depth == 0:
+            # A request-local execution contract must never survive cached-agent
+            # reuse. run_conversation() clears it again, but the gateway cache is
+            # the earliest safe boundary and protects alternate turn entry paths.
+            try:
+                from agent.task_execution_contract import detach_task_execution_contract
+
+                detached_contract = detach_task_execution_contract(agent)
+            except Exception as exc:
+                stale_contract = getattr(agent, "_task_execution_contract", None)
+                detached_contract = stale_contract
+                deactivate = getattr(stale_contract, "deactivate", None)
+                if callable(deactivate):
+                    try:
+                        deactivate()
+                    except Exception:
+                        pass
+                agent._task_execution_contract = None
+                guardrails = getattr(agent, "_tool_guardrails", None)
+                setter = getattr(guardrails, "set_execution_contract", None)
+                if callable(setter):
+                    try:
+                        setter(None)
+                    except Exception:
+                        pass
+                logger.warning(
+                    "cached agent request-contract cleanup failed closed: %s",
+                    type(exc).__name__,
+                )
             agent._last_activity_ts = time.time()
             agent._last_activity_desc = "starting new turn (cached)"
             # Reset the SessionDB flush cursor so the new turn's messages are
@@ -16403,6 +16432,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             if hasattr(agent, "_last_flushed_db_idx"):
                 agent._last_flushed_db_idx = 0
         agent._api_call_count = 0
+        return detached_contract
 
     def _commit_memory_before_soft_evict(self, agent: Any, key: str) -> None:
         """Fire on_session_end extraction before soft-evicting a live agent.
@@ -18246,6 +18276,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     pass
 
             _xproc_evicted_agent = None
+            _detached_task_contract = None
             if _cache_lock and _cache is not None:
                 with _cache_lock:
                     cached = _cache.get(session_key)
@@ -18308,7 +18339,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                     _cache.move_to_end(session_key)
                                 except KeyError:
                                     pass
-                            self._init_cached_agent_for_turn(agent, _interrupt_depth)
+                            _detached_task_contract = self._init_cached_agent_for_turn(
+                                agent,
+                                _interrupt_depth,
+                            )
                             # Refresh agent max_iterations from current config
                             # (cached agent may have been created with old config)
                             agent.max_iterations = max_iterations
@@ -18326,6 +18360,24 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 self._apply_fallback_chain_to_agent(
                     agent, self._refresh_fallback_model(),
                 )
+
+            # Receipt finalization may touch the filesystem. Keep it outside the
+            # cache lock while preserving ownership of the detached contract.
+            if _detached_task_contract is not None:
+                try:
+                    from agent.task_execution_contract import (
+                        finalize_detached_task_execution_contract,
+                    )
+
+                    finalize_detached_task_execution_contract(
+                        _detached_task_contract,
+                        error_code="artifact_contract_detached_on_cache_reuse",
+                    )
+                except Exception as exc:
+                    logger.warning(
+                        "detached request-contract finalization failed: %s",
+                        type(exc).__name__,
+                    )
 
             # Lock released — now schedule cleanup of any cross-process-evicted
             # agent on a daemon thread so memory-provider shutdown / socket

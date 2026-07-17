@@ -36,7 +36,7 @@ def test_classifier_selects_artifact_only_for_explicit_text_artifacts(message):
     contract = _contract(message)
 
     assert contract.lane == ARTIFACT_ONLY
-    assert contract.policy_version == "artifact-only-v2"
+    assert contract.policy_version == "artifact-only-v3"
 
 
 @pytest.mark.parametrize(
@@ -66,6 +66,145 @@ def test_classifier_keeps_explicit_negative_constraints_in_artifact_lane(message
     ],
 )
 def test_classifier_fails_to_normal_for_ambiguous_or_operational_requests(message):
+    assert _contract(message).lane == NORMAL
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "Alright so we got cut off there. This was my last prompt before we "
+            "got cut off and I want to make sure you don't miss anything."
+        ),
+        (
+            "I've been trying to send you copies of our conversation even as a "
+            "text file but you keep saying there is no safe artifact destination."
+        ),
+        (
+            "I don't know why you're giving me an artifact.txt file. We have work "
+            "to do here and need to start following tournaments."
+        ),
+    ],
+)
+def test_incident_recovery_language_never_activates_artifact_only(message):
+    assert _contract(message).lane == NORMAL
+
+
+def test_emergency_disable_keeps_explicit_artifact_request_normal(monkeypatch):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"agent": {"artifact_only_enabled": False}},
+    )
+
+    contract = _contract("Create and deliver recovery.txt containing safe text.")
+
+    assert contract.lane == NORMAL
+    assert contract.decision_reason == "artifact_only_disabled"
+    assert contract.artifact_output_path == ""
+    assert contract.preflight_error == ""
+
+
+def test_emergency_disable_fails_closed_when_config_cannot_be_read(monkeypatch):
+    def fail_config_read():
+        raise OSError("config unavailable")
+
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        fail_config_read,
+    )
+
+    contract = _contract("Create and deliver recovery.txt containing safe text.")
+
+    assert contract.lane == NORMAL
+    assert contract.decision_reason == "artifact_only_disabled"
+    assert contract.artifact_output_path == ""
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Could you please create recovery.txt containing safe text?",
+        "Make a copy for the sponsor.",
+        "Can you make a creative brief?",
+    ],
+)
+def test_common_direct_artifact_requests_remain_supported(message):
+    assert _contract(message).lane == ARTIFACT_ONLY
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [
+        ". ",
+        ", ",
+        ": ",
+        "; ",
+        " - ",
+        " \u2013 ",
+        " \u2014 ",
+        " (",
+        " [",
+        ' "',
+        " \u201c",
+    ],
+)
+def test_file_request_verb_and_filename_must_be_in_the_same_clause(separator):
+    message = f"Send me the runtime status{separator}the old artifact.txt was wrong."
+    if separator == " (":
+        message += ")"
+
+    assert _contract(message).lane == NORMAL
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Create pre-flight report.txt",
+        "Create concise, client-ready report.txt",
+        r"Create C:\reports\release-notes.txt",
+    ],
+)
+def test_ambiguous_punctuation_falls_back_to_normal_file_handling(message):
+    contract = _contract(message)
+
+    assert contract.lane == NORMAL
+    assert contract.before_tool("write_file", {"path": "safe.txt"}).allowed
+
+
+@pytest.mark.parametrize(
+    "separator",
+    [" and ", "\x85", "\u2028", "\u2029"],
+)
+def test_conjunctions_and_all_splitline_boundaries_do_not_bridge_to_old_files(
+    separator,
+):
+    message = (
+        "Send me the runtime status"
+        + separator
+        + "the old artifact.txt was wrong."
+    )
+
+    assert _contract(message).lane == NORMAL
+
+
+def test_bounded_direct_file_grammar_still_accepts_a_simple_request():
+    assert _contract("Send me the final report.txt").lane == ARTIFACT_ONLY
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "Create report.txt was the bad instruction, not my request. "
+            "Diagnose the gateway instead."
+        ),
+        'The phrase "Create report.txt" was the old broken instruction.',
+        "Create report.txt is an example, not a request.",
+        "Create report.txt caused the gateway failure; this is historical context.",
+        "Create report.txt \u2014 that instruction caused the outage.",
+    ],
+)
+def test_discussed_or_historical_file_instructions_stay_normal(message):
     assert _contract(message).lane == NORMAL
 
 
@@ -576,6 +715,35 @@ def test_startup_reconciliation_expires_durable_orphan(monkeypatch, tmp_path):
     assert not Path(old.artifact_root).exists()
 
 
+def test_startup_reconciliation_expires_unadopted_allocated_contract(
+    monkeypatch,
+    tmp_path,
+):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import _ARTIFACT_RECEIPTS, reconcile_artifact_receipts
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    contract = _contract("Create abandoned.txt", task_id="allocated-orphan")
+    old_time = time.time() - 7200
+    os.utime(contract.artifact_receipt_path, (old_time, old_time))
+    _ARTIFACT_RECEIPTS.pop(
+        os.path.normcase(os.path.abspath(contract.artifact_output_path)),
+        None,
+    )
+    monkeypatch.setattr(contract_module, "ARTIFACT_WRITTEN_TTL_SECONDS", 3600)
+
+    reconcile_artifact_receipts()
+
+    receipt = json.loads(
+        Path(contract.artifact_receipt_path).read_text(encoding="utf-8")
+    )
+    assert receipt["state"] == "failed_preflight"
+    assert receipt["error_code"] == "artifact_dispatch_abandoned"
+    assert not Path(contract.artifact_root).exists()
+
+
 def test_startup_reconciliation_terminalizes_crash_after_dispatching(monkeypatch, tmp_path):
     import agent.task_execution_contract as contract_module
     from agent.task_execution_contract import (
@@ -663,6 +831,12 @@ def test_conversation_contract_prepares_txt_artifact_only_for_telegram(monkeypat
         )
 
     assert captured["contract"].artifact_route != "none"
+    receipt = json.loads(
+        Path(captured["contract"].artifact_receipt_path).read_text(encoding="utf-8")
+    )
+    assert receipt["state"] == "failed_preflight"
+    assert receipt["error_code"] == "artifact_turn_setup_failed_before_adoption"
+    assert not Path(captured["contract"].artifact_root).exists()
 
     other_agent = SimpleNamespace(
         platform="discord",
@@ -677,6 +851,36 @@ def test_conversation_contract_prepares_txt_artifact_only_for_telegram(monkeypat
     )
     assert result["turn_exit_reason"] == "artifact_output_preflight_failed"
     assert result["task_execution"]["decision_reason"] == "artifact_delivery_unavailable"
+
+
+def test_conversation_emergency_disable_prepares_a_normal_turn(monkeypatch, tmp_path):
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"agent": {"artifact_only_enabled": False}},
+    )
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    captured = {}
+
+    def stop_after_turn_preparation(*args, **kwargs):
+        contract = kwargs["task_execution_contract"]
+        captured["contract"] = contract
+        assert contract.lane == NORMAL
+        assert contract.preflight_error == ""
+        assert contract.artifact_output_path == ""
+        raise RuntimeError("normal-turn-prepared")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", stop_after_turn_preparation)
+    agent = SimpleNamespace(platform="telegram", _task_execution_contract=None)
+
+    with pytest.raises(RuntimeError, match="normal-turn-prepared"):
+        conversation_loop.run_conversation(
+            agent,
+            "Create and deliver recovery.txt containing safe text.",
+            task_id="kill-switch-normal-turn",
+        )
+
+    assert captured["contract"].decision_reason == "artifact_only_disabled"
 
 
 def test_allocator_rejects_symlinked_artifact_root_even_inside_safe_root(
@@ -749,6 +953,328 @@ def test_normal_contract_does_not_restrict_tools_or_add_guidance():
 
     assert contract.before_tool("terminal", {"command": "true"}).allowed is True
     assert contract.system_guidance == ""
+
+
+def test_normal_contract_removes_expired_artifact_tool_trace_from_model_history(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    artifact_path = (
+        "/opt/data/hermes-artifacts/"
+        "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+    )
+    history = [
+        {"role": "user", "content": "Give me recovery.txt as a file."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "artifact-call",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps(
+                            {"path": artifact_path, "content": "payload"}
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "artifact-call",
+            "tool_name": "write_file",
+            "content": json.dumps({"resolved_path": artifact_path}),
+        },
+        {"role": "assistant", "content": f"MEDIA:{artifact_path}"},
+        {"role": "user", "content": "Now continue the tournament planning."},
+        {"role": "assistant", "content": "A normal planning response."},
+    ]
+    contract = _contract("Check the current runtime and fix what is broken.")
+
+    bounded = contract.bound_conversation_history(history)
+
+    assert [message["role"] for message in bounded] == ["user", "assistant"]
+    assert bounded[0] is history[4]
+    assert bounded[1] is history[5]
+    assert all(not _contains_path(message, artifact_path) for message in bounded)
+    assert "normal capabilities" in contract.system_guidance
+    assert "normal guarded file workflow and a new safe path" in contract.system_guidance
+    denied = contract.before_tool(
+        "write_file",
+        {"path": artifact_path, "content": "must not overwrite prior artifact"},
+    )
+    assert denied.allowed is False
+    assert denied.code == "expired_artifact_path_reuse"
+    assert contract.before_tool(
+        "write_file",
+        {"path": "/opt/data/new-normal-file.txt", "content": "safe"},
+    ).allowed is True
+
+
+def test_normal_history_filter_removes_stale_system_execution_contract(monkeypatch):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    history = [
+        {
+            "role": "system",
+            "content": (
+                "REQUEST EXECUTION CONTRACT (artifact_only, fail closed):\n"
+                "Use only the prior request-local artifact path."
+            ),
+        },
+        {"role": "user", "content": "Continue normal work."},
+    ]
+    contract = _contract("Continue normal work.")
+
+    assert contract.bound_conversation_history(history) == [
+        {"role": "user", "content": "Continue normal work."}
+    ]
+    assert "REQUEST RECOVERY NOTICE" in contract.system_guidance
+
+
+def test_normal_history_filter_supports_configured_root_and_tool_call_only(
+    monkeypatch, tmp_path
+):
+    configured_root = tmp_path / "configured-artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(configured_root))
+    artifact_path = str(
+        configured_root
+        / "68fc2177cc474858a2c9b998f3b8be6f"
+        / "recovery.txt"
+    )
+    history = [
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "artifact-call",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps(
+                            {"path": artifact_path, "content": "payload"}
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "artifact-call",
+            "tool_name": "write_file",
+            "content": json.dumps({"resolved_path": artifact_path}),
+        },
+    ]
+    contract = _contract("Continue normal work.")
+
+    assert contract.bound_conversation_history(history) == []
+    assert contract.references_expired_artifact({"path": artifact_path})
+    assert (
+        contract.before_tool(
+            "write_file", {"path": artifact_path, "content": "overwrite"}
+        ).code
+        == "expired_artifact_path_reuse"
+    )
+
+
+def test_normal_history_filter_supports_flat_persisted_tool_call_shape(
+    monkeypatch, tmp_path
+):
+    configured_root = tmp_path / "configured-artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(configured_root))
+    artifact_path = str(
+        configured_root
+        / "68fc2177cc474858a2c9b998f3b8be6f"
+        / "recovery.txt"
+    )
+    history = [
+        {"role": "user", "content": "Create recovery.txt."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "artifact-call",
+                    "name": "write_file",
+                    "arguments": {
+                        "path": artifact_path,
+                        "content": "payload",
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "artifact-call",
+            "name": "write_file",
+            "content": {"resolved_path": artifact_path},
+        },
+        {"role": "assistant", "content": f"MEDIA:{artifact_path}"},
+        {"role": "user", "content": "Continue normally."},
+    ]
+    contract = _contract("Continue normally.")
+
+    assert contract.bound_conversation_history(history) == [history[-1]]
+    assert contract.references_expired_artifact({"path": artifact_path})
+
+
+def test_unanchored_summary_that_mentions_artifact_path_is_preserved(
+    monkeypatch,
+):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    artifact_path = (
+        "/opt/data/hermes-artifacts/"
+        "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+    )
+    history = [
+        {
+            "role": "assistant",
+            "content": f"Compression summary: the old file was {artifact_path}.",
+        },
+        {"role": "user", "content": "Continue normally."},
+    ]
+    contract = _contract("Continue normally.")
+
+    bounded = contract.bound_conversation_history(history)
+
+    assert bounded[0] is history[0]
+    assert bounded[1] is history[1]
+    assert contract._expired_artifact_history_messages == 0
+
+
+def test_normal_history_filter_recognizes_artifact_from_previous_root(
+    monkeypatch, tmp_path
+):
+    old_root = tmp_path / "old-artifacts"
+    current_root = tmp_path / "current-artifacts"
+    artifact_path = str(
+        old_root
+        / "68fc2177cc474858a2c9b998f3b8be6f"
+        / "recovery.txt"
+    )
+    history = [
+        {"role": "user", "content": "Create recovery.txt."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "artifact-call",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps(
+                            {"path": artifact_path, "content": "payload"}
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "artifact-call",
+            "tool_name": "write_file",
+            "content": json.dumps({"resolved_path": artifact_path}),
+        },
+        {"role": "assistant", "content": f"MEDIA:{artifact_path}"},
+        {"role": "user", "content": "Continue normally."},
+    ]
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(current_root))
+    contract = _contract("Continue normally.")
+
+    bounded = contract.bound_conversation_history(history)
+
+    assert bounded == [history[-1]]
+    assert contract.references_expired_artifact({"path": artifact_path})
+    denied = contract.before_tool(
+        "write_file",
+        {"path": artifact_path, "content": "must not overwrite"},
+    )
+    assert denied.allowed is False
+    assert denied.code == "expired_artifact_path_reuse"
+
+
+def test_normal_user_path_outside_artifact_root_is_not_marked_expired(monkeypatch):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", "/opt/data")
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    ordinary_path = (
+        "/opt/data/projects/"
+        "68fc2177cc474858a2c9b998f3b8be6f/notes.txt"
+    )
+    history = [{"role": "user", "content": f"Review {ordinary_path} later."}]
+    contract = _contract("Continue normal work.")
+
+    bounded = contract.bound_conversation_history(history)
+
+    assert bounded[0] is history[0]
+    assert not contract.references_expired_artifact({"path": ordinary_path})
+    assert contract.before_tool(
+        "write_file", {"path": ordinary_path, "content": "normal"}
+    ).allowed
+
+
+def test_normal_history_filter_removes_complete_mixed_artifact_turn(
+    monkeypatch, tmp_path
+):
+    configured_root = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(configured_root))
+    artifact_path = str(
+        configured_root
+        / "68fc2177cc474858a2c9b998f3b8be6f"
+        / "recovery.txt"
+    )
+    history = [
+        {"role": "user", "content": "Create recovery.txt after reading the notes."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "artifact-call",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": json.dumps({"path": artifact_path, "content": "x"}),
+                    },
+                },
+                {
+                    "id": "read-call",
+                    "type": "function",
+                    "function": {
+                        "name": "read_file",
+                        "arguments": '{"path":"/opt/data/normal.txt"}',
+                    },
+                },
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "artifact-call",
+            "tool_name": "write_file",
+            "content": json.dumps({"resolved_path": artifact_path}),
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "read-call",
+            "tool_name": "read_file",
+            "content": "normal contents",
+        },
+    ]
+    contract = _contract("Continue normal work.")
+
+    bounded = contract.bound_conversation_history(history)
+
+    assert bounded == []
+
+
+def _contains_path(message, path):
+    return path in json.dumps(message, sort_keys=True)
 
 
 def test_guardrail_controller_blocks_without_halting_then_halts_on_budget():

@@ -7,6 +7,7 @@ Verifies that:
 4. The gateway doesn't double-write messages the agent already persisted
 """
 
+import json
 import os
 import tempfile
 from pathlib import Path
@@ -126,6 +127,188 @@ class TestFlushDeduplication:
 
                 rows = db.get_messages(agent.session_id)
                 assert len(rows) == 4, f"Expected 4 messages, got {len(rows)} (duplication bug!)"
+            finally:
+                db.close()
+
+    def test_sanitized_artifact_history_is_not_reappended(self):
+        """Gateway reuse plus filtering keeps durable message identities."""
+        from agent.task_execution_contract import build_task_execution_contract
+        from gateway.run import GatewayRunner
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            db_path = Path(tmpdir) / "test.db"
+            db = SessionDB(db_path=db_path)
+            try:
+                agent = self._make_agent(db)
+                artifact_path = (
+                    "/opt/data/hermes-artifacts/"
+                    "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+                )
+                history = [
+                    {"role": "user", "content": "Create recovery.txt and attach it."},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "artifact-call",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": (
+                                        '{"path":"' + artifact_path + '","content":"x"}'
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "artifact-call",
+                        "tool_name": "write_file",
+                        "content": '{"resolved_path":"' + artifact_path + '"}',
+                    },
+                    {"role": "assistant", "content": "MEDIA:" + artifact_path},
+                    {"role": "user", "content": "Safe prior question."},
+                    {"role": "assistant", "content": "Safe prior answer."},
+                ]
+                for message in history:
+                    db.append_message(
+                        agent.session_id,
+                        role=message["role"],
+                        content=message.get("content"),
+                        tool_name=message.get("tool_name"),
+                        tool_calls=message.get("tool_calls"),
+                        tool_call_id=message.get("tool_call_id"),
+                    )
+
+                stale_contract = build_task_execution_contract(
+                    "Return only a paste-ready prompt.",
+                    task_id="prior-artifact-mode",
+                    platform="telegram",
+                )
+                agent._task_execution_contract = stale_contract
+                GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=0)
+                assert stale_contract.active is False
+                assert agent._task_execution_contract is None
+
+                with patch.dict(
+                    os.environ,
+                    {"HERMES_ARTIFACT_ROOT": "/opt/data/hermes-artifacts"},
+                ):
+                    contract = build_task_execution_contract(
+                        "Continue normal work.",
+                        task_id="dedup-after-artifact",
+                        platform="telegram",
+                    )
+                    messages = contract.bound_conversation_history(history)
+
+                assert messages == history[4:]
+                assert messages[0] is history[4]
+                assert messages[1] is history[5]
+                messages.append({"role": "user", "content": "Continue normal work."})
+                agent._flush_messages_to_session_db(messages, history)
+
+                rows = db.get_messages(agent.session_id)
+                assert len(rows) == 7
+                assert rows[-1]["content"] == "Continue normal work."
+            finally:
+                db.close()
+
+    def test_sanitized_api_history_never_overwrites_enabled_json_snapshot(self):
+        """API-only elision must not erase durable optional JSON history."""
+        from agent.task_execution_contract import build_task_execution_contract
+        from hermes_state import SessionDB
+
+        with tempfile.TemporaryDirectory() as tmpdir:
+            root = Path(tmpdir)
+            db = SessionDB(db_path=root / "test.db")
+            try:
+                agent = self._make_agent(db)
+                agent._session_json_enabled = True
+                agent.logs_dir = root / "sessions"
+                agent.logs_dir.mkdir()
+                artifact_path = (
+                    "/opt/data/hermes-artifacts/"
+                    "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+                )
+                history = [
+                    {"role": "user", "content": "Create recovery.txt and attach it."},
+                    {
+                        "role": "assistant",
+                        "content": "",
+                        "tool_calls": [
+                            {
+                                "id": "artifact-call",
+                                "type": "function",
+                                "function": {
+                                    "name": "write_file",
+                                    "arguments": (
+                                        '{"path":"' + artifact_path + '","content":"x"}'
+                                    ),
+                                },
+                            }
+                        ],
+                    },
+                    {
+                        "role": "tool",
+                        "tool_call_id": "artifact-call",
+                        "tool_name": "write_file",
+                        "content": '{"resolved_path":"' + artifact_path + '"}',
+                    },
+                    {"role": "assistant", "content": "MEDIA:" + artifact_path},
+                    {"role": "user", "content": "Safe prior question."},
+                    {"role": "assistant", "content": "Safe prior answer."},
+                ]
+                for message in history:
+                    db.append_message(
+                        agent.session_id,
+                        role=message["role"],
+                        content=message.get("content"),
+                        tool_name=message.get("tool_name"),
+                        tool_calls=message.get("tool_calls"),
+                        tool_call_id=message.get("tool_call_id"),
+                    )
+
+                with patch.dict(
+                    os.environ,
+                    {"HERMES_ARTIFACT_ROOT": "/opt/data/hermes-artifacts"},
+                ):
+                    contract = build_task_execution_contract(
+                        "Continue normal work.",
+                        task_id="json-snapshot-after-artifact",
+                        platform="telegram",
+                    )
+                    messages = contract.bound_conversation_history(history)
+
+                assert messages == history[4:]
+                current_user = {"role": "user", "content": "Continue normal work."}
+                messages.append(current_user)
+                agent._session_log_durable_history = list(history)
+                agent._session_log_current_turn_user = current_user
+                agent._persist_user_message_idx = len(messages) - 1
+
+                for index in range(8):
+                    messages.append(
+                        {"role": "assistant", "content": f"current response {index}"}
+                    )
+                    agent._persist_session(messages, history)
+
+                snapshot_path = agent.logs_dir / f"session_{agent.session_id}.json"
+                snapshot = json.loads(snapshot_path.read_text(encoding="utf-8"))
+                contents = [message.get("content") for message in snapshot["messages"]]
+                assert snapshot["message_count"] == len(history) + 9
+                assert contents.count("Create recovery.txt and attach it.") == 1
+                assert contents.count("MEDIA:" + artifact_path) == 1
+                assert contents.count("Continue normal work.") == 1
+                assert contents[-1] == "current response 7"
+
+                rows = db.get_messages(agent.session_id)
+                assert len(rows) == len(history) + 9
+                assert sum(
+                    row["content"] == "Continue normal work." for row in rows
+                ) == 1
             finally:
                 db.close()
 

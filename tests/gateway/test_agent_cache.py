@@ -9,6 +9,7 @@ Verifies that the agent cache correctly:
 - Preserves frozen system prompt across turns
 """
 
+import os
 import threading
 from unittest.mock import MagicMock, patch
 
@@ -381,7 +382,10 @@ class TestExtractCacheBustingConfig:
         assert first["honcho.user_peer_aliases"] == [("123", "eri")]
         assert parse_calls == [config_path]
 
+        before_mtime_ns = config_path.stat().st_mtime_ns
         config_path.write_text("{\n  \"changed\": true\n}")
+        updated_mtime_ns = before_mtime_ns + 1_000_000_000
+        os.utime(config_path, ns=(updated_mtime_ns, updated_mtime_ns))
         third = GatewayRunner._extract_honcho_cache_busting_config()
 
         assert third == first
@@ -1579,6 +1583,104 @@ class TestCachedAgentInactivityReset:
         assert agent._last_activity_ts > old_ts, (
             "Stale idle time should be cleared so the new turn gets a fresh window"
         )
+
+    def test_fresh_turn_clears_request_local_execution_contract(self):
+        from agent.task_execution_contract import build_task_execution_contract
+        from gateway.run import GatewayRunner
+
+        agent = self._fake_agent()
+        agent._tool_guardrails = MagicMock()
+        stale = build_task_execution_contract(
+            "Return only one paste-ready prompt.",
+            task_id="cached-stale-contract",
+            platform="telegram",
+        )
+        agent._task_execution_contract = stale
+
+        with patch("gateway.run.time") as mock_time:
+            mock_time.time.return_value = _FAKE_NOW
+            GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=0)
+
+        assert stale.active is False
+        assert agent._task_execution_contract is None
+        agent._tool_guardrails.set_execution_contract.assert_called_once_with(None)
+
+    def test_fresh_turn_preserves_detached_contract_for_receipt_finalization(
+        self,
+        monkeypatch,
+        tmp_path,
+    ):
+        import json
+        from pathlib import Path
+
+        from agent.task_execution_contract import (
+            build_task_execution_contract,
+            finalize_detached_task_execution_contract,
+            record_artifact_dispatch,
+        )
+        from gateway.run import GatewayRunner
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        agent = self._fake_agent()
+        agent._tool_guardrails = MagicMock()
+        stale = build_task_execution_contract(
+            "Create cache-cleanup.txt",
+            task_id="cached-allocated-contract",
+            platform="telegram",
+        )
+        agent._task_execution_contract = stale
+        agent._tool_guardrails.set_execution_contract(stale)
+        agent._tool_guardrails.reset_mock()
+
+        detached = GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=0)
+
+        assert detached is stale
+        assert agent._task_execution_contract is None
+        allocated = json.loads(
+            Path(stale.artifact_receipt_path).read_text(encoding="utf-8")
+        )
+        assert allocated["state"] == "allocated"
+
+        finalize_detached_task_execution_contract(
+            detached,
+            error_code="artifact_contract_detached_on_cache_reuse",
+        )
+
+        terminal = json.loads(
+            Path(stale.artifact_receipt_path).read_text(encoding="utf-8")
+        )
+        assert terminal["state"] == "failed_preflight"
+        assert terminal["error_code"] == "artifact_contract_detached_on_cache_reuse"
+        assert record_artifact_dispatch(stale.artifact_output_path, state="delivered") is None
+        assert not Path(stale.artifact_root).exists()
+
+    def test_fresh_turn_forcibly_clears_contract_if_cleanup_raises(self):
+        from agent.task_execution_contract import build_task_execution_contract
+        from gateway.run import GatewayRunner
+
+        agent = self._fake_agent()
+        agent._tool_guardrails = MagicMock()
+        stale = build_task_execution_contract(
+            "Return only one paste-ready prompt.",
+            task_id="cached-cleanup-error",
+            platform="telegram",
+        )
+        agent._task_execution_contract = stale
+
+        with (
+            patch(
+                "agent.task_execution_contract.detach_task_execution_contract",
+                side_effect=RuntimeError("receipt unavailable"),
+            ),
+            patch("gateway.run.time") as mock_time,
+        ):
+            mock_time.time.return_value = _FAKE_NOW
+            GatewayRunner._init_cached_agent_for_turn(agent, interrupt_depth=0)
+
+        assert stale.active is False
+        assert agent._task_execution_contract is None
+        agent._tool_guardrails.set_execution_contract.assert_called_once_with(None)
 
     def test_fresh_turn_resets_desc(self):
         """interrupt_depth=0: description is updated to reflect the new turn."""

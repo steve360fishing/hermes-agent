@@ -292,8 +292,25 @@ def build_turn_context(
         _msg_preview,
     )
 
-    # Initialize conversation (copy to avoid mutating the caller's list).
+    # Keep the API-bound view separate from the durable transcript. Normal
+    # recovery can elide an expired artifact turn, and artifact-only mode can
+    # bound prior context, but neither operation may rewrite session snapshots.
+    agent._session_log_durable_history = None
+    agent._session_log_current_turn_user = None
     messages = task_execution_contract.bound_conversation_history(conversation_history)
+    if task_execution_contract._expired_artifact_history_messages:
+        logger.info(
+            "artifact history elided: session=%s correlation_id=%s lane=%s removed=%d",
+            agent.session_id or "none",
+            task_execution_contract.correlation_id,
+            task_execution_contract.lane,
+            task_execution_contract._expired_artifact_history_messages,
+        )
+    if (
+        task_execution_contract.lane == ARTIFACT_ONLY
+        or task_execution_contract._expired_artifact_history_messages
+    ):
+        agent._session_log_durable_history = list(conversation_history or [])
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():
@@ -341,6 +358,8 @@ def build_turn_context(
     # Add user message.
     user_msg = {"role": "user", "content": user_message}
     messages.append(user_msg)
+    if agent._session_log_durable_history is not None:
+        agent._session_log_current_turn_user = user_msg
     current_turn_user_idx = len(messages) - 1
     agent._persist_user_message_idx = current_turn_user_idx
 
