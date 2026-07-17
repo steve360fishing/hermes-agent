@@ -358,7 +358,7 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    command_lc = command.lower()
+    command_lc = command.replace("\\", "/").lower()
     profile_name = _profile_name_for_home(profile_home)
     home_lc = str(profile_home).replace("\\", "/").lower()
 
@@ -805,6 +805,8 @@ def write_runtime_status(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    readiness: Any = _UNSET,
+    readiness_diagnostic: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -830,6 +832,10 @@ def write_runtime_status(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if readiness is not _UNSET:
+        payload["readiness"] = readiness
+    if readiness_diagnostic is not _UNSET:
+        payload["readiness_diagnostic"] = readiness_diagnostic
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})
@@ -872,8 +878,15 @@ def record_profile_reconciliation_failure(reason: str) -> None:
     _write_json_file(path, payload)
 
 
-def safe_mode_transport_readiness() -> dict[str, str]:
-    """Readiness payload for safe mode until the recovery transport is wired."""
+def safe_mode_transport_readiness(
+    *, telegram_connected: bool = False
+) -> dict[str, str]:
+    """Return truthful readiness for the bundled safe-mode Telegram transport."""
+    if telegram_connected:
+        return {
+            "readiness": "ready",
+            "readiness_diagnostic": "safe_mode_telegram_ready",
+        }
     return {
         "readiness": "degraded",
         "readiness_diagnostic": "safe_mode_transport_not_wired",

@@ -601,6 +601,7 @@ def run_conversation(
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,
+        platform=getattr(agent, "platform", None),
     )
     if _prebuilt_task_contract.preflight_error:
         _preflight_response = (

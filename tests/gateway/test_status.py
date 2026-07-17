@@ -29,6 +29,33 @@ def test_safe_mode_transport_gap_has_a_degraded_readiness_contract() -> None:
     }
 
 
+def test_safe_mode_transport_reports_ready_only_when_telegram_connected() -> None:
+    assert status.safe_mode_transport_readiness(telegram_connected=True) == {
+        "readiness": "ready",
+        "readiness_diagnostic": "safe_mode_telegram_ready",
+    }
+
+
+def test_runtime_status_persists_safe_mode_readiness(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_HOME", str(tmp_path))
+    status.write_runtime_status(
+        gateway_state="running",
+        readiness="ready",
+        readiness_diagnostic="safe_mode_telegram_ready",
+    )
+
+    payload = status.read_runtime_status()
+    assert payload["readiness"] == "ready"
+    assert payload["readiness_diagnostic"] == "safe_mode_telegram_ready"
+
+
+def test_windows_explicit_hermes_home_matches_profile_command() -> None:
+    assert status._command_line_belongs_to_profile(
+        r"HERMES_HOME=C:\Users\steve\.hermes hermes gateway run",
+        Path(r"C:\Users\steve\.hermes"),
+    )
+
+
 class TestGatewayPidState:
     def test_write_pid_file_records_gateway_metadata(self, tmp_path, monkeypatch):
         monkeypatch.setenv("HERMES_HOME", str(tmp_path))

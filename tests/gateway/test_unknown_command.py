@@ -204,6 +204,30 @@ async def test_command_hook_can_deny_before_dispatch(monkeypatch):
 
 
 @pytest.mark.asyncio
+async def test_recovery_floor_new_command_bypasses_plugin_decision_hook(monkeypatch):
+    """A plugin cannot trap an authenticated operator out of /new recovery."""
+    import gateway.run as gateway_run
+
+    runner = _make_runner()
+    runner._handle_reset_command = AsyncMock(return_value="New session started")
+    runner.hooks.emit_collect = AsyncMock(
+        return_value=[{"decision": "deny", "message": "plugin lockout"}]
+    )
+
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+
+    result = await runner._handle_message(_make_event("/new"))
+
+    assert result is not None
+    assert "plugin lockout" not in result
+    assert "Confirm /new" in result
+    runner._handle_reset_command.assert_not_awaited()
+    runner.hooks.emit_collect.assert_not_awaited()
+
+
+@pytest.mark.asyncio
 async def test_command_hook_deny_without_message_uses_default(monkeypatch):
     """A deny decision with no message falls back to a generic blocked string."""
     import gateway.run as gateway_run

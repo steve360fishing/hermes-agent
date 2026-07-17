@@ -191,6 +191,24 @@
       "rationale": "allocation boundary for the artifact delivery contract."
     },
     {
+      "id": "agent/task_execution_contract.py:_write_artifact_receipt",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_write_artifact_receipt",
+      "disposition": "covered",
+      "rationale": "delivery receipt state is part of the artifact delivery contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:record_artifact_written",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "record_artifact_written",
+      "disposition": "covered",
+      "rationale": "artifact byte verification advances the delivery lifecycle."
+    },
+    {
       "id": "agent/task_execution_contract.py:build_task_execution_contract",
       "contract": "artifact_delivery",
       "role": "allocation",
@@ -630,6 +648,15 @@
       "symbol": "GatewayRunner._deliver_media_from_response",
       "disposition": "covered",
       "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._deliver_media_from_response._deliver_document",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._deliver_media_from_response._deliver_document",
+      "disposition": "covered",
+      "rationale": "document dispatch and receipt updates are reviewed as one delivery boundary."
     },
     {
       "id": "gateway/run.py:GatewayRunner._run_background_task",
@@ -1926,6 +1953,15 @@
       "symbol": "restore_primary_runtime",
       "disposition": "covered",
       "rationale": "recovery boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/agent_runtime_helpers.py:fallback_cap_message_after_primary_eligibility",
+      "contract": "incident_fallback",
+      "role": "recovery",
+      "path": "agent/agent_runtime_helpers.py",
+      "symbol": "fallback_cap_message_after_primary_eligibility",
+      "disposition": "covered",
+      "rationale": "primary-route recovery is rechecked before retaining a fallback cap."
     },
     {
       "id": "agent/agent_runtime_helpers.py:switch_model",

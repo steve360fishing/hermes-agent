@@ -233,4 +233,4 @@ def test_runtime_integration_points_remain_wired() -> None:
     assert "record_openrouter_fallback_activation" in chat_helpers
     assert "is_emergency_openrouter_fallback_active" in turn_finalizer
     assert "apply_openrouter_fallback_notice" in gateway
-    assert "fallback_cap_message_if_exhausted" in gateway
+    assert "fallback_cap_message_after_primary_eligibility" in gateway

@@ -70,6 +70,18 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_MODEL_FREE_RECOVERY_COMMANDS = frozenset({"new", "reset", "stop"})
+
+
+def _is_model_free_recovery_command(event: Any) -> bool:
+    """Keep reset/stop controls reachable even when a plugin is unhealthy."""
+    try:
+        command = event.get_command()
+    except Exception:
+        return False
+    return str(command or "").strip().lower().replace("_", "-") in (
+        _MODEL_FREE_RECOVERY_COMMANDS
+    )
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -7252,6 +7264,27 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        if os.getenv("HERMES_SAFE_MODE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            try:
+                from gateway.status import (
+                    safe_mode_transport_readiness,
+                    write_runtime_status,
+                )
+
+                telegram_adapter = self.adapters.get(Platform.TELEGRAM)
+                readiness = safe_mode_transport_readiness(
+                    telegram_connected=bool(
+                        telegram_adapter and telegram_adapter.is_connected
+                    )
+                )
+                write_runtime_status(**readiness)
+            except Exception:
+                logger.warning(
+                    "Safe mode transport readiness could not be published",
+                    exc_info=True,
+                )
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -8685,6 +8718,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(self.config, "thread_sessions_per_user", False),
             )
 
+        safe_mode = os.getenv("HERMES_SAFE_MODE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if safe_mode:
+            if platform != Platform.TELEGRAM:
+                logger.info(
+                    "Safe mode skipped non-recovery platform: %s", platform.value
+                )
+                return None
+            from plugins.platforms.telegram import adapter as telegram_adapter
+
+            if not telegram_adapter.check_telegram_requirements():
+                logger.error("Safe mode Telegram recovery transport is unavailable")
+                return None
+            return telegram_adapter._build_adapter(config)
+
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:
             from gateway.platform_registry import platform_registry
@@ -8902,7 +8951,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (background-process completions, startup-restore replays) are NOT
         # traffic — counting them would keep a genuinely idle gateway awake. This
         # clock is what the idle predicate (gateway/scale_to_zero.is_idle) reads.
-        if not is_internal:
+        if not is_internal and not _is_model_free_recovery_command(event):
             self._scale_to_zero_note_real_inbound()
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
@@ -8912,7 +8961,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
+        if not is_internal and not _is_model_free_recovery_command(event):
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -9660,7 +9709,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the previous fire-and-forget emit(): return values are now
         # honored, but handlers that return nothing behave exactly as
         # before (telemetry-style hooks keep working).
-        if command and is_gateway_known_command(canonical):
+        if (
+            command
+            and is_gateway_known_command(canonical)
+            and canonical not in _MODEL_FREE_RECOVERY_COMMANDS
+        ):
             raw_args = event.get_command_args().strip()
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -18864,11 +18917,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 try:
-                    from agent.openrouter_fallback_guard import (
-                        fallback_cap_message_if_exhausted,
+                    from agent.agent_runtime_helpers import (
+                        fallback_cap_message_after_primary_eligibility,
                     )
 
-                    fallback_cap_message = fallback_cap_message_if_exhausted(agent)
+                    fallback_cap_message = fallback_cap_message_after_primary_eligibility(
+                        agent
+                    )
                 except Exception:
                     fallback_cap_message = None
                 if fallback_cap_message:

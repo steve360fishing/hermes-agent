@@ -4020,6 +4020,33 @@ class TestRunConversation:
         assert agent._task_execution_contract is None
         assert agent._tool_guardrails._execution_contract is None
 
+    def test_artifact_preflight_uses_active_platform_delivery_capability(
+        self, agent, tmp_path
+    ):
+        self._setup_agent(agent)
+        agent.platform = "unsupported-platform"
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_WRITE_SAFE_ROOT": str(tmp_path),
+                    "HERMES_ARTIFACT_ROOT": str(tmp_path / "artifacts"),
+                },
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Give me example.txt as a file.")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert result["turn_exit_reason"] == "artifact_output_preflight_failed"
+        assert not agent.client.chat.completions.create.called
+        assert agent._task_execution_contract is None
+        assert agent._tool_guardrails._execution_contract is None
+
     def test_turn_setup_exception_clears_request_local_contract(self, agent):
         from agent.task_execution_contract import build_task_execution_contract
 

@@ -177,3 +177,28 @@ async def test_internal_events_bypass_hook(monkeypatch):
     # Even though the hook would say skip, internal events bypass it.
     await runner._handle_message(event)
     assert called["count"] == 0
+
+
+@pytest.mark.asyncio
+async def test_new_recovery_command_bypasses_pre_dispatch_plugin(monkeypatch):
+    """The pre-auth hook cannot suppress an authenticated operator's /new."""
+    _clear_auth_env(monkeypatch)
+    monkeypatch.setenv("WHATSAPP_ALLOWED_USERS", "*")
+    called = []
+
+    def _fake_hook(name, **kwargs):
+        called.append(name)
+        return [{"action": "skip", "reason": "plugin-lockout"}]
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", _fake_hook)
+
+    runner, _adapter = _make_runner(Platform.WHATSAPP)
+    runner.hooks = SimpleNamespace(emit_collect=AsyncMock(return_value=[]))
+    runner._handle_reset_command = AsyncMock(return_value="New session started")
+
+    result = await runner._handle_message(_make_event("/new"))
+
+    assert result is not None
+    assert "Confirm /new" in result
+    assert "pre_gateway_dispatch" not in called
+    runner._handle_reset_command.assert_not_awaited()
