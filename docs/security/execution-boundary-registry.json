@@ -2363,6 +2363,33 @@
       "rationale": "Inbound polling updates supply the evidence required to leave recovering readiness."
     },
     {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter._schedule_polling_recovery",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter._schedule_polling_recovery",
+      "disposition": "covered",
+      "rationale": "Scheduling recovery clears stale receive evidence before the retry task can report readiness."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter._start_polling_resilient",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter._start_polling_resilient",
+      "disposition": "covered",
+      "rationale": "Every polling start clears prior receive evidence until a new receive cycle completes."
+    },
+    {
+      "id": "plugins/platforms/telegram/adapter.py:TelegramAdapter._handle_polling_network_error",
+      "contract": "safe_mode",
+      "role": "enforcement",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "TelegramAdapter._handle_polling_network_error",
+      "disposition": "covered",
+      "rationale": "Network recovery clears stale receive evidence before reconnect handling begins."
+    },
+    {
       "id": "hermes_cli/main.py:_apply_safe_mode",
       "contract": "safe_mode",
       "role": "decision",
@@ -2552,7 +2579,7 @@
       "id": "gateway/run.py:GatewayRunner.start", "contract": "safe_mode", "role": "lifecycle", "path": "gateway/run.py", "symbol": "GatewayRunner.start", "disposition": "covered", "rationale": "Gateway startup computes and records recovery-transport readiness for the active safe-mode lifecycle."
     },
     {
-      "id": "gateway/status.py:safe_mode_transport_readiness", "contract": "safe_mode", "role": "enforcement", "path": "gateway/status.py", "symbol": "safe_mode_transport_readiness", "disposition": "covered", "rationale": "This readiness boundary reports safe mode ready only after the bundled Telegram recovery transport is connected."
+      "id": "gateway/status.py:safe_mode_transport_readiness", "contract": "safe_mode", "role": "enforcement", "path": "gateway/status.py", "symbol": "safe_mode_transport_readiness", "disposition": "covered", "rationale": "This readiness boundary reports safe mode ready only after the bundled Telegram recovery transport is connected and has current receive-path evidence."
     }
   ]
 }

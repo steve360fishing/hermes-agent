@@ -155,13 +155,17 @@ async def test_initial_start_polling_does_not_write_false_green():
     adapter = TelegramAdapter.__new__(TelegramAdapter)
     adapter._app = MagicMock()
     adapter._app.updater.start_polling = AsyncMock(return_value=None)
+    adapter._polling_receive_evidence = True
     adapter._record_polling_liveness = MagicMock()
+    adapter._publish_safe_mode_receive_readiness = MagicMock()
 
     assert await adapter._start_polling_resilient(
         drop_pending_updates=False, error_callback=None
     )
 
     adapter._record_polling_liveness.assert_not_called()
+    assert adapter._polling_receive_evidence is False
+    adapter._publish_safe_mode_receive_readiness.assert_called_once_with()
 
 
 @pytest.mark.asyncio

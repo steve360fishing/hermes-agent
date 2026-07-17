@@ -2076,6 +2076,8 @@ class TelegramAdapter(BasePlatformAdapter):
         adapter: the gateway process stays alive and the existing reconnect
         ladder (``_handle_polling_network_error``) recovers in the background.
         """
+        self._polling_receive_evidence = False
+        self._publish_safe_mode_receive_readiness()
         if self.has_fatal_error:
             return
         if self._polling_error_task and not self._polling_error_task.done():
@@ -2129,6 +2131,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not (self._app and self._app.updater):
             raise RuntimeError("Telegram application/updater not initialized")
+        self._polling_receive_evidence = False
+        self._publish_safe_mode_receive_readiness()
         try:
             # Same watchdog bound as the reconnect ladders: a wedged httpx
             # connection pool can hang start_polling() forever at bootstrap
@@ -2174,6 +2178,8 @@ class TelegramAdapter(BasePlatformAdapter):
         MAX_NETWORK_RETRIES attempts, then mark the adapter retryable-fatal so
         the supervisor restarts the gateway process.
         """
+        self._polling_receive_evidence = False
+        self._publish_safe_mode_receive_readiness()
         if self.has_fatal_error:
             return
 
