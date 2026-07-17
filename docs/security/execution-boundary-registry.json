@@ -2466,6 +2466,24 @@
     },
     {
       "id": "run_agent.py:AIAgent._needs_thinking_reasoning_pad", "contract": "incident_fallback", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent._needs_thinking_reasoning_pad", "disposition": "reviewed_exclusion", "rationale": "Fallback token is used only to shape reasoning metadata, not provider activation."
+    },
+    {
+      "id": "cli.py:load_cli_config", "contract": "safe_mode", "role": "enforcement", "path": "cli.py", "symbol": "load_cli_config", "disposition": "covered", "rationale": "Safe mode bypasses both user and project behavioral configuration before CLI defaults are resolved."
+    },
+    {
+      "id": "cli.py:main", "contract": "safe_mode", "role": "lifecycle", "path": "cli.py", "symbol": "main", "disposition": "covered", "rationale": "The CLI entrypoint owns safe-mode startup and cleanup for the request lifecycle."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner", "contract": "safe_mode", "role": "lifecycle", "path": "gateway/run.py", "symbol": "GatewayRunner", "disposition": "reviewed_exclusion", "rationale": "The class container inherits safe-mode matches from concrete startup and adapter-construction methods registered separately."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._create_adapter", "contract": "safe_mode", "role": "enforcement", "path": "gateway/run.py", "symbol": "GatewayRunner._create_adapter", "disposition": "covered", "rationale": "Safe mode permits only the bundled Telegram recovery adapter and rejects every other platform."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner.start", "contract": "safe_mode", "role": "lifecycle", "path": "gateway/run.py", "symbol": "GatewayRunner.start", "disposition": "covered", "rationale": "Gateway startup computes and records recovery-transport readiness for the active safe-mode lifecycle."
+    },
+    {
+      "id": "gateway/status.py:safe_mode_transport_readiness", "contract": "safe_mode", "role": "enforcement", "path": "gateway/status.py", "symbol": "safe_mode_transport_readiness", "disposition": "covered", "rationale": "This readiness boundary reports safe mode ready only after the bundled Telegram recovery transport is connected."
     }
   ]
 }
