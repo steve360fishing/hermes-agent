@@ -8,8 +8,10 @@ for must still be returned.  Previously any of those raised straight out of
 traceback and lost the whole turn.
 """
 
-import pytest
 import os
+import json
+from pathlib import Path
+import pytest
 from unittest.mock import patch
 
 from agent.turn_finalizer import finalize_turn
@@ -126,6 +128,7 @@ def _run(
     final_response=None,
     api_call_count=3,
     turn_exit_reason="unknown",
+    interrupted=False,
 ):
     messages = [
         {"role": "user", "content": "do a thing"},
@@ -142,7 +145,7 @@ def _run(
         agent,
         final_response=final_response,
         api_call_count=api_call_count,
-        interrupted=False,
+        interrupted=interrupted,
         failed=False,
         messages=messages,
         conversation_history=None,
@@ -274,6 +277,7 @@ def test_successful_artifact_write_forces_exact_media_delivery_response(
     contract = build_task_execution_contract(
         "Create and deliver example.txt containing the supplied copy.",
         task_id="artifact-delivery",
+        platform="telegram",
     )
     with open(contract.artifact_output_path, "wb") as artifact:
         artifact.write(b"exact bytes\n")
@@ -290,6 +294,56 @@ def test_successful_artifact_write_forces_exact_media_delivery_response(
 
     assert result["final_response"] == f"MEDIA:{contract.artifact_output_path}"
     assert agent._task_execution_contract is None
+
+
+def test_successful_artifact_write_creates_non_secret_written_receipt(monkeypatch, tmp_path):
+    agent = _StubAgent(raise_in=())
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = build_task_execution_contract(
+        "Create and deliver example.txt containing the supplied copy.",
+        task_id="artifact-receipt",
+        platform="telegram",
+    )
+    Path(contract.artifact_output_path).write_bytes(b"exact bytes\n")
+    agent._task_execution_contract = contract
+    agent._tool_guardrails.set_execution_contract(contract)
+    agent._turn_file_mutation_paths = {contract.artifact_output_path}
+
+    _run(agent, final_response="done", api_call_count=1)
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "written"
+    assert receipt["bytes"] == len(b"exact bytes\n")
+    assert receipt["sha256"]
+    assert "content" not in receipt
+    assert "chat_id" not in receipt
+
+
+def test_cancelled_artifact_turn_cleans_registry_and_transient_directory(monkeypatch, tmp_path):
+    from agent.task_execution_contract import _ARTIFACT_RECEIPTS, record_artifact_written
+
+    agent = _StubAgent(raise_in=())
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = build_task_execution_contract(
+        "Create and deliver example.txt containing the supplied copy.",
+        task_id="artifact-cancelled",
+        platform="telegram",
+    )
+    Path(contract.artifact_output_path).write_bytes(b"partial")
+    assert record_artifact_written(contract) is True
+    agent._task_execution_contract = contract
+    agent._tool_guardrails.set_execution_contract(contract)
+    agent._turn_file_mutation_paths = {contract.artifact_output_path}
+
+    _run(agent, final_response=None, api_call_count=1, interrupted=True)
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "failed_preflight"
+    assert receipt["error_code"] == "artifact_turn_cancelled"
+    assert os.path.abspath(contract.artifact_output_path) not in _ARTIFACT_RECEIPTS
+    assert not Path(contract.artifact_root).exists()
 
 
 def test_artifact_contract_suppresses_background_skill_review():

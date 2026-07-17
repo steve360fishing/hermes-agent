@@ -63,7 +63,7 @@ docker --version && docker compose version
 | 查看日志（跟踪） | `docker logs --tail 50 -f NAME` |
 | 进入容器 Shell | `docker exec -it NAME /bin/sh` |
 | 列出所有容器 | `docker ps -a` |
-| 构建镜像 | `docker build -t TAG .` |
+| 构建镜像 | `docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t TAG .` |
 | Compose 启动 | `docker compose up -d` |
 | Compose 停止 | `docker compose down` |
 | 磁盘使用情况 | `docker system df` |
@@ -140,10 +140,11 @@ docker top NAME                        # 运行中的进程
 
 ```bash
 # 构建
-docker build -t my-app:latest .
+# Hermes 根 Dockerfile 需要不可变的源代码来源：
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-app:latest .
 docker build -t my-app:prod -f Dockerfile.prod .
-docker build --no-cache -t my-app .              # 全量重新构建
-DOCKER_BUILDKIT=1 docker build -t my-app .       # 使用 BuildKit 加速
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" --no-cache -t my-app .  # 全量重新构建
+DOCKER_BUILDKIT=1 docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-app .  # 使用 BuildKit 加速
 
 # 拉取与推送
 docker pull node:20-alpine

@@ -358,9 +358,9 @@ def _command_line_belongs_to_profile(command: str, profile_home: Path) -> bool:
     explicit ``HERMES_HOME=<path>``) on its argv; the default/root gateway runs
     bare with no profile flag.
     """
-    command_lc = command.lower()
+    command_lc = command.replace("\\", "/").lower()
     profile_name = _profile_name_for_home(profile_home)
-    home_lc = str(profile_home).lower()
+    home_lc = str(profile_home).replace("\\", "/").lower()
 
     if profile_name is not None and profile_name != "default":
         profile_lc = profile_name.lower()
@@ -805,6 +805,8 @@ def write_runtime_status(
     error_code: Any = _UNSET,
     error_message: Any = _UNSET,
     served_profiles: Any = _UNSET,
+    readiness: Any = _UNSET,
+    readiness_diagnostic: Any = _UNSET,
 ) -> None:
     """Persist gateway runtime health information for diagnostics/status."""
     path = _get_runtime_status_path()
@@ -830,6 +832,10 @@ def write_runtime_status(
         # for a single-profile gateway. Lets `hermes status` show per-profile
         # coverage without a second probe.
         payload["served_profiles"] = list(served_profiles or [])
+    if readiness is not _UNSET:
+        payload["readiness"] = readiness
+    if readiness_diagnostic is not _UNSET:
+        payload["readiness_diagnostic"] = readiness_diagnostic
 
     if platform is not _UNSET:
         platform_payload = payload["platforms"].get(platform, {})
@@ -854,6 +860,42 @@ def read_runtime_status(path: Optional[Path] = None) -> Optional[dict[str, Any]]
     the active profile's ``gateway_state.json``.
     """
     return _read_json_file(path or _get_runtime_status_path())
+
+
+def record_profile_reconciliation_failure(reason: str) -> None:
+    """Persist a safe readiness diagnostic without taking down recovery paths."""
+    code = "".join(ch for ch in str(reason).lower() if ch.isalnum() or ch == "_")
+    code = code or "unavailable"
+    write_runtime_status(
+        gateway_state="starting",
+        error_code="profile_reconciliation_failed",
+        error_message="Profile reconciliation is unavailable; recovery transport may be unavailable.",
+    )
+    path = _get_runtime_status_path()
+    payload = _read_json_file(path) or _build_runtime_status_record()
+    payload["readiness"] = "degraded"
+    payload["readiness_diagnostic"] = f"profile_reconciliation_{code}"
+    _write_json_file(path, payload)
+
+
+def safe_mode_transport_readiness(
+    *, telegram_connected: bool = False, telegram_receive_healthy: bool = False
+) -> dict[str, str]:
+    """Return truthful readiness for the bundled safe-mode Telegram transport."""
+    if telegram_connected and telegram_receive_healthy:
+        return {
+            "readiness": "ready",
+            "readiness_diagnostic": "safe_mode_telegram_ready",
+        }
+    if telegram_connected:
+        return {
+            "readiness": "degraded",
+            "readiness_diagnostic": "safe_mode_telegram_recovering",
+        }
+    return {
+        "readiness": "degraded",
+        "readiness_diagnostic": "safe_mode_transport_not_wired",
+    }
 
 
 def parse_active_agents(raw: Any) -> int:

@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -8,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _resolve_cron_disabled_toolsets, _merge_mcp_into_per_job_toolsets, _run_agent_with_inactivity_timeout
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -75,6 +76,69 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+    def test_platform_resolution_error_returns_immutable_empty_allowlist(self):
+        with patch("hermes_cli.tools_config._get_platform_tools", side_effect=RuntimeError("broken config")):
+            result = _resolve_cron_enabled_toolsets({"enabled_toolsets": None}, self.CFG)
+
+        assert result == ()
+        assert isinstance(result, tuple)
+
+
+class TestCronInactivityQuarantine:
+    def test_timeout_waits_for_worker_exit_before_releasing_control(self):
+        started = __import__("threading").Event()
+        release = __import__("threading").Event()
+
+        class UncooperativeAgent:
+            def run_conversation(self, _prompt):
+                started.set()
+                release.wait(timeout=5)
+                return {"final_response": "late"}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 10, "last_activity_desc": "stuck"}
+
+            def interrupt(self, _reason):
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+            timed_out = caller.submit(
+                _run_agent_with_inactivity_timeout,
+                UncooperativeAgent(),
+                "prompt",
+                0.01,
+                0.005,
+            )
+            assert started.wait(timeout=1)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                timed_out.result(timeout=0.05)
+            release.set()
+            with pytest.raises(TimeoutError, match="idle for"):
+                timed_out.result(timeout=1)
+
+
+class TestCronToolsetValidation:
+    @pytest.mark.parametrize("invalid", ["web", {"web": True}, ["web", 1], ["web", ""]])
+    def test_invalid_job_enabled_toolsets_fail_closed(self, invalid):
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": invalid}, {}) == ()
+
+    @pytest.mark.parametrize("invalid", ["terminal", {"terminal": True}, ["terminal", 1], ["terminal", ""]])
+    def test_invalid_managed_disabled_toolsets_fail_closed(self, invalid):
+        cfg = {"agent": {"disabled_toolsets": invalid}}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
+        assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
+
+    @pytest.mark.parametrize("invalid", ["web", {"web": True}, ["web", 1], ["web", ""]])
+    def test_invalid_platform_cron_toolsets_fail_closed(self, invalid):
+        cfg = {"platform_toolsets": {"cron": invalid}}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
+        assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
+
+    def test_invalid_managed_overlay_object_fails_closed(self):
+        cfg = {"agent": ["not-a-mapping"]}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
+        assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
 
 
 class TestResolveOrigin:
@@ -1252,6 +1316,101 @@ class TestRunJobSessionPersistence:
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
 
+    def test_managed_overlay_error_stops_before_provider_mcp_or_agent(self, tmp_path):
+        job = {
+            "id": "managed-overlay-error",
+            "name": "managed overlay error",
+            "prompt": "hello",
+            "model": "test/model",
+        }
+        provider = MagicMock()
+        discover_mcp = MagicMock()
+        overlay = MagicMock(side_effect=RuntimeError("managed policy unreadable"))
+        extra = (
+            patch("hermes_cli.managed_scope.apply_managed_overlay_strict", new=overlay),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", new=provider),
+            patch("tools.mcp_tool.discover_mcp_tools", new=discover_mcp),
+        )
+
+        with self._run_job_patches(tmp_path, extra=extra) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "config.yaml could not be loaded" in (error or "")
+        overlay.assert_called_once()
+        provider.assert_not_called()
+        discover_mcp.assert_not_called()
+        mock_agent_cls.assert_not_called()
+
+    @pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n", "null\n"])
+    def test_non_mapping_managed_root_stops_before_provider_mcp_or_agent(
+        self, tmp_path, monkeypatch, body,
+    ):
+        job = {
+            "id": "managed-overlay-non-mapping",
+            "name": "managed overlay non-mapping",
+            "prompt": "hello",
+            "model": "test/model",
+        }
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(body, encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+
+        from hermes_cli import managed_scope
+
+        managed_scope.invalidate_managed_cache()
+        provider = MagicMock()
+        discover_mcp = MagicMock()
+        extra = (
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", new=provider),
+            patch("tools.mcp_tool.discover_mcp_tools", new=discover_mcp),
+        )
+
+        with self._run_job_patches(tmp_path, extra=extra) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "config.yaml could not be loaded" in (error or "")
+        provider.assert_not_called()
+        discover_mcp.assert_not_called()
+        mock_agent_cls.assert_not_called()
+
+    def test_empty_cron_authority_stays_toolless_with_inherited_kanban_task(
+        self, tmp_path, monkeypatch,
+    ):
+        (tmp_path / "config.yaml").write_text(
+            "platform_toolsets:\n  cron: web\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "inherited-parent-task")
+        job = {
+            "id": "fail-closed-kanban",
+            "name": "fail closed kanban",
+            "prompt": "hello",
+            "model": "test/model",
+        }
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True, error
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ()
+
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+        _clear_tool_defs_cache()
+        try:
+            tools = get_tool_definitions(
+                enabled_toolsets=kwargs["enabled_toolsets"],
+                disabled_toolsets=kwargs["disabled_toolsets"],
+                quiet_mode=True,
+            )
+        finally:
+            _clear_tool_defs_cache()
+        assert tools == []
+
     def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
         """agent.disabled_toolsets must be honoured in cron — issue #25752.
 
@@ -2195,8 +2354,8 @@ class TestRunJobModelResolution:
         assert error is None
         assert mock_agent_cls.call_args.kwargs["model"] == "alias-key-model"
 
-    def test_corrupt_config_yaml_does_not_crash_with_job_model(self, tmp_path, monkeypatch):
-        """A malformed config.yaml degrades gracefully when the job has a model."""
+    def test_corrupt_config_yaml_blocks_execution_even_with_job_model(self, tmp_path, monkeypatch):
+        """A malformed config cannot widen cron authority through a job override."""
         (tmp_path / "config.yaml").write_text("{{{invalid yaml!!!")
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
@@ -2216,10 +2375,9 @@ class TestRunJobModelResolution:
             mock_agent_cls.return_value = mock_agent
             success, _, _, error = run_job(job)
 
-        # Explicit job model survives the corrupt-config fall-through.
-        assert success is True
-        assert error is None
-        assert mock_agent_cls.call_args.kwargs["model"] == "explicit-model"
+        assert success is False
+        assert "config.yaml" in error
+        mock_agent_cls.assert_not_called()
 
 
 class TestRunJobSkillBacked:
@@ -4805,6 +4963,12 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             mock_pool.submit.return_value = fail_future
 
             result = _deliver_result(job, "Report content")
+
+            # The mocked executor never consumes the fallback coroutine.
+            # Close each submitted coroutine so this test has no hidden async
+            # survivor or unawaited-coroutine warning.
+            for call in mock_pool.submit.call_args_list:
+                call.args[1].close()
 
         assert result is not None
         assert "a@example.com" in result

@@ -67,3 +67,43 @@ def test_overlay_user_envref_cannot_shadow_managed_literal(managed, monkeypatch)
     _write(managed, "model:\n  default: managed/locked\n")
     out = managed_scope.apply_managed_overlay({"model": {"default": "${EVIL}"}})
     assert out["model"]["default"] == "managed/locked"
+
+
+def test_strict_overlay_raises_when_managed_config_is_malformed(managed):
+    from hermes_cli import managed_scope
+
+    _write(managed, "model: [unterminated\n")
+    assert hasattr(managed_scope, "apply_managed_overlay_strict")
+    with pytest.raises(managed_scope.ManagedScopeError):
+        managed_scope.apply_managed_overlay_strict({"model": {"default": "user/model"}})
+
+
+def test_strict_overlay_raises_when_overlay_application_fails(managed, monkeypatch):
+    from hermes_cli import config as config_module
+    from hermes_cli import managed_scope
+
+    _write(managed, "model:\n  default: managed/locked\n")
+
+    def fail_merge(_base, _overlay):
+        raise TypeError("merge failed")
+
+    monkeypatch.setattr(config_module, "_deep_merge", fail_merge)
+    with pytest.raises(managed_scope.ManagedScopeError, match="failed to apply"):
+        managed_scope.apply_managed_overlay_strict({"model": {"default": "user/model"}})
+
+
+@pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n", "null\n"])
+def test_strict_overlay_rejects_every_non_mapping_yaml_root(managed, body):
+    from hermes_cli import managed_scope
+
+    _write(managed, body)
+    with pytest.raises(managed_scope.ManagedScopeError, match="root must be an object"):
+        managed_scope.apply_managed_overlay_strict({"model": {"default": "user/model"}})
+
+
+def test_strict_overlay_accepts_empty_mapping(managed):
+    from hermes_cli import managed_scope
+
+    source = {"model": {"default": "user/model"}}
+    _write(managed, "{}\n")
+    assert managed_scope.apply_managed_overlay_strict(source) == source

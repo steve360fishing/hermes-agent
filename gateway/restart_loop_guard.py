@@ -42,6 +42,7 @@ logger = logging.getLogger("gateway.run")
 # breaker, but the documented ~10s respawn loop does within a few cycles.
 DEFAULT_MAX_RESTARTS = 3
 DEFAULT_WINDOW_SECONDS = 60
+_STATE_GENERATION = 1
 
 
 def _state_path():
@@ -52,6 +53,9 @@ def _load_boots() -> List[float]:
     try:
         raw = _state_path().read_text(encoding="utf-8")
         data = json.loads(raw)
+        generation = data.get("generation")
+        if generation is not None and generation != _STATE_GENERATION:
+            return []
         boots = data.get("boots", [])
         return [float(t) for t in boots if isinstance(t, (int, float))]
     except (OSError, ValueError, TypeError):
@@ -62,7 +66,10 @@ def _save_boots(boots: List[float]) -> None:
     try:
         path = _state_path()
         path.parent.mkdir(parents=True, exist_ok=True)
-        path.write_text(json.dumps({"boots": boots}), encoding="utf-8")
+        path.write_text(
+            json.dumps({"generation": _STATE_GENERATION, "boots": boots}),
+            encoding="utf-8",
+        )
     except OSError:
         pass
 
@@ -80,7 +87,9 @@ def record_restart_interrupted_boot(
     """
     ts = time.time() if now is None else now
     cutoff = ts - max(1, window_seconds)
-    boots = [t for t in _load_boots() if t >= cutoff]
+    # Future timestamps can be left behind by a clock rollback, image restore,
+    # or manual edit. Never let them count indefinitely and suppress recovery.
+    boots = [t for t in _load_boots() if cutoff <= t <= ts]
     boots.append(ts)
     _save_boots(boots)
     return boots
@@ -105,7 +114,7 @@ def is_restart_loop_tripped(
     ts = time.time() if now is None else now
     cutoff = ts - max(1, window_seconds)
     try:
-        recent = [t for t in _load_boots() if t >= cutoff]
+        recent = [t for t in _load_boots() if cutoff <= t <= ts]
     except Exception:  # pragma: no cover — _load_boots already guards
         return False
     return len(recent) >= max_restarts

@@ -15,10 +15,11 @@ import logging
 import os
 import html as _html
 import re
+import stat
 import threading
 import warnings
 from datetime import datetime, timezone
-from typing import Dict, List, Optional, Set, Any
+from typing import Any, Callable, Dict, List, Optional, Set
 
 logger = logging.getLogger(__name__)
 
@@ -44,6 +45,65 @@ def _redact_telegram_error_text(error: object) -> str:
         return redact_sensitive_text(text, force=True)
     except Exception:
         return "<telegram error redacted>"
+
+
+class _UnsafeDocumentPath(OSError):
+    pass
+
+
+def _document_stat_identity(value: os.stat_result) -> tuple[int, int] | None:
+    inode = int(getattr(value, "st_ino", 0) or 0)
+    if inode == 0:
+        return None
+    return int(getattr(value, "st_dev", 0) or 0), inode
+
+
+def _open_verified_document_descriptor(file_path: str) -> int:
+    """Open once through a pinned parent chain and verify any durable receipt."""
+    try:
+        from agent.task_execution_contract import (
+            ArtifactPathSecurityError,
+            ArtifactReceiptPersistenceError,
+            open_path_descriptor_no_reparse,
+            open_registered_artifact_descriptor,
+        )
+
+        registered_fd = open_registered_artifact_descriptor(file_path)
+        if registered_fd is not None:
+            return registered_fd
+        return open_path_descriptor_no_reparse(file_path)
+    except ArtifactReceiptPersistenceError as exc:
+        raise _UnsafeDocumentPath("document_receipt_unavailable") from exc
+    except ArtifactPathSecurityError as exc:
+        code = str(exc)
+        if code == "artifact_receipt_mismatch":
+            code = "document_receipt_mismatch"
+        elif code.startswith("artifact_parent") or code.startswith("artifact_secure"):
+            code = "document_parent_unsafe"
+        elif code.startswith("artifact_"):
+            code = "document_path_changed"
+        raise _UnsafeDocumentPath(code) from exc
+
+
+def _record_document_transport_attempt(file_path: str) -> None:
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    record_artifact_dispatch(
+        file_path,
+        state="dispatching",
+        transport_attempt=True,
+    )
+
+
+def _record_document_preflight_failure(file_path: str, error_code: str) -> None:
+    """Terminalize registered artifacts rejected before Telegram is called."""
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    record_artifact_dispatch(
+        file_path,
+        state="failed_preflight",
+        error_code=error_code,
+    )
 
 
 def _consume_abandoned_task(task: asyncio.Task) -> None:
@@ -234,6 +294,7 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from plugins.platforms.telegram.liveness import write_polling_liveness_marker
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -306,6 +367,45 @@ def check_telegram_requirements() -> bool:
     HTTPXRequest = _HR
     TELEGRAM_AVAILABLE = True
     return True
+
+
+def _new_polling_liveness_request(
+    *, on_completed_receive: Callable[[], None], **kwargs: Any
+) -> Any:
+    """Build the dedicated getUpdates request with a completed-receive hook."""
+
+    def record_completed_receive() -> None:
+        try:
+            on_completed_receive()
+        except Exception:
+            # Marker recording is best-effort and must never disrupt PTB's
+            # receive loop after a valid Bot API response.
+            logger.debug("Telegram liveness receive hook failed", exc_info=True)
+
+    if not isinstance(HTTPXRequest, type):
+        request = HTTPXRequest(**kwargs)
+        original_post = request.post
+
+        async def post_with_liveness(*args: Any, **post_kwargs: Any) -> Any:
+            result = await original_post(*args, **post_kwargs)
+            record_completed_receive()
+            return result
+
+        try:
+            request.post = post_with_liveness
+        except (AttributeError, TypeError) as exc:
+            raise TypeError(
+                "Telegram getUpdates request factory returned an unhookable request"
+            ) from exc
+        return request
+
+    class _PollingLivenessHTTPXRequest(HTTPXRequest):
+        async def post(self, *args: Any, **post_kwargs: Any) -> Any:
+            result = await super().post(*args, **post_kwargs)
+            record_completed_receive()
+            return result
+
+    return _PollingLivenessHTTPXRequest(**kwargs)
 
 
 # Matches every character that MarkdownV2 requires to be backslash-escaped
@@ -599,6 +699,9 @@ class TelegramAdapter(BasePlatformAdapter):
         # error_callback ever fires and the gateway silently stops receiving
         # messages with the process still alive (#55769).
         self._polling_not_running_count: int = 0
+        # A successful start_polling() only proves bootstrap. Safe-mode
+        # readiness additionally requires an actual receive-path observation.
+        self._polling_receive_evidence: bool = False
         # After sustained reconnect storms the PTB httpx pool can return
         # SendResult(success=True) for sends that never actually transmit.
         # _handle_polling_network_error sets this; _verify_polling_after_reconnect
@@ -1142,9 +1245,12 @@ class TelegramAdapter(BasePlatformAdapter):
         reply_to_message_id: Optional[int],
         media_label: str,
         reset_media: Optional[Any] = None,
+        before_attempt: Optional[Any] = None,
     ) -> Any:
         """Retry stale private-topic media replies once without the topic anchor."""
         try:
+            if before_attempt is not None:
+                before_attempt()
             return await send_fn(**send_kwargs)
         except Exception as send_err:
             if not self._should_retry_without_dm_topic_reply_anchor(
@@ -1162,6 +1268,8 @@ class TelegramAdapter(BasePlatformAdapter):
             )
             if reset_media is not None:
                 reset_media()
+            if before_attempt is not None:
+                before_attempt()
             retry_kwargs = dict(send_kwargs)
             retry_kwargs["reply_to_message_id"] = None
             retry_kwargs.pop("message_thread_id", None)
@@ -1988,6 +2096,8 @@ class TelegramAdapter(BasePlatformAdapter):
         adapter: the gateway process stays alive and the existing reconnect
         ladder (``_handle_polling_network_error``) recovers in the background.
         """
+        self._polling_receive_evidence = False
+        self._publish_safe_mode_receive_readiness()
         if self.has_fatal_error:
             return
         if self._polling_error_task and not self._polling_error_task.done():
@@ -2041,6 +2151,8 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not (self._app and self._app.updater):
             raise RuntimeError("Telegram application/updater not initialized")
+        self._polling_receive_evidence = False
+        self._publish_safe_mode_receive_readiness()
         try:
             # Same watchdog bound as the reconnect ladders: a wedged httpx
             # connection pool can hang start_polling() forever at bootstrap
@@ -2086,6 +2198,8 @@ class TelegramAdapter(BasePlatformAdapter):
         MAX_NETWORK_RETRIES attempts, then mark the adapter retryable-fatal so
         the supervisor restarts the gateway process.
         """
+        self._polling_receive_evidence = False
+        self._publish_safe_mode_receive_readiness()
         if self.has_fatal_error:
             return
 
@@ -2282,7 +2396,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
                 pass
 
-    async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
+    async def _probe_pending_updates(self, bot, probe_timeout: float) -> bool:
         """Detect a wedged getUpdates consumer via pending_update_count.
 
         PTB can report ``updater.running == True`` while its long-poll task is
@@ -2308,17 +2422,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only meaningful in polling mode; in webhook mode Telegram pushes
         # updates and holds no server-side queue.
         if self._webhook_mode:
-            return
+            return False
         # A reconnect already in flight owns recovery — don't double-trigger,
         # and don't misread its brief stop()->start_polling() window (where
         # updater.running is transiently False) as a dead updater below.
         if self._polling_error_task and not self._polling_error_task.done():
             self._polling_not_running_count = 0
-            return
+            return False
         updater = getattr(self._app, "updater", None) if self._app else None
         if updater is None:
             self._polling_pending_stuck_count = 0
-            return
+            return False
         if not getattr(updater, "running", False):
             # We are in polling mode with no reconnect in flight, yet PTB's
             # updater has stopped entirely. This is distinct from the
@@ -2349,21 +2463,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         RuntimeError("Telegram updater stopped while in polling mode")
                     )
                 )
-            return
+            return False
         self._polling_not_running_count = 0
         get_webhook_info = getattr(bot, "get_webhook_info", None)
         if not callable(get_webhook_info):
-            return
+            return False
         try:
             info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
         except (asyncio.TimeoutError, OSError):
             # A failed probe is a connectivity symptom the get_me() path or the
             # outer handler will catch; don't treat it as a stuck-queue signal.
-            return
+            return False
         pending = int(getattr(info, "pending_update_count", 0) or 0)
         if pending <= 0:
             self._polling_pending_stuck_count = 0
-            return
+            return True
         self._polling_pending_stuck_count += 1
         logger.warning(
             "[%s] Telegram polling heartbeat: %d update(s) queued but not "
@@ -2383,6 +2497,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     RuntimeError("getUpdates consumer wedged: pending updates not draining")
                 )
             )
+        return False
 
     async def _verify_polling_after_reconnect(self) -> None:
         """Heartbeat probe scheduled after a successful reconnect.
@@ -2428,6 +2543,68 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, HEARTBEAT_PROBE_DELAY, probe_err,
             )
             await self._handle_polling_network_error(probe_err)
+
+    def _record_polling_liveness(self) -> None:
+        """Persist a marker after a defensible receive-path observation.
+
+        The marker is deliberately best-effort: a filesystem failure must make
+        the host watchdog fail closed, never take down an otherwise live
+        gateway. No provider result, token, chat id, or message content is
+        persisted.
+        """
+        if not write_polling_liveness_marker():
+            logger.debug("[%s] Telegram liveness marker was not written", self.name)
+
+    def _can_refresh_polling_liveness(self) -> bool:
+        """Return whether this adapter is actively receiving in polling mode."""
+        if getattr(self, "_webhook_mode", False):
+            return False
+        recovery = getattr(self, "_polling_error_task", None)
+        if recovery is not None and not recovery.done():
+            return False
+        app = getattr(self, "_app", None)
+        updater = getattr(app, "updater", None) if app is not None else None
+        return updater is not None and bool(getattr(updater, "running", False))
+
+    @property
+    def has_healthy_polling_receive(self) -> bool:
+        """Whether polling has current receive evidence and a running updater."""
+        return bool(
+            getattr(self, "_polling_receive_evidence", False)
+            and self._can_refresh_polling_liveness()
+        )
+
+    def _publish_safe_mode_receive_readiness(self) -> None:
+        """Promote safe-mode readiness only after receive-path proof exists."""
+        if os.getenv("HERMES_SAFE_MODE", "").strip().lower() not in {
+            "1", "true", "yes", "on"
+        }:
+            return
+        try:
+            from gateway.status import safe_mode_transport_readiness, write_runtime_status
+
+            write_runtime_status(
+                **safe_mode_transport_readiness(
+                    telegram_connected=self.is_connected,
+                    telegram_receive_healthy=self.has_healthy_polling_receive,
+                )
+            )
+        except Exception:
+            logger.debug("[%s] Safe-mode receive readiness write failed", self.name, exc_info=True)
+
+    def _record_inbound_polling_liveness(self) -> None:
+        """Record an update PTB delivered through the active polling path."""
+        if self._can_refresh_polling_liveness():
+            self._polling_receive_evidence = True
+            self._record_polling_liveness()
+            self._publish_safe_mode_receive_readiness()
+
+    def _record_completed_polling_receive(self) -> None:
+        """Record a completed successful getUpdates long-poll receive cycle."""
+        if self._can_refresh_polling_liveness():
+            self._polling_receive_evidence = True
+            self._record_polling_liveness()
+            self._publish_safe_mode_receive_readiness()
 
     def _disarm_ptb_retry_loop(self) -> None:
         """Synchronously stop PTB's internal polling retry loop.
@@ -3204,7 +3381,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         )
                     },
                 )
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _new_polling_liveness_request(
+                    on_completed_receive=self._record_completed_polling_receive,
                     **request_kwargs,
                     httpx_kwargs={
                         "transport": TelegramFallbackTransport(
@@ -3217,14 +3395,16 @@ class TelegramAdapter(BasePlatformAdapter):
                 request = HTTPXRequest(
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _new_polling_liveness_request(
+                    on_completed_receive=self._record_completed_polling_receive,
                     **request_kwargs, proxy=proxy_url, httpx_kwargs=_with_limits()
                 )
             else:
                 if disable_fallback:
                     logger.info("[%s] Telegram fallback-IP transport disabled via env", self.name)
                 request = HTTPXRequest(**request_kwargs, httpx_kwargs=_with_limits())
-                get_updates_request = HTTPXRequest(
+                get_updates_request = _new_polling_liveness_request(
+                    on_completed_receive=self._record_completed_polling_receive,
                     **request_kwargs, httpx_kwargs=_with_limits()
                 )
 
@@ -3406,7 +3586,7 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
-            
+
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
             logger.info("[%s] Connected to Telegram (%s mode)", self.name, mode)
@@ -5355,6 +5535,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle inline keyboard button clicks."""
+        self._record_inbound_polling_liveness()
         query = update.callback_query
         if not query or not query.data:
             return
@@ -6196,10 +6377,12 @@ class TelegramAdapter(BasePlatformAdapter):
     ) -> SendResult:
         """Send a document/file natively as a Telegram file attachment."""
         if not self._bot:
+            _record_document_preflight_failure(file_path, "telegram_not_connected")
             return SendResult(success=False, error="Not connected")
 
         try:
             if not os.path.exists(file_path):
+                _record_document_preflight_failure(file_path, "document_path_missing")
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
 
             display_name = file_name or os.path.basename(file_path)
@@ -6213,30 +6396,40 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
 
-            with open(file_path, "rb") as f:
-                msg = await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_document,
-                    {
-                        "chat_id": normalize_telegram_chat_id(chat_id),
-                        "document": f,
-                        "filename": display_name,
-                        "caption": caption[:1024] if caption else None,
-                        "reply_to_message_id": reply_to_id,
-                        **thread_kwargs,
-                        **self._notification_kwargs(metadata),
-                    },
-                    metadata,
-                    reply_to_id,
-                    "document",
-                    reset_media=lambda: f.seek(0),
-                )
+            fd = _open_verified_document_descriptor(file_path)
+            try:
+                with os.fdopen(fd, "rb") as f:
+                    fd = None
+                    msg = await self._send_with_dm_topic_reply_anchor_retry(
+                        self._bot.send_document,
+                        {
+                            "chat_id": normalize_telegram_chat_id(chat_id),
+                            "document": f,
+                            "filename": display_name,
+                            "caption": caption[:1024] if caption else None,
+                            "reply_to_message_id": reply_to_id,
+                            **thread_kwargs,
+                            **self._notification_kwargs(metadata),
+                        },
+                        metadata,
+                        reply_to_id,
+                        "document",
+                        reset_media=lambda: f.seek(0),
+                        before_attempt=lambda: _record_document_transport_attempt(file_path),
+                    )
+            finally:
+                if fd is not None:
+                    os.close(fd)
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _UnsafeDocumentPath as e:
+            _record_document_preflight_failure(file_path, str(e) or "document_path_changed")
+            return SendResult(success=False, error=str(e) or "document_path_changed")
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send document: %s",
                 self.name, _redact_telegram_error_text(e),
             )
-            return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+            return SendResult(success=False, error="document_dispatch_exception")
 
     async def send_video(
         self,
@@ -7545,6 +7738,7 @@ class TelegramAdapter(BasePlatformAdapter):
         rapid successive text messages from the same user/chat and aggregate
         them into a single MessageEvent before dispatching.
         """
+        self._record_inbound_polling_liveness()
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -7573,6 +7767,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
+        self._record_inbound_polling_liveness()
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -7595,6 +7790,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
+        self._record_inbound_polling_liveness()
         msg = self._effective_update_message(update)
         if not msg:
             return
@@ -7799,6 +7995,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        self._record_inbound_polling_liveness()
         if not update.message:
             return
         if not self._is_user_authorized_from_message(update.message):

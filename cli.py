@@ -378,12 +378,18 @@ def load_cli_config() -> Dict[str, Any]:
     user_config_path = _hermes_home / 'config.yaml'
     project_config_path = Path(__file__).parent / 'cli-config.yaml'
 
+    # Safe mode must not load either user or project behavioral config. The
+    # latter is normally a useful fallback for --ignore-user-config, but it is
+    # still untrusted customization during recovery.
+    safe_mode = os.environ.get("HERMES_SAFE_MODE") == "1"
     # --ignore-user-config: force-skip the user config.yaml (still honor project
-    # config as a fallback so defaults stay sensible).
+    # config as a fallback so defaults stay sensible outside safe mode).
     ignore_user_config = os.environ.get("HERMES_IGNORE_USER_CONFIG") == "1"
 
     # Use user config if it exists, otherwise project config
-    if user_config_path.exists() and not ignore_user_config:
+    if safe_mode:
+        config_path = None
+    elif user_config_path.exists() and not ignore_user_config:
         config_path = user_config_path
     else:
         config_path = project_config_path
@@ -511,7 +517,7 @@ def load_cli_config() -> Dict[str, Any]:
     _file_has_terminal_config = False
 
     # Load from file if exists
-    if config_path.exists():
+    if config_path is not None and config_path.exists():
         try:
             with open(config_path, "r", encoding="utf-8") as f:
                 from hermes_cli.config import _normalize_root_model_keys
@@ -15868,10 +15874,14 @@ def main(
     # Handle query shorthand
     query = query or q
     
+    safe_mode = os.environ.get("HERMES_SAFE_MODE") == "1"
+
     # Parse toolsets - handle both string and tuple/list inputs
     # Default to hermes-cli toolset which includes cronjob management tools
     toolsets_list = None
-    if toolsets:
+    if safe_mode:
+        toolsets_list = []
+    elif toolsets:
         if isinstance(toolsets, str):
             toolsets_list = [t.strip() for t in toolsets.split(",")]
         elif isinstance(toolsets, (list, tuple)):
@@ -15899,7 +15909,7 @@ def main(
             from hermes_cli.tools_config import _get_platform_tools
             toolsets_list = sorted(_get_platform_tools(CLI_CONFIG, "cli"))
     
-    parsed_skills = _parse_skills_argument(skills)
+    parsed_skills = [] if safe_mode else _parse_skills_argument(skills)
 
     # Create CLI instance
     cli = HermesCLI(

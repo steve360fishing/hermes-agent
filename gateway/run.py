@@ -70,6 +70,18 @@ _PLATFORM_CONNECT_TIMEOUT_SECS_DEFAULT = 30.0
 _ADAPTER_DISCONNECT_TIMEOUT_SECS_DEFAULT = 5.0
 _GATEWAY_PROXY_SSE_BUFFER_MAX_CHARS = 16 * 1024 * 1024
 _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-]*)")
+_MODEL_FREE_RECOVERY_COMMANDS = frozenset({"new", "reset", "stop"})
+
+
+def _is_model_free_recovery_command(event: Any) -> bool:
+    """Keep reset/stop controls reachable even when a plugin is unhealthy."""
+    try:
+        command = event.get_command()
+    except Exception:
+        return False
+    return str(command or "").strip().lower().replace("_", "-") in (
+        _MODEL_FREE_RECOVERY_COMMANDS
+    )
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
@@ -6714,6 +6726,15 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             )
         return True
 
+    async def _reconcile_artifact_receipts_periodically(self, interval: float) -> None:
+        """Run bounded receipt recovery until gateway shutdown cancels this task."""
+        from agent.task_execution_contract import reconcile_artifact_receipts
+
+        while self._running:
+            await asyncio.sleep(interval)
+            if self._running:
+                reconcile_artifact_receipts()
+
     async def start(self) -> bool:
         """
         Start the gateway and all configured platform adapters.
@@ -6721,6 +6742,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         Returns True if at least one adapter connected successfully.
         """
         logger.info("Starting Hermes Gateway...")
+        try:
+            from agent.task_execution_contract import reconcile_artifact_receipts
+
+            # Recover abandoned durable receipts even when no later artifact
+            # request arrives. The reconciler only touches existing roots.
+            reconcile_artifact_receipts()
+        except Exception:
+            logger.warning("Startup artifact receipt reconciliation failed", exc_info=True)
         try:
             self._gateway_loop = asyncio.get_running_loop()
         except RuntimeError:
@@ -7252,6 +7281,53 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
         self._running = True
         self._update_runtime_status("running")
+        try:
+            from agent.task_execution_contract import (
+                ARTIFACT_RECEIPT_RECONCILE_INTERVAL_SECONDS,
+                reconcile_artifact_receipts,
+            )
+
+            artifact_reconciler = asyncio.create_task(
+                self._reconcile_artifact_receipts_periodically(
+                    ARTIFACT_RECEIPT_RECONCILE_INTERVAL_SECONDS
+                )
+            )
+            self._background_tasks.add(artifact_reconciler)
+            artifact_reconciler.add_done_callback(self._background_tasks.discard)
+        except Exception:
+            logger.warning("Artifact receipt reconciliation could not be started", exc_info=True)
+        if os.getenv("HERMES_SAFE_MODE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }:
+            try:
+                from gateway.status import (
+                    safe_mode_transport_readiness,
+                    write_runtime_status,
+                )
+
+                telegram_adapter = self.adapters.get(Platform.TELEGRAM)
+                readiness = safe_mode_transport_readiness(
+                    telegram_connected=bool(
+                        telegram_adapter and telegram_adapter.is_connected
+                    ),
+                    telegram_receive_healthy=bool(
+                        telegram_adapter
+                        and getattr(telegram_adapter, "has_healthy_polling_receive", False)
+                    ),
+                )
+                write_runtime_status(**readiness)
+                if readiness["readiness"] != "ready":
+                    self._update_platform_runtime_status(
+                        Platform.TELEGRAM.value,
+                        platform_state="recovering",
+                        error_code="telegram_receive_unproven",
+                        error_message="Telegram polling recovery is active; receive evidence is not yet available.",
+                    )
+            except Exception:
+                logger.warning(
+                    "Safe mode transport readiness could not be published",
+                    exc_info=True,
+                )
         
         # Emit gateway:startup hook
         hook_count = len(self.hooks.loaded_hooks)
@@ -8685,6 +8761,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 getattr(self.config, "thread_sessions_per_user", False),
             )
 
+        safe_mode = os.getenv("HERMES_SAFE_MODE", "").strip().lower() in {
+            "1", "true", "yes", "on",
+        }
+        if safe_mode:
+            if platform != Platform.TELEGRAM:
+                logger.info(
+                    "Safe mode skipped non-recovery platform: %s", platform.value
+                )
+                return None
+            from plugins.platforms.telegram import adapter as telegram_adapter
+
+            if not telegram_adapter.check_telegram_requirements():
+                logger.error("Safe mode Telegram recovery transport is unavailable")
+                return None
+            return telegram_adapter._build_adapter(config)
+
         # ── Plugin-registered platforms (checked first) ───────────────────
         try:
             from gateway.platform_registry import platform_registry
@@ -8902,7 +8994,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # (background-process completions, startup-restore replays) are NOT
         # traffic — counting them would keep a genuinely idle gateway awake. This
         # clock is what the idle predicate (gateway/scale_to_zero.is_idle) reads.
-        if not is_internal:
+        if not is_internal and not _is_model_free_recovery_command(event):
             self._scale_to_zero_note_real_inbound()
 
         # Fire pre_gateway_dispatch plugin hook for user-originated messages.
@@ -8912,7 +9004,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         #   {"action": "allow"}   /   None          -> normal dispatch
         # Hook runs BEFORE auth so plugins can handle unauthorized senders
         # (e.g. customer handover ingest) without triggering the pairing flow.
-        if not is_internal:
+        if not is_internal and not _is_model_free_recovery_command(event):
             try:
                 from hermes_cli.plugins import invoke_hook as _invoke_hook
                 _hook_results = _invoke_hook(
@@ -9660,7 +9752,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # the previous fire-and-forget emit(): return values are now
         # honored, but handlers that return nothing behave exactly as
         # before (telemetry-style hooks keep working).
-        if command and is_gateway_known_command(canonical):
+        if (
+            command
+            and is_gateway_known_command(canonical)
+            and canonical not in _MODEL_FREE_RECOVERY_COMMANDS
+        ):
             raw_args = event.get_command_args().strip()
             hook_ctx = {
                 "platform": source.platform.value if source.platform else "",
@@ -13176,6 +13272,55 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
+            async def _deliver_document(file_path: str) -> bool:
+                """Do not let a false document result erase a MEDIA-only reply."""
+                from agent.task_execution_contract import (
+                    record_artifact_dispatch,
+                    registered_artifact_correlation_id,
+                )
+
+                correlation_id = registered_artifact_correlation_id(file_path)
+                try:
+                    result = await adapter.send_document(
+                        chat_id=event.source.chat_id,
+                        file_path=file_path,
+                        metadata=_thread_meta,
+                    )
+                except Exception:
+                    result = None
+                if getattr(result, "success", False):
+                    record_artifact_dispatch(
+                        file_path,
+                        state="delivered",
+                        message_id=getattr(result, "message_id", None),
+                    )
+                    return True
+                try:
+                    notice_result = await adapter.send(
+                        chat_id=event.source.chat_id,
+                        content="⚠️ Couldn't deliver the requested attachment."
+                        + (f" Reference: {correlation_id}." if correlation_id else ""),
+                        metadata=_thread_meta,
+                    )
+                except Exception:
+                    notice_result = None
+                notice_ok = getattr(notice_result, "success", False)
+                correlation_id = record_artifact_dispatch(
+                    file_path,
+                    state="ambiguous",
+                    error_code=(
+                        str(getattr(result, "error", "document_dispatch_failed"))
+                        if notice_ok
+                        else "failure_notice_undelivered"
+                    ),
+                ) or correlation_id
+                if not notice_ok:
+                    logger.error(
+                        "[%s] Artifact and failure-notice delivery both failed",
+                        adapter.name,
+                    )
+                return False
+
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
@@ -13229,11 +13374,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        await _deliver_document(media_path)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -13247,11 +13388,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
-                        )
+                        await _deliver_document(file_path)
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
 
@@ -18831,11 +18968,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _persist_user_timestamp_override is not None:
                     _conversation_kwargs["persist_user_timestamp"] = _persist_user_timestamp_override
                 try:
-                    from agent.openrouter_fallback_guard import (
-                        fallback_cap_message_if_exhausted,
+                    from agent.agent_runtime_helpers import (
+                        fallback_cap_message_after_primary_eligibility,
                     )
 
-                    fallback_cap_message = fallback_cap_message_if_exhausted(agent)
+                    fallback_cap_message = fallback_cap_message_after_primary_eligibility(
+                        agent
+                    )
                 except Exception:
                     fallback_cap_message = None
                 if fallback_cap_message:

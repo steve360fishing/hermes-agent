@@ -1087,6 +1087,41 @@ def test_numeric_mcp_server_name_does_not_crash_sorted():
     sorted(enabled)
 
 
+@pytest.mark.parametrize(
+    "invalid",
+    ["web", {"web": True}, ["web", 12306], ["web", ""]],
+)
+def test_get_platform_tools_invalid_cron_list_fails_closed(invalid):
+    config = {
+        "platform_toolsets": {"cron": invalid},
+        "mcp_servers": {"must-not-expand": {"enabled": True}},
+    }
+
+    assert _get_platform_tools(config, "cron") == set()
+
+
+@pytest.mark.parametrize("invalid", ["terminal", {"terminal": True}, ["terminal", 1]])
+def test_get_platform_tools_invalid_cron_disabled_list_fails_closed(invalid):
+    config = {
+        "platform_toolsets": {"cron": ["web"]},
+        "agent": {"disabled_toolsets": invalid},
+    }
+
+    assert _get_platform_tools(config, "cron") == set()
+
+
+@pytest.mark.parametrize(
+    "config",
+    [
+        {"platform_toolsets": "cron=web"},
+        {"platform_toolsets": {"cron": ["web"]}, "agent": "disabled=terminal"},
+        {"platform_toolsets": {"cron": ["web"]}, "agent": {"disabled_toolsets": None}},
+    ],
+)
+def test_get_platform_tools_invalid_cron_overlay_container_fails_closed(config):
+    assert _get_platform_tools(config, "cron") == set()
+
+
 # ─── Imagegen Backend Picker Wiring ────────────────────────────────────────
 
 def test_toolset_has_keys_treats_no_key_providers_as_configured():

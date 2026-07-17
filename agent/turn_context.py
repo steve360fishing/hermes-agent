@@ -234,6 +234,7 @@ def build_turn_context(
     task_execution_contract = task_execution_contract or build_task_execution_contract(
         contract_message,
         task_id=effective_task_id,
+        platform=getattr(agent, "platform", None),
     )
     agent._task_execution_contract = task_execution_contract
     set_contract = getattr(agent._tool_guardrails, "set_execution_contract", None)

@@ -370,7 +370,7 @@ USER hermes
 构建并替换官方镜像使用：
 
 ```sh
-docker build -t my-hermes:latest .
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-hermes:latest .
 docker run -d \
   --name hermes \
   --restart unless-stopped \

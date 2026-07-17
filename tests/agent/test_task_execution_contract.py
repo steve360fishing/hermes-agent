@@ -2,6 +2,8 @@ from __future__ import annotations
 
 import json
 import os
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -13,12 +15,13 @@ from agent.task_execution_contract import (
     build_task_execution_contract,
     validate_artifact_output_path,
 )
+import agent.conversation_loop as conversation_loop
 from agent.conversation_loop import _effective_request_system_prompt
 from agent.tool_guardrails import ToolCallGuardrailController
 
 
 def _contract(message: str, task_id: str = "fixture-task"):
-    return build_task_execution_contract(message, task_id=task_id)
+    return build_task_execution_contract(message, task_id=task_id, platform="telegram")
 
 
 @pytest.mark.parametrize(
@@ -96,6 +99,40 @@ def test_same_requested_filename_gets_isolated_task_directories(
     assert Path(second.artifact_output_path).name == "report.txt"
     assert first.artifact_output_path != second.artifact_output_path
     assert first.artifact_root != second.artifact_root
+
+
+def test_same_turn_key_allocates_unique_artifact_identities(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    first = _contract("Give me report.txt as a file.", task_id="same-session")
+    second = _contract("Give me report.txt as a file.", task_id="same-session")
+
+    assert first.artifact_id != second.artifact_id
+    assert first.artifact_output_path != second.artifact_output_path
+
+
+def test_concurrent_turns_allocate_distinct_artifact_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        contracts = list(pool.map(lambda _: _contract("Give me report.txt as a file.", task_id="same-session"), range(8)))
+
+    assert len({contract.artifact_id for contract in contracts}) == 8
+    assert len({contract.artifact_output_path for contract in contracts}) == 8
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "```text\nCreate and deliver report.txt as a file.\n```",
+        "> Create and deliver report.txt as a file.",
+        "Quote this example only: `Create and deliver report.txt as a file.`",
+    ],
+)
+def test_untrusted_examples_do_not_activate_artifact_only(message):
+    assert _contract(message).lane == NORMAL
 
 
 def test_classifier_is_deterministic_without_retaining_prompt_text():
@@ -203,6 +240,35 @@ def test_txt_bytes_round_trip_through_real_writer_stack(monkeypatch, tmp_path):
     assert Path(contract.artifact_output_path).read_bytes() == content.encode("utf-8")
 
 
+@pytest.mark.parametrize("size, expected", [(0, True), (49 * 1024 * 1024, True), (49 * 1024 * 1024 + 1, False)])
+def test_artifact_write_preflight_enforces_49mb_ceiling(monkeypatch, tmp_path, size, expected):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Create and deliver example.txt containing safe text.")
+
+    decision = contract.before_tool(
+        "write_file", {"path": contract.artifact_output_path, "content": "x" * size}
+    )
+
+    assert decision.allowed is expected
+    if not expected:
+        assert decision.code == "artifact_write_too_large"
+
+
+def test_file_artifact_requires_known_document_delivery_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = build_task_execution_contract(
+        "Create and deliver example.txt containing safe text.",
+        task_id="no-delivery",
+        platform="unsupported-platform",
+    )
+
+    assert contract.lane == NORMAL
+    assert contract.preflight_error == "artifact_delivery_unavailable"
+
+
 def test_txt_request_without_filename_gets_stable_txt_name(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
     monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
@@ -239,7 +305,7 @@ def test_primary_root_rejected_by_writer_policy_selects_safe_fallback(
     assert contract.preflight_error == ""
     assert contract.artifact_route == "configured_fallback"
     assert Path(contract.artifact_output_path).parent == (
-        safe_root / "hermes-artifacts" / contract.correlation_id
+        safe_root / "hermes-artifacts" / contract.artifact_id
     ).resolve()
     assert validate_artifact_output_path(
         contract.artifact_output_path, contract.artifact_root
@@ -280,6 +346,337 @@ def test_protected_or_symlink_escape_path_is_rejected_before_write(
     except (OSError, NotImplementedError):
         pytest.skip("symlinks are unavailable in this test environment")
     assert validate_artifact_output_path(str(link / "secret.txt"), str(safe_root))
+
+
+def test_receipt_marks_symlink_swap_as_failed_preflight(monkeypatch, tmp_path):
+    from agent.task_execution_contract import record_artifact_written
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Give me report.txt as a file.")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    try:
+        Path(contract.artifact_output_path).symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable in this test environment")
+
+    assert record_artifact_written(contract) is False
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "failed_preflight"
+
+
+def test_terminal_receipt_cannot_regress_and_registry_is_cleaned(monkeypatch, tmp_path):
+    from agent.task_execution_contract import (
+        _ARTIFACT_RECEIPTS,
+        record_artifact_dispatch,
+        record_artifact_written,
+    )
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Give me report.txt as a file.")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+
+    assert record_artifact_dispatch(contract.artifact_output_path, state="dispatching")
+    assert record_artifact_dispatch(
+        contract.artifact_output_path, state="delivered", message_id="msg-1"
+    )
+    record_artifact_dispatch(contract.artifact_output_path, state="dispatching")
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "delivered"
+    assert receipt["attempt_count"] == 0
+    assert os.path.abspath(contract.artifact_output_path) not in _ARTIFACT_RECEIPTS
+    assert not Path(contract.artifact_root).exists()
+
+
+def test_concurrent_receipt_transitions_are_serialized(monkeypatch, tmp_path):
+    from agent.task_execution_contract import record_artifact_dispatch, record_artifact_written
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Give me report.txt as a file.")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        list(pool.map(
+            lambda _: record_artifact_dispatch(contract.artifact_output_path, state="dispatching"),
+            range(24),
+        ))
+    record_artifact_dispatch(contract.artifact_output_path, state="delivered", message_id="msg-1")
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "delivered"
+    assert receipt["attempt_count"] == 0
+
+
+def test_receipt_write_failure_keeps_registry_and_artifact(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import (
+        _ARTIFACT_RECEIPTS,
+        record_artifact_dispatch,
+        record_artifact_written,
+    )
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Give me report.txt as a file.", task_id="receipt-io-failure")
+    artifact = Path(contract.artifact_output_path)
+    artifact.write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+    before = Path(contract.artifact_receipt_path).read_bytes()
+    real_replace = contract_module.os.replace
+    real_rename = contract_module.os.rename
+
+    def fail_receipt_replace(source, destination, *args, **kwargs):
+        if os.path.basename(destination) == os.path.basename(contract.artifact_receipt_path):
+            raise OSError("simulated durable receipt failure")
+        return real_replace(source, destination, *args, **kwargs)
+
+    def fail_receipt_rename(source, destination, *args, **kwargs):
+        if os.path.basename(destination) == os.path.basename(contract.artifact_receipt_path):
+            raise OSError("simulated durable receipt failure")
+        return real_rename(source, destination, *args, **kwargs)
+
+    monkeypatch.setattr(contract_module.os, "replace", fail_receipt_replace)
+    monkeypatch.setattr(contract_module.os, "rename", fail_receipt_rename)
+
+    with pytest.raises(OSError, match="receipt"):
+        record_artifact_dispatch(
+            contract.artifact_output_path,
+            state="ambiguous",
+            error_code="document_dispatch_exception",
+        )
+
+    assert Path(contract.artifact_receipt_path).read_bytes() == before
+    assert artifact.read_bytes() == b"payload"
+    assert os.path.normcase(os.path.abspath(contract.artifact_output_path)) in _ARTIFACT_RECEIPTS
+
+
+def test_written_artifact_backlog_is_bounded_deterministically(monkeypatch, tmp_path):
+    from agent.task_execution_contract import _ARTIFACT_RECEIPTS, record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    contracts = []
+    for index in range(24):
+        contract = _contract(
+            f"Give me report-{index}.txt as a file.",
+            task_id=f"abandoned-{index:02d}",
+        )
+        Path(contract.artifact_output_path).write_bytes(f"payload-{index}".encode())
+        assert record_artifact_written(contract) is True
+        contracts.append(contract)
+
+    pending_receipts = []
+    for receipt_path in (artifact_base / ".receipts").glob("*.json"):
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        if receipt["state"] == "written":
+            pending_receipts.append(receipt)
+
+    assert len(pending_receipts) <= 16
+    assert sum(int(item["bytes"]) for item in pending_receipts) <= 128 * 1024 * 1024
+    assert len(
+        [
+            path
+            for path in _ARTIFACT_RECEIPTS
+            if os.path.commonpath([artifact_base, Path(path)]) == str(artifact_base)
+        ]
+    ) <= 16
+    assert not Path(contracts[0].artifact_root).exists()
+    oldest = json.loads(Path(contracts[0].artifact_receipt_path).read_text(encoding="utf-8"))
+    assert oldest["state"] == "failed_preflight"
+    assert oldest["error_code"] == "artifact_dispatch_abandoned"
+
+
+def test_written_artifact_backlog_enforces_byte_cap(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    monkeypatch.setattr(contract_module, "MAX_PENDING_ARTIFACT_BYTES", 10)
+    for index in range(2):
+        contract = _contract(
+            f"Give me bytes-{index}.txt as a file.",
+            task_id=f"byte-cap-{index}",
+        )
+        Path(contract.artifact_output_path).write_bytes(b"12345678")
+        assert record_artifact_written(contract) is True
+
+    pending = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (artifact_base / ".receipts").glob("*.json")
+    ]
+    pending = [receipt for receipt in pending if receipt["state"] == "written"]
+    assert sum(receipt["bytes"] for receipt in pending) <= 10
+
+
+def test_dispatching_artifact_backlog_enforces_count_and_byte_caps(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import record_artifact_dispatch, record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    monkeypatch.setattr(contract_module, "MAX_PENDING_ARTIFACTS", 2)
+    monkeypatch.setattr(contract_module, "MAX_PENDING_ARTIFACT_BYTES", 10)
+    contracts = []
+    for index in range(3):
+        contract = _contract(
+            f"Give me dispatch-{index}.txt as a file.",
+            task_id=f"dispatch-cap-{index}",
+        )
+        Path(contract.artifact_output_path).write_bytes(b"12345678")
+        assert record_artifact_written(contract) is True
+        assert record_artifact_dispatch(contract.artifact_output_path, state="dispatching")
+        contracts.append(contract)
+        contract_module._reconcile_artifact_store(str(artifact_base))
+
+    receipts = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (artifact_base / ".receipts").glob("*.json")
+    ]
+    pending = [item for item in receipts if item["state"] in {"written", "dispatching"}]
+    assert len(pending) <= 2
+    assert sum(int(item["bytes"]) for item in pending) <= 10
+    oldest = json.loads(Path(contracts[0].artifact_receipt_path).read_text(encoding="utf-8"))
+    assert oldest["state"] == "ambiguous"
+    assert oldest["error_code"] == "artifact_dispatch_abandoned"
+
+
+def test_startup_reconciliation_expires_durable_orphan(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import _ARTIFACT_RECEIPTS, record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    old = _contract("Give me old.txt as a file.", task_id="old-orphan")
+    Path(old.artifact_output_path).write_bytes(b"old")
+    assert record_artifact_written(old) is True
+    old_time = time.time() - 7200
+    os.utime(old.artifact_receipt_path, (old_time, old_time))
+    _ARTIFACT_RECEIPTS.pop(
+        os.path.normcase(os.path.abspath(old.artifact_output_path)),
+        None,
+    )
+    monkeypatch.setattr(contract_module, "ARTIFACT_WRITTEN_TTL_SECONDS", 3600)
+
+    _contract("Give me new.txt as a file.", task_id="startup-reconcile")
+
+    receipt = json.loads(Path(old.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "failed_preflight"
+    assert receipt["error_code"] == "artifact_dispatch_abandoned"
+    assert not Path(old.artifact_root).exists()
+
+
+def test_startup_reconciliation_terminalizes_crash_after_dispatching(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import (
+        _ARTIFACT_RECEIPTS,
+        reconcile_artifact_receipts,
+        record_artifact_dispatch,
+        record_artifact_written,
+    )
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    contract = _contract("Give me crash.txt as a file.", task_id="dispatch-crash")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+    assert record_artifact_dispatch(contract.artifact_output_path, state="dispatching")
+    old_time = time.time() - 7200
+    os.utime(contract.artifact_receipt_path, (old_time, old_time))
+    _ARTIFACT_RECEIPTS.pop(os.path.normcase(os.path.abspath(contract.artifact_output_path)), None)
+    monkeypatch.setattr(contract_module, "ARTIFACT_WRITTEN_TTL_SECONDS", 3600)
+
+    reconcile_artifact_receipts()
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "ambiguous"
+    assert receipt["error_code"] == "artifact_dispatch_abandoned"
+    assert not Path(contract.artifact_root).exists()
+
+
+def test_periodic_reconciliation_leaves_receipt_before_ttl(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import reconcile_artifact_receipts, record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    contract = _contract("Give me fresh.txt as a file.", task_id="periodic-fresh")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+    monkeypatch.setattr(contract_module, "ARTIFACT_WRITTEN_TTL_SECONDS", 3600)
+
+    reconcile_artifact_receipts()
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "written"
+    assert Path(contract.artifact_root).exists()
+
+
+def test_file_artifact_mode_rejects_missing_platform(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = build_task_execution_contract(
+        "Create and deliver report.txt containing safe text.",
+        task_id="missing-platform",
+        platform=None,
+    )
+
+    assert contract.lane == NORMAL
+    assert contract.preflight_error == "artifact_delivery_unavailable"
+    assert contract.artifact_output_path == ""
+
+
+def test_conversation_contract_prepares_txt_artifact_only_for_telegram(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    captured = {}
+
+    def stop_after_turn_preparation(*args, **kwargs):
+        contract = kwargs["task_execution_contract"]
+        captured["contract"] = contract
+        assert contract.lane == ARTIFACT_ONLY
+        assert contract.artifact_extension == ".txt"
+        assert contract.artifact_output_path.endswith("report.txt")
+        raise RuntimeError("turn-preparation-complete")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", stop_after_turn_preparation)
+    telegram_agent = SimpleNamespace(platform="telegram", _task_execution_contract=None)
+
+    with pytest.raises(RuntimeError, match="turn-preparation-complete"):
+        conversation_loop.run_conversation(
+            telegram_agent,
+            "Create and deliver report.txt containing safe text.",
+            task_id="telegram-conversation-artifact",
+        )
+
+    assert captured["contract"].artifact_route != "none"
+
+    other_agent = SimpleNamespace(
+        platform="discord",
+        _task_execution_contract=None,
+        model="test-model",
+        provider="test-provider",
+    )
+    result = conversation_loop.run_conversation(
+        other_agent,
+        "Create and deliver report.txt containing safe text.",
+        task_id="discord-conversation-artifact",
+    )
+    assert result["turn_exit_reason"] == "artifact_output_preflight_failed"
+    assert result["task_execution"]["decision_reason"] == "artifact_delivery_unavailable"
 
 
 def test_allocator_rejects_symlinked_artifact_root_even_inside_safe_root(

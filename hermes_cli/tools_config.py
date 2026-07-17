@@ -1612,6 +1612,30 @@ def enabled_mcp_server_names(config: dict) -> Set[str]:
     }
 
 
+def _strict_toolset_list(value, field: str) -> list[str]:
+    if not isinstance(value, list) or any(not isinstance(name, str) or not name.strip() for name in value):
+        raise ValueError(f"{field} must be a list of non-empty strings")
+    return list(value)
+
+
+def validate_cron_toolset_overlays(config: dict) -> None:
+    """Raise when any cron authority overlay is not strict ``list[str]``."""
+    if not isinstance(config, dict):
+        raise ValueError("cron config must be an object")
+    platform_toolsets = config.get("platform_toolsets")
+    if platform_toolsets is not None:
+        if not isinstance(platform_toolsets, dict):
+            raise ValueError("platform_toolsets must be an object")
+        if "cron" in platform_toolsets:
+            _strict_toolset_list(platform_toolsets["cron"], "platform_toolsets.cron")
+    agent_cfg = config.get("agent")
+    if agent_cfg is not None:
+        if not isinstance(agent_cfg, dict):
+            raise ValueError("agent must be an object")
+        if "disabled_toolsets" in agent_cfg:
+            _strict_toolset_list(agent_cfg["disabled_toolsets"], "agent.disabled_toolsets")
+
+
 def _exempt_explicit_platform_native(
     default_off: Set[str], platform: str, *, explicitly_configured: bool
 ) -> None:
@@ -1642,6 +1666,13 @@ def _get_platform_tools(
 ) -> Set[str]:
     """Resolve which individual toolset names are enabled for a platform."""
     from toolsets import resolve_toolset, TOOLSETS
+
+    if platform == "cron":
+        try:
+            validate_cron_toolset_overlays(config)
+        except ValueError as exc:
+            logger.warning("invalid cron toolset authority; disabling all cron toolsets: %s", exc)
+            return set()
 
     platform_toolsets = config.get("platform_toolsets") or {}
     toolset_names = platform_toolsets.get(platform)

@@ -38,6 +38,10 @@ _CONFIG_CACHE: Dict[str, tuple] = {}
 _ENV_CACHE: Dict[str, tuple] = {}
 
 
+class ManagedScopeError(RuntimeError):
+    """Managed policy could not be loaded or applied safely."""
+
+
 def _under_pytest() -> bool:
     """True when running inside the test suite.
 
@@ -78,7 +82,7 @@ def invalidate_managed_cache() -> None:
         _ENV_CACHE.clear()
 
 
-def _cached_read(path: Path, cache: Dict[str, tuple], parse):
+def _cached_read(path: Path, cache: Dict[str, tuple], parse, *, strict: bool = False):
     """Shared (mtime_ns, size)-keyed read. Returns a deepcopy of the parsed value.
 
     Returns ``None`` when the file is absent or fails to parse (fail-open). A
@@ -88,8 +92,12 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     """
     try:
         st = path.stat()
-    except OSError:
+    except FileNotFoundError:
         return None  # absent
+    except OSError as exc:
+        if strict:
+            raise ManagedScopeError(f"managed scope: failed to inspect {path}: {exc}") from exc
+        return None
     key = (st.st_mtime_ns, st.st_size)
     path_key = str(path)
     with _CACHE_LOCK:
@@ -100,6 +108,8 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
         with open(path, encoding="utf-8") as f:
             parsed = parse(f)
     except Exception as exc:  # noqa: BLE001 — fail-open, but LOUD
+        if strict:
+            raise ManagedScopeError(f"managed scope: failed to parse {path}: {exc}") from exc
         logger.warning(
             "managed scope: failed to parse %s: %s — IGNORING this managed file. "
             "Admin policy from this file is NOT being applied. Fix and restart.",
@@ -112,17 +122,26 @@ def _cached_read(path: Path, cache: Dict[str, tuple], parse):
     return parsed
 
 
-def load_managed_config() -> dict:
-    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
+def _load_managed_config(*, strict: bool) -> dict:
     managed_dir = get_managed_dir()
     if managed_dir is None:
         return {}
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        yaml.safe_load,
+        strict=strict,
     )
-    return parsed if isinstance(parsed, dict) else {}
+    if isinstance(parsed, dict):
+        return parsed
+    if strict:
+        raise ManagedScopeError("managed scope: config.yaml root must be an object")
+    return {}
+
+
+def load_managed_config() -> dict:
+    """Parsed managed config.yaml, or {} when absent/malformed (fail-open)."""
+    return _load_managed_config(strict=False)
 
 
 def load_managed_env() -> Dict[str, str]:
@@ -132,6 +151,30 @@ def load_managed_env() -> Dict[str, str]:
         return {}
     parsed = _cached_read(managed_dir / ".env", _ENV_CACHE, _parse_env)
     return parsed if isinstance(parsed, dict) else {}
+
+
+def _apply_loaded_managed_overlay(config: dict, managed: dict) -> dict:
+    if not isinstance(config, dict):
+        raise ManagedScopeError("managed scope: overlay target must be an object")
+    if not managed:
+        return config
+    from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
+
+    managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
+    if isinstance(managed_expanded.get("model"), str):
+        managed_expanded = dict(managed_expanded)
+        managed_expanded["model"] = {"default": managed_expanded["model"]}
+    return _deep_merge(config, managed_expanded)
+
+
+def apply_managed_overlay_strict(config: dict) -> dict:
+    """Apply managed config or raise ``ManagedScopeError`` on any failure."""
+    try:
+        return _apply_loaded_managed_overlay(config, _load_managed_config(strict=True))
+    except ManagedScopeError:
+        raise
+    except Exception as exc:
+        raise ManagedScopeError(f"managed scope: failed to apply config overlay: {exc}") from exc
 
 
 def apply_managed_overlay(config: dict) -> dict:
@@ -155,23 +198,7 @@ def apply_managed_overlay(config: dict) -> dict:
     returns ``config`` (callers pass a dict they own).
     """
     try:
-        managed = load_managed_config()
-        if not managed:
-            return config
-        # Imported lazily to avoid an import cycle (config imports managed_scope).
-        from hermes_cli.config import _deep_merge, _expand_env_vars, _normalize_root_model_keys
-
-        managed_expanded = _normalize_root_model_keys(_expand_env_vars(managed))
-        # A bare ``model: x/y`` string in the managed file must merge as
-        # ``model.default`` — otherwise _deep_merge would replace the caller's
-        # ``model`` dict with a string and break every ``cfg["model"]["..."]``
-        # read. _normalize_root_model_keys only promotes the string when there
-        # are root provider/base_url keys to migrate, so handle the bare case
-        # here (matches cli.py's own string-model handling).
-        if isinstance(managed_expanded.get("model"), str):
-            managed_expanded = dict(managed_expanded)
-            managed_expanded["model"] = {"default": managed_expanded["model"]}
-        return _deep_merge(config, managed_expanded)
+        return _apply_loaded_managed_overlay(config, load_managed_config())
     except Exception:  # noqa: BLE001 — overlay must never break a caller
         logger.warning("managed scope: failed to apply config overlay", exc_info=True)
         return config

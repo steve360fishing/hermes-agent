@@ -2739,13 +2739,16 @@ class TestConcurrentToolExecution:
         assert messages[1]["tool_call_id"] == "c2"
         assert all("Python interpreter is shutting down" in m["content"] for m in messages)
 
-    def test_concurrent_timeout_returns_finished_tools_without_hanging(self, agent, monkeypatch):
-        """A wedged worker must not freeze the whole concurrent tool batch."""
+    def test_concurrent_timeout_waits_for_cooperative_worker_exit_before_returning(self, agent, monkeypatch):
+        """Timed-out workers are interrupted and cannot mutate after the batch returns."""
+        import concurrent.futures
         import threading
-        import time as _time
 
         monkeypatch.setenv("HERMES_CONCURRENT_TOOL_TIMEOUT_S", "0.1")
-        blocker = threading.Event()
+        release = threading.Event()
+        interrupted = threading.Event()
+        started = threading.Event()
+        post_return_mutations = []
         tc1 = _mock_tool_call(name="web_search", arguments='{"q": "fast"}', call_id="c1")
         tc2 = _mock_tool_call(name="web_search", arguments='{"q": "slow"}', call_id="c2")
         mock_msg = _mock_assistant_msg(content="", tool_calls=[tc1, tc2])
@@ -2754,7 +2757,9 @@ class TestConcurrentToolExecution:
 
         def fake_handle(name, args, task_id, **kwargs):
             if args.get("q") == "slow":
-                blocker.wait(5)
+                started.set()
+                release.wait(5)
+                post_return_mutations.append("late")
                 return "late"
             return "fast-result"
 
@@ -2763,22 +2768,33 @@ class TestConcurrentToolExecution:
 
         agent._flush_messages_to_session_db = MagicMock(side_effect=record_flush)
 
-        start = _time.monotonic()
-        try:
-            with patch("run_agent.handle_function_call", side_effect=fake_handle):
-                agent._execute_tool_calls_concurrent(mock_msg, messages, "task-1")
-        finally:
-            blocker.set()
+        original_set_interrupt = __import__("run_agent")._set_interrupt
 
-        assert _time.monotonic() - start < 1.0
+        def record_interrupt(value, thread_id):
+            if value:
+                interrupted.set()
+            return original_set_interrupt(value, thread_id)
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+            with patch("run_agent.handle_function_call", side_effect=fake_handle), patch(
+                "run_agent._set_interrupt", side_effect=record_interrupt
+            ):
+                pending = caller.submit(agent._execute_tool_calls_concurrent, mock_msg, messages, "task-1")
+                assert started.wait(timeout=1)
+                assert interrupted.wait(timeout=1)
+                assert not pending.done()
+                release.set()
+                pending.result(timeout=1)
+
+        assert post_return_mutations == ["late"]
         assert len(messages) == 2
         assert messages[0]["tool_call_id"] == "c1"
         assert "fast-result" in messages[0]["content"]
         assert messages[1]["tool_call_id"] == "c2"
-        assert "timed out after" in messages[1]["content"]
+        assert "late" in messages[1]["content"]
         assert [batch[-1]["tool_call_id"] for batch in flushed] == ["c1", "c2"]
         assert "fast-result" in flushed[0][-1]["content"]
-        assert "timed out after" in flushed[1][-1]["content"]
+        assert "late" in flushed[1][-1]["content"]
 
     def test_concurrent_timeout_prefers_late_real_result_over_timeout_message(self, agent, monkeypatch):
         """A worker that finishes in the window between the deadline snapshot
@@ -4017,6 +4033,33 @@ class TestRunConversation:
         assert "safe artifact destination" in result["final_response"]
         assert not agent.client.chat.completions.create.called
         agent._compress_context.assert_not_called()
+        assert agent._task_execution_contract is None
+        assert agent._tool_guardrails._execution_contract is None
+
+    def test_artifact_preflight_uses_active_platform_delivery_capability(
+        self, agent, tmp_path
+    ):
+        self._setup_agent(agent)
+        agent.platform = "unsupported-platform"
+
+        with (
+            patch.dict(
+                os.environ,
+                {
+                    "HERMES_WRITE_SAFE_ROOT": str(tmp_path),
+                    "HERMES_ARTIFACT_ROOT": str(tmp_path / "artifacts"),
+                },
+            ),
+            patch.object(agent, "_persist_session"),
+            patch.object(agent, "_save_trajectory"),
+            patch.object(agent, "_cleanup_task_resources"),
+        ):
+            result = agent.run_conversation("Give me example.txt as a file.")
+
+        assert result["failed"] is True
+        assert result["api_calls"] == 0
+        assert result["turn_exit_reason"] == "artifact_output_preflight_failed"
+        assert not agent.client.chat.completions.create.called
         assert agent._task_execution_contract is None
         assert agent._tool_guardrails._execution_contract is None
 

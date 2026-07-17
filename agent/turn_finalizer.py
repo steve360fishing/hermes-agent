@@ -55,7 +55,19 @@ def _finalize_turn_impl(
 
     # A successful artifact write must deterministically produce the gateway
     # attachment directive; do not depend on the model remembering to echo it.
-    if artifact_only and getattr(task_contract, "artifact_file_requested", False):
+    if (
+        artifact_only
+        and getattr(task_contract, "artifact_file_requested", False)
+        and (interrupted or failed)
+    ):
+        from agent.task_execution_contract import finalize_artifact_contract
+
+        finalize_artifact_contract(
+            task_contract,
+            state="failed_preflight",
+            error_code=("artifact_turn_cancelled" if interrupted else "artifact_turn_failed"),
+        )
+    elif artifact_only and getattr(task_contract, "artifact_file_requested", False):
         artifact_path = getattr(task_contract, "artifact_output_path", "")
         landed_paths = getattr(agent, "_turn_file_mutation_paths", None) or set()
         try:
@@ -71,6 +83,10 @@ def _finalize_turn_impl(
                 )
                 is None
             )
+            if artifact_ready:
+                from agent.task_execution_contract import record_artifact_written
+
+                artifact_ready = record_artifact_written(task_contract)
         except (OSError, ValueError):
             artifact_ready = False
         if artifact_ready:
@@ -81,6 +97,14 @@ def _finalize_turn_impl(
                 if message.get("role") == "assistant" and not message.get("tool_calls"):
                     message["content"] = final_response
                     break
+        else:
+            from agent.task_execution_contract import finalize_artifact_contract
+
+            finalize_artifact_contract(
+                task_contract,
+                state="failed_preflight",
+                error_code="artifact_write_not_verified",
+            )
 
     if final_response is None and (
         api_call_count >= agent.max_iterations

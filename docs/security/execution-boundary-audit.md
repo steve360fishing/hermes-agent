@@ -7,15 +7,20 @@ layer rejects, or where a turn-scoped restriction survives into another turn.
 
 ## Coverage denominator
 
-`scripts/check_execution_boundaries.py` scans a conservative union of:
+`scripts/check_execution_boundaries.py` scans the exact union of:
 
 - eight shipped Python entrypoints;
 - ten runtime roots that can be loaded dynamically by profiles, plugins,
   providers, cron, gateways, or adapters; and
-- contract-specific semantic tokens in the files that implement each boundary.
+- every contract-specific rule path, even when it is outside an entrypoint or
+  runtime root; and
+- contract-specific semantic tokens in those files.
 
-The checked-in registry currently classifies 225 source sites across five
-contract families:
+The checked-in registry currently classifies all 276 discoverable source sites
+across five contract families. The checker recomputes that union without
+intersecting a semantic match with a contract rule's path list, and the
+regression floor prevents the denominator from falling below 225 unless the
+registry is explicitly reconciled.
 
 | Contract | Required roles |
 | --- | --- |
@@ -33,9 +38,30 @@ that Python import analysis can enumerate every runtime plugin. CI fails when:
 - a registered symbol or identifier is stale;
 - a contract is missing a required role; or
 - the registry references a missing source path.
+- a tracked source cannot be read or parsed;
+- a lifecycle edge is duplicate, reversed, contradictory, unrelated to its
+  registered edge identity, or outside its contract's explicit role-transition
+  order; or
+- duplicate JSON keys or a non-redacted inventory schema are supplied.
 
 Reviewed exclusions require a written rationale. New sites are never accepted
 implicitly.
+
+Lifecycle relationships are machine-checked against the registry's canonical
+transition graph. Each relationship names an edge identity, contract, type,
+and exact endpoints; prose is explanatory evidence and is not used to infer
+whether two relationships contradict one another.
+
+## Documented boundary families
+
+The registry records source-specific evidence rather than assigning generic
+labels. In the owned runtime paths, the contract review also maps discoverable
+recovery, session, credential/provider, profile/plugin, channel, deployment/
+watchdog, resource, approval/lease, clock/network, and backup/restore
+boundaries to their concrete source owners. A family is added to the enforced
+registry only when a path restriction and lifecycle relationship can be named;
+otherwise this document records it as a review family rather than pretending
+that a broad token scan proves coverage.
 
 ## Cross-layer lifecycle checks
 
@@ -75,15 +101,20 @@ Windows.
 
 ## Effective runtime manifest
 
-The checker can emit a sanitized manifest with `--manifest-out`. It records:
+The checker can emit a sanitized manifest with `--manifest-out`, plus explicit
+`--plugin-inventory` and `--transport-inventory` JSON inputs. It records:
 
 - source commit and tree;
-- SHA-256 hashes for all shipped entrypoints; and
-- configured environment names and presence.
+- SHA-256 hashes for all shipped entrypoints and registry-declared boundary
+  core modules, plus the checker, the actual supplied registry, and the actual
+  supplied inventories;
+- explicit effective plugin and transport inventories using only
+  `{ "plugins": ["name"] }` and `{ "transports": ["name"] }` schemas; and
+- configured environment names and presence only.
 
-Values for names containing key, token, secret, password, credential, or
-cookie are never emitted. The manifest is evidence, not configuration, and it
-does not mutate the runtime.
+No environment values are emitted, including values for non-secret names. A
+manifest fails rather than silently omitting a declared core module. The
+manifest is evidence, not configuration, and it does not mutate the runtime.
 
 ## Live read-only snapshot (2026-07-16)
 

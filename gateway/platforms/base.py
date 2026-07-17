@@ -36,6 +36,46 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
+def _artifact_dispatch_delivered(path: str, message_id) -> None:
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    record_artifact_dispatch(path, state="delivered", message_id=message_id)
+
+
+def _artifact_dispatch_failed(path: str, error_code: str) -> str | None:
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    return record_artifact_dispatch(
+        path,
+        state="ambiguous",
+        error_code=str(error_code or "document_dispatch_failed"),
+    )
+
+
+def _artifact_correlation_for_path(path: str) -> str | None:
+    from agent.task_execution_contract import registered_artifact_correlation_id
+
+    return registered_artifact_correlation_id(path)
+
+
+def _safe_artifact_delivery_failure(correlation_id: str | None) -> str:
+    suffix = f" Reference: {correlation_id}." if correlation_id else ""
+    return f"⚠️ Couldn't deliver the requested attachment.{suffix}"
+
+
+async def _send_artifact_failure_notice(adapter, *, chat_id: str, correlation_id: str | None, metadata) -> bool:
+    """Attempt the one safe notice once and verify the platform result."""
+    try:
+        result = await adapter.send(
+            chat_id=chat_id,
+            content=_safe_artifact_delivery_failure(correlation_id),
+            metadata=metadata,
+        )
+    except Exception:
+        return False
+    return getattr(result, "success", False) is True
+
+
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
@@ -5121,6 +5161,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                         else:
+                            _artifact_correlation = _artifact_correlation_for_path(media_path)
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
@@ -5129,8 +5170,46 @@ class BasePlatformAdapter(ABC):
 
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
+                            if ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                                notice_ok = await _send_artifact_failure_notice(
+                                    self,
+                                    chat_id=event.source.chat_id,
+                                    correlation_id=_artifact_correlation,
+                                    metadata=_final_thread_metadata,
+                                )
+                                _artifact_dispatch_failed(
+                                    media_path,
+                                    (
+                                        str(getattr(media_result, "error", "") or "document_dispatch_failed")
+                                        if notice_ok
+                                        else "failure_notice_undelivered"
+                                    ),
+                                )
+                                if not notice_ok:
+                                    logger.error(
+                                        "[%s] Artifact and failure-notice delivery both failed",
+                                        self.name,
+                                    )
+                        elif ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                            _artifact_dispatch_delivered(media_path, getattr(media_result, "message_id", None))
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        if ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                            notice_ok = await _send_artifact_failure_notice(
+                                self,
+                                chat_id=event.source.chat_id,
+                                correlation_id=_artifact_correlation_for_path(media_path),
+                                metadata=_final_thread_metadata,
+                            )
+                            _artifact_dispatch_failed(
+                                media_path,
+                                "document_dispatch_exception" if notice_ok else "failure_notice_undelivered",
+                            )
+                            if not notice_ok:
+                                logger.error(
+                                    "[%s] Artifact and failure-notice delivery both failed",
+                                    self.name,
+                                )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
