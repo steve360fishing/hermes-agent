@@ -67,6 +67,7 @@ DISCOVERY_RULES = (
     DiscoveryRule(
         "artifact_request",
         (
+            "cli.py",
             "agent/task_execution_contract.py",
             "agent/turn_context.py",
             "agent/turn_finalizer.py",
@@ -187,8 +188,8 @@ class _SymbolVisitor(ast.NodeVisitor):
         self._visit_symbol(node, node.name)
 
 
-def _tracked_python_paths(repo_root: Path, runtime_roots: Iterable[str]) -> list[Path]:
-    roots = tuple(runtime_roots)
+def _tracked_python_paths(repo_root: Path, scan_paths: Iterable[str]) -> list[Path]:
+    roots = tuple(scan_paths)
     result = subprocess.run(
         ["git", "ls-files", "-z", "--", *roots],
         cwd=repo_root,
@@ -205,36 +206,54 @@ def _tracked_python_paths(repo_root: Path, runtime_roots: Iterable[str]) -> list
     paths: list[Path] = []
     for root_name in roots:
         root = repo_root / root_name
-        if root.exists():
+        if root.is_file() and root.suffix == ".py":
+            paths.append(root)
+        elif root.exists():
             paths.extend(root.rglob("*.py"))
     return paths
 
 
-def discover_sites(repo_root: Path, runtime_roots: Iterable[str]) -> list[Site]:
+def _discover_sites_with_errors(repo_root: Path, scan_paths: Iterable[str]) -> tuple[list[Site], list[str]]:
     sites: dict[tuple[str, str], Site] = {}
+    errors: list[str] = []
     all_tokens = tuple(token for rule in DISCOVERY_RULES for token in rule.tokens)
-    for path in _tracked_python_paths(repo_root, runtime_roots):
+    for path in _tracked_python_paths(repo_root, scan_paths):
         relative = path.relative_to(repo_root).as_posix()
         try:
             source = path.read_text(encoding="utf-8")
-        except (OSError, UnicodeError):
+        except (OSError, UnicodeError) as exc:
+            errors.append(f"unreadable tracked source: {relative}: {exc}")
+            continue
+        try:
+            tree = ast.parse(source, filename=relative)
+        except SyntaxError as exc:
+            errors.append(f"unparseable tracked source: {relative}: {exc.msg}")
             continue
         lowered_source = source.lower()
         if not any(token in lowered_source for token in all_tokens):
             continue
-        try:
-            tree = ast.parse(source, filename=relative)
-        except SyntaxError:
-            continue
         visitor = _SymbolVisitor(source)
         visitor.visit(tree)
+        module_segment = "\n".join(
+            ast.get_source_segment(source, node) or ""
+            for node in tree.body
+            if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Import, ast.ImportFrom))
+        )
+        if module_segment:
+            visitor.symbols.append(("__module__", tree, module_segment))
         for symbol, node, segment in visitor.symbols:
             lowered = segment.lower()
             for rule in DISCOVERY_RULES:
+                if relative not in rule.paths:
+                    continue
                 if any(token in lowered for token in rule.tokens):
-                    site = Site(rule.contract, relative, symbol, node.lineno)
+                    site = Site(rule.contract, relative, symbol, getattr(node, "lineno", 1))
                     sites[(rule.contract, site.key)] = site
-    return sorted(sites.values(), key=lambda site: (site.contract, site.path, site.line, site.symbol))
+    return sorted(sites.values(), key=lambda site: (site.contract, site.path, site.line, site.symbol)), errors
+
+
+def discover_sites(repo_root: Path, scan_paths: Iterable[str]) -> list[Site]:
+    return _discover_sites_with_errors(repo_root, scan_paths)[0]
 
 
 def _all_symbols(repo_root: Path, relative_path: str) -> set[str]:
@@ -248,7 +267,7 @@ def _all_symbols(repo_root: Path, relative_path: str) -> set[str]:
         return set()
     visitor = _SymbolVisitor(source, include_segments=False)
     visitor.visit(tree)
-    return {symbol for symbol, _node, _segment in visitor.symbols}
+    return {"__module__", *(symbol for symbol, _node, _segment in visitor.symbols)}
 
 
 def validate_registry(
@@ -259,9 +278,6 @@ def validate_registry(
 ) -> list[str]:
     errors: list[str] = []
     symbol_cache: dict[str, set[str]] = {}
-    if discovered_sites is not None:
-        for discovered in discovered_sites:
-            symbol_cache.setdefault(discovered.path, set()).add(discovered.symbol)
     if registry.get("schema_version") != 1:
         errors.append("registry schema_version must be 1")
     entrypoints = registry.get("entrypoints", [])
@@ -298,7 +314,7 @@ def validate_registry(
         if not isinstance(path, str) or not (repo_root / path).is_file():
             errors.append(f"{prefix}: missing path {path!r}")
             continue
-        if discovered_sites is None and path not in symbol_cache:
+        if path not in symbol_cache:
             symbol_cache[path] = _all_symbols(repo_root, path)
         available_symbols = symbol_cache.get(path, set())
         if not isinstance(symbol, str) or symbol not in available_symbols:
@@ -319,12 +335,52 @@ def validate_registry(
         missing = set(required_roles) - roles.get(contract, set())
         if missing:
             errors.append(f"{contract}: missing required roles {sorted(missing)}")
+
+    sites_by_contract_id = {
+        (site.get("contract"), site.get("id")): site
+        for site in registry.get("sites", [])
+    }
+    relationship_roles: dict[str, set[str]] = {}
+    relationships = registry.get("lifecycle_relationships")
+    if not isinstance(relationships, list):
+        errors.append("lifecycle relationships must be a list")
+        relationships = []
+    for index, relationship in enumerate(relationships):
+        prefix = f"lifecycle_relationships[{index}]"
+        if not isinstance(relationship, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+        contract = relationship.get("contract")
+        source = sites_by_contract_id.get((contract, relationship.get("from")))
+        target = sites_by_contract_id.get((contract, relationship.get("to")))
+        invariant = relationship.get("invariant")
+        if contract not in REQUIRED_CONTRACTS:
+            errors.append(f"{prefix}: unknown contract {contract!r}")
+            continue
+        if source is None or target is None:
+            errors.append(f"{prefix}: endpoints must reference registered sites")
+            continue
+        if source.get("contract") != contract or target.get("contract") != contract:
+            errors.append(f"{prefix}: endpoints must belong to {contract}")
+            continue
+        if not isinstance(invariant, str) or not invariant.strip():
+            errors.append(f"{prefix}: invariant is required")
+        relationship_roles.setdefault(contract, set()).update(
+            {str(source.get("role")), str(target.get("role"))}
+        )
+    for contract, required_roles in REQUIRED_CONTRACTS.items():
+        missing = set(required_roles) - relationship_roles.get(contract, set())
+        if missing:
+            errors.append(f"{contract}: lifecycle relationships missing roles {sorted(missing)}")
     return errors
 
 
 def audit_repository(repo_root: Path, registry: dict[str, Any]) -> AuditReport:
-    discovered = discover_sites(repo_root, registry.get("runtime_roots", RUNTIME_ROOTS))
-    invalid = validate_registry(repo_root, registry, discovered_sites=discovered)
+    scan_paths = tuple(registry.get("entrypoints", ENTRYPOINTS)) + tuple(
+        registry.get("runtime_roots", RUNTIME_ROOTS)
+    )
+    discovered, discovery_errors = _discover_sites_with_errors(repo_root, scan_paths)
+    invalid = discovery_errors + validate_registry(repo_root, registry, discovered_sites=discovered)
     classified = {
         (site.get("contract"), f"{site.get('path')}:{site.get('symbol')}")
         for site in registry.get("sites", [])
@@ -355,24 +411,37 @@ def _secret_like(name: str) -> bool:
     return any(token in upper for token in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "COOKIE"))
 
 
-def build_runtime_manifest(*, repo_root: Path, environment_names: Iterable[str]) -> dict[str, Any]:
-    environment: dict[str, dict[str, Any]] = {}
+def build_runtime_manifest(
+    *,
+    repo_root: Path,
+    environment_names: Iterable[str],
+    boundary_core_modules: Iterable[str] = (),
+    plugin_inventory: Any = None,
+    transport_inventory: Any = None,
+) -> dict[str, Any]:
+    environment: dict[str, dict[str, bool]] = {}
     for name in sorted(set(environment_names)):
-        value = os.environ.get(name)
-        secret_like = _secret_like(name)
-        record: dict[str, Any] = {"present": value is not None, "secret_like": secret_like}
-        if value is not None and not secret_like:
-            record["value"] = value
-        environment[name] = record
+        environment[name] = {"present": os.environ.get(name) is not None}
     return {
         "schema_version": 1,
-        "git_head": _git_value(repo_root, "rev-parse", "HEAD"),
-        "git_tree": _git_value(repo_root, "rev-parse", "HEAD^{tree}"),
+        "source_identity": {
+            "git_head": _git_value(repo_root, "rev-parse", "HEAD"),
+            "git_tree": _git_value(repo_root, "rev-parse", "HEAD^{tree}"),
+        },
         "entrypoint_hashes": {
             path: hashlib.sha256((repo_root / path).read_bytes()).hexdigest()
             for path in ENTRYPOINTS
             if (repo_root / path).is_file()
         },
+        "boundary_core_hashes": {
+            path: hashlib.sha256((repo_root / path).read_bytes()).hexdigest()
+            for path in sorted(set(boundary_core_modules))
+            if (repo_root / path).is_file()
+        },
+        "checker_hash": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
+        "registry_hash": hashlib.sha256((repo_root / REGISTRY_PATH).read_bytes()).hexdigest(),
+        "plugin_inventory": plugin_inventory,
+        "transport_inventory": transport_inventory,
         "environment": environment,
     }
 
@@ -385,11 +454,18 @@ def _load_registry(path: Path) -> dict[str, Any]:
     return data
 
 
+def _load_inventory(path: Path) -> Any:
+    with path.open("r", encoding="utf-8") as handle:
+        return json.load(handle)
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--root", type=Path, default=Path(__file__).resolve().parent.parent)
     parser.add_argument("--registry", type=Path)
     parser.add_argument("--manifest-out", type=Path)
+    parser.add_argument("--plugin-inventory", type=Path)
+    parser.add_argument("--transport-inventory", type=Path)
     args = parser.parse_args(argv)
     repo_root = args.root.resolve()
     registry_path = (args.registry or (repo_root / REGISTRY_PATH)).resolve()
@@ -400,9 +476,21 @@ def main(argv: list[str] | None = None) -> int:
         return 2
     report = audit_repository(repo_root, registry)
     if args.manifest_out:
+        if args.plugin_inventory is None or args.transport_inventory is None:
+            print("execution-boundary audit error: --manifest-out requires explicit plugin and transport inventories", file=sys.stderr)
+            return 2
+        try:
+            plugin_inventory = _load_inventory(args.plugin_inventory)
+            transport_inventory = _load_inventory(args.transport_inventory)
+        except (OSError, ValueError, json.JSONDecodeError) as exc:
+            print(f"execution-boundary audit error: {exc}", file=sys.stderr)
+            return 2
         manifest = build_runtime_manifest(
             repo_root=repo_root,
             environment_names=registry.get("manifest_environment_names", []),
+            boundary_core_modules=registry.get("boundary_core_modules", []),
+            plugin_inventory=plugin_inventory,
+            transport_inventory=transport_inventory,
         )
         args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
         args.manifest_out.write_text(

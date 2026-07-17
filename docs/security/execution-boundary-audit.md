@@ -37,6 +37,17 @@ that Python import analysis can enumerate every runtime plugin. CI fails when:
 Reviewed exclusions require a written rationale. New sites are never accepted
 implicitly.
 
+## Documented boundary families
+
+The registry records source-specific evidence rather than assigning generic
+labels. In the owned runtime paths, the contract review also maps discoverable
+recovery, session, credential/provider, profile/plugin, channel, deployment/
+watchdog, resource, approval/lease, clock/network, and backup/restore
+boundaries to their concrete source owners. A family is added to the enforced
+registry only when a path restriction and lifecycle relationship can be named;
+otherwise this document records it as a review family rather than pretending
+that a broad token scan proves coverage.
+
 ## Cross-layer lifecycle checks
 
 | Failure boundary | Required result | Regression proof |
@@ -75,15 +86,17 @@ Windows.
 
 ## Effective runtime manifest
 
-The checker can emit a sanitized manifest with `--manifest-out`. It records:
+The checker can emit a sanitized manifest with `--manifest-out`, plus explicit
+`--plugin-inventory` and `--transport-inventory` JSON inputs. It records:
 
 - source commit and tree;
-- SHA-256 hashes for all shipped entrypoints; and
-- configured environment names and presence.
+- SHA-256 hashes for all shipped entrypoints and registry-declared boundary
+  core modules, plus the checker and registry themselves;
+- explicit effective plugin and transport inventories; and
+- configured environment names and presence only.
 
-Values for names containing key, token, secret, password, credential, or
-cookie are never emitted. The manifest is evidence, not configuration, and it
-does not mutate the runtime.
+No environment values are emitted, including values for non-secret names. The
+manifest is evidence, not configuration, and it does not mutate the runtime.
 
 ## Live read-only snapshot (2026-07-16)
 

@@ -62,6 +62,88 @@
     "OPENROUTER_API_KEY",
     "TELEGRAM_BOT_TOKEN"
   ],
+  "boundary_core_modules": [
+    "agent/task_execution_contract.py",
+    "agent/turn_context.py",
+    "agent/turn_finalizer.py",
+    "cron/jobs.py",
+    "cron/scheduler.py",
+    "gateway/platforms/base.py"
+  ],
+  "lifecycle_relationships": [
+    {
+      "contract": "artifact_request",
+      "from": "agent/task_execution_contract.py:_classify",
+      "to": "agent/conversation_loop.py:_effective_request_system_prompt",
+      "invariant": "A classified artifact request is propagated into the active turn."
+    },
+    {
+      "contract": "artifact_request",
+      "from": "agent/conversation_loop.py:_effective_request_system_prompt",
+      "to": "agent/task_execution_contract.py:TaskExecutionContract.before_tool",
+      "invariant": "The propagated request contract is enforced before a tool call."
+    },
+    {
+      "contract": "artifact_request",
+      "from": "agent/task_execution_contract.py:TaskExecutionContract.before_tool",
+      "to": "agent/turn_finalizer.py:_finalize_turn_impl",
+      "invariant": "Request-scoped enforcement is cleared during finalization."
+    },
+    {
+      "contract": "artifact_delivery",
+      "from": "agent/task_execution_contract.py:build_task_execution_contract",
+      "to": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool",
+      "invariant": "Allocated artifact output is validated before delivery."
+    },
+    {
+      "contract": "artifact_delivery",
+      "from": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool",
+      "to": "cron/scheduler.py:_send_media_via_adapter",
+      "invariant": "Only validated artifact paths may cross a delivery adapter."
+    },
+    {
+      "contract": "artifact_delivery",
+      "from": "cron/scheduler.py:_send_media_via_adapter",
+      "to": "agent/turn_finalizer.py:_finalize_turn_impl",
+      "invariant": "Delivery completion or rejection reaches finalizer recovery."
+    },
+    {
+      "contract": "safe_mode",
+      "from": "hermes_cli/main.py:_apply_safe_mode",
+      "to": "hermes_cli/plugins.py:PluginManager.discover_and_load",
+      "invariant": "Safe-mode decisions constrain plugin discovery for the session lifecycle."
+    },
+    {
+      "contract": "safe_mode",
+      "from": "hermes_cli/plugins.py:PluginManager.discover_and_load",
+      "to": "hermes_cli/main.py:_prepare_agent_startup",
+      "invariant": "Restricted plugin state is preserved through startup lifecycle preparation."
+    },
+    {
+      "contract": "incident_fallback",
+      "from": "agent/chat_completion_helpers.py:try_activate_fallback",
+      "to": "agent/openrouter_fallback_guard.py:_cap_fallback_output",
+      "invariant": "Fallback activation cannot exceed the enforced provider capability cap."
+    },
+    {
+      "contract": "incident_fallback",
+      "from": "agent/openrouter_fallback_guard.py:_cap_fallback_output",
+      "to": "agent/agent_runtime_helpers.py:restore_primary_runtime",
+      "invariant": "Fallback recovery restores primary runtime authority."
+    },
+    {
+      "contract": "cron_restrictions",
+      "from": "cron/jobs.py:create_job",
+      "to": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets",
+      "invariant": "Persisted job allowlists remain bounded when scheduler toolsets are resolved."
+    },
+    {
+      "contract": "cron_restrictions",
+      "from": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets",
+      "to": "cron/jobs.py:update_job",
+      "invariant": "Cron policy recovery updates the persisted restriction rather than expanding defaults."
+    }
+  ],
   "sites": [
     {
       "id": "agent/task_execution_contract.py:TaskExecutionContract",
@@ -2087,6 +2169,60 @@
       "symbol": "_load_mcp_config",
       "disposition": "covered",
       "rationale": "enforcement boundary for the safe mode contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:__module__",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "module-scope contract imports are reviewed as propagation dependencies."
+    },
+    {
+      "id": "agent/tool_guardrails.py:__module__",
+      "contract": "artifact_request",
+      "role": "enforcement",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "module-scope guardrail dependencies are reviewed as enforcement dependencies."
+    },
+    {
+      "id": "gateway/platforms/base.py:__module__",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "module-scope delivery validation dependencies are covered by the base adapter contract."
+    },
+    {
+      "id": "tools/cronjob_tools.py:__module__",
+      "contract": "cron_restrictions",
+      "role": "decision",
+      "path": "tools/cronjob_tools.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "module-scope cron schema dependencies are reviewed as job-policy decisions."
+    },
+    {
+      "id": "agent/chat_completion_helpers.py:__module__",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/chat_completion_helpers.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "module-scope fallback guard dependencies are covered as enforcement."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:__module__",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "module-scope fallback policy dependencies are covered as enforcement."
     }
   ]
 }

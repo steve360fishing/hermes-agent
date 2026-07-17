@@ -1,5 +1,6 @@
 """Tests for cron/scheduler.py — origin resolution, delivery routing, and error logging."""
 
+import concurrent.futures
 import contextlib
 import json
 import logging
@@ -8,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _run_agent_with_inactivity_timeout
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -75,6 +76,46 @@ class TestPerJobToolsetMcpMerge:
         # _get_platform_tools args: (cfg, "cron")
         assert m_platform.call_args[0][1] == "cron"
         assert set(result) == set(sentinel)
+
+    def test_platform_resolution_error_returns_immutable_empty_allowlist(self):
+        with patch("hermes_cli.tools_config._get_platform_tools", side_effect=RuntimeError("broken config")):
+            result = _resolve_cron_enabled_toolsets({"enabled_toolsets": None}, self.CFG)
+
+        assert result == ()
+        assert isinstance(result, tuple)
+
+
+class TestCronInactivityQuarantine:
+    def test_timeout_waits_for_worker_exit_before_releasing_control(self):
+        started = __import__("threading").Event()
+        release = __import__("threading").Event()
+
+        class UncooperativeAgent:
+            def run_conversation(self, _prompt):
+                started.set()
+                release.wait(timeout=5)
+                return {"final_response": "late"}
+
+            def get_activity_summary(self):
+                return {"seconds_since_activity": 10, "last_activity_desc": "stuck"}
+
+            def interrupt(self, _reason):
+                pass
+
+        with concurrent.futures.ThreadPoolExecutor(max_workers=1) as caller:
+            timed_out = caller.submit(
+                _run_agent_with_inactivity_timeout,
+                UncooperativeAgent(),
+                "prompt",
+                0.01,
+                0.005,
+            )
+            assert started.wait(timeout=1)
+            with pytest.raises(concurrent.futures.TimeoutError):
+                timed_out.result(timeout=0.05)
+            release.set()
+            with pytest.raises(TimeoutError, match="idle for"):
+                timed_out.result(timeout=1)
 
 
 class TestResolveOrigin:
@@ -2195,8 +2236,8 @@ class TestRunJobModelResolution:
         assert error is None
         assert mock_agent_cls.call_args.kwargs["model"] == "alias-key-model"
 
-    def test_corrupt_config_yaml_does_not_crash_with_job_model(self, tmp_path, monkeypatch):
-        """A malformed config.yaml degrades gracefully when the job has a model."""
+    def test_corrupt_config_yaml_blocks_execution_even_with_job_model(self, tmp_path, monkeypatch):
+        """A malformed config cannot widen cron authority through a job override."""
         (tmp_path / "config.yaml").write_text("{{{invalid yaml!!!")
         monkeypatch.delenv("HERMES_MODEL", raising=False)
 
@@ -2216,10 +2257,9 @@ class TestRunJobModelResolution:
             mock_agent_cls.return_value = mock_agent
             success, _, _, error = run_job(job)
 
-        # Explicit job model survives the corrupt-config fall-through.
-        assert success is True
-        assert error is None
-        assert mock_agent_cls.call_args.kwargs["model"] == "explicit-model"
+        assert success is False
+        assert "config.yaml" in error
+        mock_agent_cls.assert_not_called()
 
 
 class TestRunJobSkillBacked:
@@ -4805,6 +4845,12 @@ class TestMultiTargetDeliveryContinuesOnFailure:
             mock_pool.submit.return_value = fail_future
 
             result = _deliver_result(job, "Report content")
+
+            # The mocked executor never consumes the fallback coroutine.
+            # Close each submitted coroutine so this test has no hidden async
+            # survivor or unawaited-coroutine warning.
+            for call in mock_pool.submit.call_args_list:
+                call.args[1].close()
 
         assert result is not None
         assert "a@example.com" in result

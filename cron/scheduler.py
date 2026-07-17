@@ -167,7 +167,10 @@ def _merge_mcp_into_per_job_toolsets(per_job: list[str], cfg: dict) -> list[str]
     return result
 
 
-def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
+_CRON_FAIL_CLOSED_TOOLSETS: tuple[str, ...] = ()
+
+
+def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | tuple[str, ...]:
     """Resolve the toolset list for a cron job.
 
     Precedence:
@@ -178,8 +181,9 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
     2. Per-platform ``hermes tools`` config for the ``cron`` platform.
        Mirrors gateway behavior (``_get_platform_tools(cfg, platform_key)``)
        so users can gate cron toolsets globally without recreating every job.
-    3. ``None`` on any lookup failure — AIAgent loads the full default set
-       (legacy behavior before this change, preserved as the safety net).
+    3. An immutable empty allowlist on any lookup failure.  Passing ``None``
+       would make AIAgent load its full default set, expanding authority while
+       the policy source is untrustworthy.
 
     _DEFAULT_OFF_TOOLSETS ({moa, homeassistant, rl}) are removed by
     ``_get_platform_tools`` for unconfigured platforms, so fresh installs
@@ -194,10 +198,62 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | None:
         return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:
         logger.warning(
-            "Cron toolset resolution failed, falling back to full default toolset: %s",
+            "Cron toolset resolution failed; disabling all cron toolsets: %s",
             exc,
         )
-        return None
+        return _CRON_FAIL_CLOSED_TOOLSETS
+
+
+def _run_agent_with_inactivity_timeout(
+    agent: Any,
+    prompt: str,
+    inactivity_limit: float | None,
+    poll_interval: float = 5.0,
+) -> dict:
+    """Run one cron agent without releasing scheduler state before it exits.
+
+    Python cannot safely terminate an arbitrary worker thread.  On timeout we
+    interrupt the agent, then quarantine the cron call by waiting for that
+    worker to exit before raising.  The outer job remains in the running set
+    throughout, preventing a recurrence from overlapping an uncooperative run.
+    """
+    pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
+    context = contextvars.copy_context()
+    future = pool.submit(context.run, agent.run_conversation, prompt)
+    timed_out = False
+    activity: dict[str, Any] = {}
+    try:
+        if inactivity_limit is None:
+            return future.result()
+        while True:
+            done, _ = concurrent.futures.wait({future}, timeout=poll_interval)
+            if done:
+                return future.result()
+            if hasattr(agent, "get_activity_summary"):
+                try:
+                    activity = agent.get_activity_summary() or {}
+                except Exception:
+                    activity = {}
+            if activity.get("seconds_since_activity", 0.0) >= inactivity_limit:
+                timed_out = True
+                break
+        if hasattr(agent, "interrupt"):
+            agent.interrupt("Cron job timed out (inactivity)")
+        # A Future cancellation cannot stop a running Python thread.  Waiting
+        # here is the explicit quarantine contract: no hidden survivor may run
+        # after this cron invocation reports failure.
+        try:
+            future.result()
+        except Exception:
+            pass
+        last_desc = activity.get("last_activity_desc", "unknown")
+        seconds = activity.get("seconds_since_activity", 0)
+        raise TimeoutError(
+            f"Cron job idle for {int(seconds)}s (limit {int(inactivity_limit)}s) "
+            f"— last activity: {last_desc}"
+        )
+    finally:
+        pool.shutdown(wait=True, cancel_futures=not timed_out)
 
 
 def _resolve_cron_reasoning_config(job: dict, cfg: dict) -> dict | None:
@@ -2858,7 +2914,8 @@ def run_job(
                         if _default:
                             model = _default
         except Exception as e:
-            logger.warning("Job '%s': failed to load config.yaml, using defaults: %s", job_id, e)
+            logger.warning("Job '%s': failed to load config.yaml; blocking execution: %s", job_id, e)
+            raise RuntimeError(f"Cron job '{job_name}' blocked: config.yaml could not be loaded") from e
 
         # Fail fast if no model resolved from job / env / config.yaml: an empty
         # model otherwise reaches the provider as an opaque 400 (#23979).
@@ -3113,72 +3170,13 @@ def run_job(
         else:
             _cron_timeout = 600.0
         _cron_inactivity_limit = _cron_timeout if _cron_timeout > 0 else None
-        _POLL_INTERVAL = 5.0
-        _cron_pool = concurrent.futures.ThreadPoolExecutor(max_workers=1)
-        # Preserve scheduler-scoped ContextVar state (for example skill-declared
-        # env passthrough registrations) when the cron run hops into the worker
-        # thread used for inactivity timeout monitoring.
-        _cron_context = contextvars.copy_context()
-        _cron_future = _cron_pool.submit(_cron_context.run, agent.run_conversation, prompt)
-        _inactivity_timeout = False
         try:
-            if _cron_inactivity_limit is None:
-                # Unlimited — just wait for the result.
-                result = _cron_future.result()
-            else:
-                result = None
-                while True:
-                    done, _ = concurrent.futures.wait(
-                        {_cron_future}, timeout=_POLL_INTERVAL,
-                    )
-                    if done:
-                        result = _cron_future.result()
-                        break
-                    # Agent still running — check inactivity.
-                    _idle_secs = 0.0
-                    if hasattr(agent, "get_activity_summary"):
-                        try:
-                            _act = agent.get_activity_summary()
-                            _idle_secs = _act.get("seconds_since_activity", 0.0)
-                        except Exception:
-                            pass
-                    if _idle_secs >= _cron_inactivity_limit:
-                        _inactivity_timeout = True
-                        break
-        except Exception:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-            raise
-        finally:
-            _cron_pool.shutdown(wait=False, cancel_futures=True)
-
-        if _inactivity_timeout:
-            # Build diagnostic summary from the agent's activity tracker.
-            _activity = {}
-            if hasattr(agent, "get_activity_summary"):
-                try:
-                    _activity = agent.get_activity_summary()
-                except Exception:
-                    pass
-            _last_desc = _activity.get("last_activity_desc", "unknown")
-            _secs_ago = _activity.get("seconds_since_activity", 0)
-            _cur_tool = _activity.get("current_tool")
-            _iter_n = _activity.get("api_call_count", 0)
-            _iter_max = _activity.get("max_iterations", 0)
-
-            logger.error(
-                "Job '%s' idle for %.0fs (inactivity limit %.0fs) "
-                "| last_activity=%s | iteration=%s/%s | tool=%s",
-                job_name, _secs_ago, _cron_inactivity_limit,
-                _last_desc, _iter_n, _iter_max,
-                _cur_tool or "none",
+            result = _run_agent_with_inactivity_timeout(
+                agent, prompt, _cron_inactivity_limit,
             )
-            if hasattr(agent, "interrupt"):
-                agent.interrupt("Cron job timed out (inactivity)")
-            raise TimeoutError(
-                f"Cron job '{job_name}' idle for "
-                f"{int(_secs_ago)}s (limit {int(_cron_inactivity_limit)}s) "
-                f"— last activity: {_last_desc}"
-            )
+        except TimeoutError as exc:
+            logger.error("Job '%s' timed out and remains quarantined until its worker exits: %s", job_name, exc)
+            raise TimeoutError(f"Cron job '{job_name}' {exc}") from exc
 
         # Guard against non-dict returns from run_conversation under error conditions
         if not isinstance(result, dict):
