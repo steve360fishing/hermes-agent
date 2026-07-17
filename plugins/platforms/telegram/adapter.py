@@ -294,6 +294,7 @@ from plugins.platforms.telegram.telegram_network import (
     discover_fallback_ips,
     parse_fallback_ip_env,
 )
+from plugins.platforms.telegram.liveness import write_polling_liveness_marker
 from utils import atomic_replace, env_float, env_int
 
 _TELEGRAM_IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".webp", ".gif"}
@@ -2240,6 +2241,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, attempt,
             )
             self._polling_network_error_count = 0
+            self._record_polling_liveness()
             # start_polling() succeeding IS the recovery signal: the long-poll
             # connection is live again, so clear the degraded flag immediately
             # rather than blocking all outbound sends for the full
@@ -2328,7 +2330,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 # probes see a non-zero queue while we believe we're polling, so
                 # a single in-flight update (consumed before the next probe)
                 # never trips recovery.
-                await self._probe_pending_updates(bot, PROBE_TIMEOUT)
+                if await self._probe_pending_updates(bot, PROBE_TIMEOUT):
+                    self._record_polling_liveness()
             except asyncio.CancelledError:
                 return
             except (asyncio.TimeoutError, OSError) as probe_err:
@@ -2347,7 +2350,7 @@ class TelegramAdapter(BasePlatformAdapter):
                 # CLOSE-WAIT symptoms — let PTB's own handlers surface them.
                 pass
 
-    async def _probe_pending_updates(self, bot, probe_timeout: float) -> None:
+    async def _probe_pending_updates(self, bot, probe_timeout: float) -> bool:
         """Detect a wedged getUpdates consumer via pending_update_count.
 
         PTB can report ``updater.running == True`` while its long-poll task is
@@ -2373,17 +2376,17 @@ class TelegramAdapter(BasePlatformAdapter):
         # Only meaningful in polling mode; in webhook mode Telegram pushes
         # updates and holds no server-side queue.
         if self._webhook_mode:
-            return
+            return False
         # A reconnect already in flight owns recovery — don't double-trigger,
         # and don't misread its brief stop()->start_polling() window (where
         # updater.running is transiently False) as a dead updater below.
         if self._polling_error_task and not self._polling_error_task.done():
             self._polling_not_running_count = 0
-            return
+            return False
         updater = getattr(self._app, "updater", None) if self._app else None
         if updater is None:
             self._polling_pending_stuck_count = 0
-            return
+            return False
         if not getattr(updater, "running", False):
             # We are in polling mode with no reconnect in flight, yet PTB's
             # updater has stopped entirely. This is distinct from the
@@ -2414,21 +2417,21 @@ class TelegramAdapter(BasePlatformAdapter):
                         RuntimeError("Telegram updater stopped while in polling mode")
                     )
                 )
-            return
+            return False
         self._polling_not_running_count = 0
         get_webhook_info = getattr(bot, "get_webhook_info", None)
         if not callable(get_webhook_info):
-            return
+            return False
         try:
             info = await asyncio.wait_for(get_webhook_info(), probe_timeout)  # type: ignore[arg-type]
         except (asyncio.TimeoutError, OSError):
             # A failed probe is a connectivity symptom the get_me() path or the
             # outer handler will catch; don't treat it as a stuck-queue signal.
-            return
+            return False
         pending = int(getattr(info, "pending_update_count", 0) or 0)
         if pending <= 0:
             self._polling_pending_stuck_count = 0
-            return
+            return True
         self._polling_pending_stuck_count += 1
         logger.warning(
             "[%s] Telegram polling heartbeat: %d update(s) queued but not "
@@ -2448,6 +2451,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     RuntimeError("getUpdates consumer wedged: pending updates not draining")
                 )
             )
+        return False
 
     async def _verify_polling_after_reconnect(self) -> None:
         """Heartbeat probe scheduled after a successful reconnect.
@@ -2487,12 +2491,24 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
+            self._record_polling_liveness()
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
                 self.name, HEARTBEAT_PROBE_DELAY, probe_err,
             )
             await self._handle_polling_network_error(probe_err)
+
+    def _record_polling_liveness(self) -> None:
+        """Persist only real successful polling/connectivity evidence.
+
+        The marker is deliberately best-effort: a filesystem failure must make
+        the host watchdog fail closed, never take down an otherwise live
+        gateway. No provider result, token, chat id, or message content is
+        persisted.
+        """
+        if not write_polling_liveness_marker():
+            logger.debug("[%s] Telegram liveness marker was not written", self.name)
 
     def _disarm_ptb_retry_loop(self) -> None:
         """Synchronously stop PTB's internal polling retry loop.
@@ -3471,6 +3487,8 @@ class TelegramAdapter(BasePlatformAdapter):
                         "polling will be retried in the background",
                         self.name,
                     )
+                else:
+                    self._record_polling_liveness()
             
             self._mark_connected()
             mode = "webhook" if self._webhook_mode else "polling"
