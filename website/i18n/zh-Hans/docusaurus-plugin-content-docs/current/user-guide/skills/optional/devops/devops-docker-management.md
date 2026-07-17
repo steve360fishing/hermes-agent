@@ -140,10 +140,11 @@ docker top NAME                        # 运行中的进程
 
 ```bash
 # 构建
-docker build -t my-app:latest .
+# Hermes 根 Dockerfile 需要不可变的源代码来源：
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-app:latest .
 docker build -t my-app:prod -f Dockerfile.prod .
-docker build --no-cache -t my-app .              # 全量重新构建
-DOCKER_BUILDKIT=1 docker build -t my-app .       # 使用 BuildKit 加速
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" --no-cache -t my-app .  # 全量重新构建
+DOCKER_BUILDKIT=1 docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-app .  # 使用 BuildKit 加速
 
 # 拉取与推送
 docker pull node:20-alpine

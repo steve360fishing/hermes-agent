@@ -124,10 +124,11 @@ docker top NAME                        # running processes
 
 ```bash
 # Build
-docker build -t my-app:latest .
+# Hermes root Dockerfile requires immutable source provenance:
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-app:latest .
 docker build -t my-app:prod -f Dockerfile.prod .
-docker build --no-cache -t my-app .              # clean rebuild
-DOCKER_BUILDKIT=1 docker build -t my-app .       # faster with BuildKit
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" --no-cache -t my-app .  # clean rebuild
+DOCKER_BUILDKIT=1 docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-app .  # faster with BuildKit
 
 # Pull and push
 docker pull node:20-alpine
