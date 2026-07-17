@@ -1660,6 +1660,29 @@ def write_file_tool(path: str, content: str, task_id: str = "default",
             "file contents before writing."
         )
     try:
+        from agent.task_execution_contract import (
+            is_registered_artifact_path,
+            write_registered_artifact,
+        )
+
+        if is_registered_artifact_path(path):
+            success, error, bytes_written = write_registered_artifact(path, content)
+            if not success:
+                return tool_error(error)
+            resolved = os.path.abspath(os.path.expanduser(path))
+            _mark_verification_stale(task_id, [resolved], session_id=session_id)
+            file_state.note_write(task_id, resolved)
+            return json.dumps(
+                {
+                    "bytes_written": bytes_written,
+                    "resolved_path": resolved,
+                    "files_modified": [resolved],
+                },
+                ensure_ascii=False,
+            )
+    except ImportError:
+        pass
+    try:
         # Resolve once for the registry lock + stale check.  Failures here
         # fall back to the legacy path — write proceeds, per-task staleness
         # check below still runs.

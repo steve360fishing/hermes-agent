@@ -13255,19 +13255,34 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         pass
                     return True
                 try:
+                    notice_result = await adapter.send(
+                        chat_id=event.source.chat_id,
+                        content="⚠️ Couldn't deliver the requested attachment."
+                        + (f" Reference: {correlation_id}." if correlation_id else ""),
+                        metadata=_thread_meta,
+                    )
+                except Exception:
+                    notice_result = None
+                notice_ok = getattr(notice_result, "success", False)
+                try:
                     from agent.task_execution_contract import record_artifact_dispatch
 
                     correlation_id = record_artifact_dispatch(
-                        file_path, state="ambiguous", error_code=str(getattr(result, "error", "document_dispatch_failed"))
+                        file_path,
+                        state="ambiguous",
+                        error_code=(
+                            str(getattr(result, "error", "document_dispatch_failed"))
+                            if notice_ok
+                            else "failure_notice_undelivered"
+                        ),
                     ) or correlation_id
                 except Exception:
                     pass
-                await adapter.send(
-                    chat_id=event.source.chat_id,
-                    content="⚠️ Couldn't deliver the requested attachment."
-                    + (f" Reference: {correlation_id}." if correlation_id else ""),
-                    metadata=_thread_meta,
-                )
+                if not notice_ok:
+                    logger.error(
+                        "[%s] Artifact and failure-notice delivery both failed",
+                        adapter.name,
+                    )
                 return False
 
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}

@@ -68,6 +68,19 @@ def _safe_artifact_delivery_failure(correlation_id: str | None) -> str:
     return f"⚠️ Couldn't deliver the requested attachment.{suffix}"
 
 
+async def _send_artifact_failure_notice(adapter, *, chat_id: str, correlation_id: str | None, metadata) -> bool:
+    """Attempt the one safe notice once and verify the platform result."""
+    try:
+        result = await adapter.send(
+            chat_id=chat_id,
+            content=_safe_artifact_delivery_failure(correlation_id),
+            metadata=metadata,
+        )
+    except Exception:
+        return False
+    return getattr(result, "success", False) is True
+
+
 def _platform_name(platform) -> str:
     """Normalize a Platform enum / raw string into a lowercase name."""
     value = getattr(platform, "value", platform)
@@ -5163,23 +5176,45 @@ class BasePlatformAdapter(ABC):
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             if ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                                _artifact_dispatch_failed(media_path, getattr(media_result, "error", ""))
-                                await self.send(
+                                notice_ok = await _send_artifact_failure_notice(
+                                    self,
                                     chat_id=event.source.chat_id,
-                                    content=_safe_artifact_delivery_failure(_artifact_correlation),
+                                    correlation_id=_artifact_correlation,
                                     metadata=_final_thread_metadata,
                                 )
+                                _artifact_dispatch_failed(
+                                    media_path,
+                                    (
+                                        str(getattr(media_result, "error", "") or "document_dispatch_failed")
+                                        if notice_ok
+                                        else "failure_notice_undelivered"
+                                    ),
+                                )
+                                if not notice_ok:
+                                    logger.error(
+                                        "[%s] Artifact and failure-notice delivery both failed",
+                                        self.name,
+                                    )
                         elif ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
                             _artifact_dispatch_delivered(media_path, getattr(media_result, "message_id", None))
                     except Exception as media_err:
                         logger.warning("[%s] Error sending media: %s", self.name, media_err)
                         if ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            _artifact_dispatch_failed(media_path, "document_dispatch_exception")
-                            await self.send(
+                            notice_ok = await _send_artifact_failure_notice(
+                                self,
                                 chat_id=event.source.chat_id,
-                                content=_safe_artifact_delivery_failure(None),
+                                correlation_id=None,
                                 metadata=_final_thread_metadata,
                             )
+                            _artifact_dispatch_failed(
+                                media_path,
+                                "document_dispatch_exception" if notice_ok else "failure_notice_undelivered",
+                            )
+                            if not notice_ok:
+                                logger.error(
+                                    "[%s] Artifact and failure-notice delivery both failed",
+                                    self.name,
+                                )
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:

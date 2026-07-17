@@ -15,6 +15,7 @@ import logging
 import os
 import html as _html
 import re
+import stat
 import threading
 import warnings
 from datetime import datetime, timezone
@@ -44,6 +45,45 @@ def _redact_telegram_error_text(error: object) -> str:
         return redact_sensitive_text(text, force=True)
     except Exception:
         return "<telegram error redacted>"
+
+
+class _UnsafeDocumentPath(OSError):
+    pass
+
+
+def _document_stat_identity(value: os.stat_result) -> tuple[int, int] | None:
+    inode = int(getattr(value, "st_ino", 0) or 0)
+    if inode == 0:
+        return None
+    return int(getattr(value, "st_dev", 0) or 0), inode
+
+
+def _open_verified_document_descriptor(file_path: str) -> int:
+    """Open once and prove the visible path names that same regular file."""
+    before = os.lstat(file_path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise _UnsafeDocumentPath("document_path_unsafe")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(file_path, flags)
+    try:
+        opened = os.fstat(fd)
+        identity = _document_stat_identity(opened)
+        if identity is None or _document_stat_identity(before) != identity:
+            raise _UnsafeDocumentPath("document_path_changed")
+        try:
+            from agent.task_execution_contract import registered_artifact_identity_matches
+
+            if not registered_artifact_identity_matches(file_path, opened):
+                raise _UnsafeDocumentPath("document_path_changed")
+        except ImportError:
+            pass
+        after_open = os.lstat(file_path)
+        if stat.S_ISLNK(after_open.st_mode) or _document_stat_identity(after_open) != identity:
+            raise _UnsafeDocumentPath("document_path_changed")
+        return fd
+    except BaseException:
+        os.close(fd)
+        raise
 
 
 def _consume_abandoned_task(task: asyncio.Task) -> None:
@@ -6213,14 +6253,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
 
-            open_flags = os.O_RDONLY
-            nofollow = getattr(os, "O_NOFOLLOW", 0)
-            if nofollow:
-                open_flags |= nofollow
-            fd = os.open(file_path, open_flags)
+            fd = _open_verified_document_descriptor(file_path)
             try:
-                if os.path.islink(file_path):
-                    return SendResult(success=False, error="document_path_symlink")
                 with os.fdopen(fd, "rb") as f:
                     fd = None
                     msg = await self._send_with_dm_topic_reply_anchor_retry(
@@ -6243,6 +6277,8 @@ class TelegramAdapter(BasePlatformAdapter):
                 if fd is not None:
                     os.close(fd)
             return SendResult(success=True, message_id=str(msg.message_id))
+        except _UnsafeDocumentPath as e:
+            return SendResult(success=False, error=str(e) or "document_path_changed")
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send document: %s",

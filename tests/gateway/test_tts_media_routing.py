@@ -7,6 +7,9 @@ only renders as a voice bubble when explicitly flagged) and via
 ``GatewayRunner._deliver_media_from_response``.
 """
 
+import json
+import os
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock
 
@@ -115,6 +118,69 @@ async def test_document_exception_emits_safe_visible_failure(tmp_path, monkeypat
 
 
 @pytest.mark.asyncio
+async def test_failed_failure_notice_is_not_treated_as_visible_success(tmp_path, monkeypatch):
+    from agent.task_execution_contract import (
+        _ARTIFACT_RECEIPTS,
+        build_task_execution_contract,
+        record_artifact_written,
+    )
+
+    root = tmp_path / "media-cache"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(root))
+    contract = build_task_execution_contract(
+        "Create and deliver report.txt containing safe text.",
+        task_id="failed-notice",
+        platform="telegram",
+    )
+    Path(contract.artifact_output_path).write_bytes(b"media")
+    assert record_artifact_written(contract) is True
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
+
+    adapter = _MediaRoutingAdapter()
+    event = _event()
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{contract.artifact_output_path}")
+    adapter.send_document = AsyncMock(return_value=SendResult(success=False, error="rejected"))
+    adapter.send = AsyncMock(return_value=SendResult(success=False, error="notice rejected"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "ambiguous"
+    assert receipt["error_code"] == "failure_notice_undelivered"
+    assert adapter.send.await_count == 1
+    assert os.path.abspath(contract.artifact_output_path) not in _ARTIFACT_RECEIPTS
+    assert not Path(contract.artifact_root).exists()
+
+
+@pytest.mark.asyncio
+async def test_failure_notice_exception_is_attempted_once(tmp_path, monkeypatch):
+    from agent.task_execution_contract import build_task_execution_contract, record_artifact_written
+
+    root = tmp_path / "media-cache"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(root))
+    contract = build_task_execution_contract(
+        "Create and deliver report.txt containing safe text.",
+        task_id="failed-notice-exception",
+        platform="telegram",
+    )
+    Path(contract.artifact_output_path).write_bytes(b"media")
+    assert record_artifact_written(contract) is True
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
+    adapter = _MediaRoutingAdapter()
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{contract.artifact_output_path}")
+    adapter.send_document = AsyncMock(return_value=SendResult(success=False, error="rejected"))
+    adapter.send = AsyncMock(side_effect=RuntimeError("notice transport failed"))
+
+    await adapter._process_message_background(_event(), build_session_key(_event().source))
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["error_code"] == "failure_notice_undelivered"
+    assert adapter.send.await_count == 1
+
+
+@pytest.mark.asyncio
 async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
     event = _event()
@@ -162,6 +228,46 @@ def _fake_runner(thread_meta):
         _reply_anchor_for_event=lambda event: None,
     )
     return runner
+
+
+@pytest.mark.asyncio
+async def test_streaming_failed_failure_notice_records_undelivered(tmp_path, monkeypatch):
+    from agent.task_execution_contract import build_task_execution_contract, record_artifact_written
+
+    root = tmp_path / "media-cache"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(root))
+    contract = build_task_execution_contract(
+        "Create and deliver report.txt containing safe text.",
+        task_id="stream-failed-notice",
+        platform="telegram",
+    )
+    Path(contract.artifact_output_path).write_bytes(b"media")
+    assert record_artifact_written(contract) is True
+    monkeypatch.setattr("gateway.platforms.base.MEDIA_DELIVERY_SAFE_ROOTS", (root,))
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=False, error="notice rejected")),
+        send_voice=AsyncMock(),
+        send_document=AsyncMock(return_value=SendResult(success=False, error="rejected")),
+        send_image_file=AsyncMock(),
+        send_video=AsyncMock(),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"MEDIA:{contract.artifact_output_path}",
+        _event(thread_id="topic-1"),
+        adapter,
+    )
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "ambiguous"
+    assert receipt["error_code"] == "failure_notice_undelivered"
+    adapter.send.assert_awaited_once()
 
 
 @pytest.mark.asyncio

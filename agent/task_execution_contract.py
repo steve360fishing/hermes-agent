@@ -11,6 +11,7 @@ import hashlib
 import json
 import os
 import re
+import stat
 import tempfile
 import threading
 import time
@@ -26,8 +27,15 @@ NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
 POLICY_VERSION = "artifact-only-v2"
 MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
-_ARTIFACT_RECEIPT_LOCK = threading.Lock()
+_ARTIFACT_RECEIPT_LOCK = threading.RLock()
 _ARTIFACT_RECEIPTS: dict[str, "TaskExecutionContract"] = {}
+_TERMINAL_RECEIPT_STATES = frozenset({"delivered", "failed_preflight", "ambiguous"})
+_ALLOWED_RECEIPT_TRANSITIONS = {
+    "": frozenset({"allocated"}),
+    "allocated": frozenset({"allocated", "written", "failed_preflight", "ambiguous"}),
+    "written": frozenset({"written", "dispatching", "failed_preflight", "ambiguous"}),
+    "dispatching": frozenset({"dispatching", "delivered", "ambiguous"}),
+}
 
 _SUPPORTED_ARTIFACT_TYPES = {
     ".txt": "text/plain",
@@ -124,6 +132,7 @@ class TaskExecutionContract:
     _truncated_chars: int = 0
     _started_at: float = field(default_factory=time.monotonic, repr=False)
     _lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    _artifact_identity: tuple[int, int] | None = field(default=None, repr=False)
     active: bool = True
 
     @property
@@ -415,7 +424,13 @@ def build_task_execution_contract(
             preflight_error = preflight_error or "artifact_output_unavailable"
         else:
             artifact_root, output_path, artifact_route = prepared
-            artifact_receipt_path = os.path.join(artifact_root, ".artifact-delivery-receipt.json")
+            receipts_root = os.path.join(os.path.dirname(artifact_root), ".receipts")
+            try:
+                os.makedirs(receipts_root, mode=0o700, exist_ok=True)
+            except OSError:
+                preflight_error = "artifact_output_unavailable"
+            else:
+                artifact_receipt_path = os.path.join(receipts_root, f"{artifact_id}.json")
     explicit_urls = frozenset(
         filter(None, (_normalized_url(url.rstrip(".,);]")) for url in _URL.findall(text)))
     )
@@ -436,9 +451,9 @@ def build_task_execution_contract(
         explicit_urls=explicit_urls,
     )
     if contract.artifact_file_requested and not contract.preflight_error:
-        _write_artifact_receipt(contract, state="allocated")
         with _ARTIFACT_RECEIPT_LOCK:
-            _ARTIFACT_RECEIPTS[os.path.realpath(contract.artifact_output_path)] = contract
+            _ARTIFACT_RECEIPTS[_artifact_registry_key(contract.artifact_output_path)] = contract
+            _write_artifact_receipt_locked(contract, state="allocated")
     return contract
 
 
@@ -454,22 +469,150 @@ def artifact_content_fits(content: str) -> bool:
         return False
 
 
+def _artifact_registry_key(path: str) -> str:
+    return os.path.normcase(os.path.abspath(os.path.expanduser(str(path or ""))))
+
+
+def _stat_identity(value: os.stat_result) -> tuple[int, int] | None:
+    device = int(getattr(value, "st_dev", 0) or 0)
+    inode = int(getattr(value, "st_ino", 0) or 0)
+    if inode == 0:
+        return None
+    return device, inode
+
+
+def _artifact_error_code(exc: OSError, default: str) -> str:
+    if isinstance(exc, FileExistsError):
+        return "artifact_destination_exists"
+    for item in getattr(exc, "args", ()):
+        if isinstance(item, str) and re.fullmatch(r"artifact_[a-z_]+", item):
+            return item
+    return default
+
+
+def _verified_artifact_bytes(contract: TaskExecutionContract) -> tuple[bytes, tuple[int, int]]:
+    path = contract.artifact_output_path
+    before = os.lstat(path)
+    if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+        raise OSError("artifact_not_regular")
+    flags = os.O_RDONLY | getattr(os, "O_BINARY", 0) | getattr(os, "O_NOFOLLOW", 0)
+    fd = os.open(path, flags)
+    try:
+        opened = os.fstat(fd)
+        identity = _stat_identity(opened)
+        if identity is None or _stat_identity(before) != identity:
+            raise OSError("artifact_path_changed")
+        after_open = os.lstat(path)
+        if stat.S_ISLNK(after_open.st_mode) or _stat_identity(after_open) != identity:
+            raise OSError("artifact_path_changed")
+        chunks: list[bytes] = []
+        remaining = MAX_ARTIFACT_BYTES + 1
+        while remaining > 0:
+            chunk = os.read(fd, min(1024 * 1024, remaining))
+            if not chunk:
+                break
+            chunks.append(chunk)
+            remaining -= len(chunk)
+        final_fd = os.fstat(fd)
+        final_path = os.lstat(path)
+        if _stat_identity(final_fd) != identity or _stat_identity(final_path) != identity:
+            raise OSError("artifact_path_changed")
+        payload = b"".join(chunks)
+        if len(payload) > MAX_ARTIFACT_BYTES or len(payload) != final_fd.st_size:
+            raise OSError("artifact_oversize_or_changed")
+        return payload, identity
+    finally:
+        os.close(fd)
+
+
+def write_registered_artifact(path: str, content: str) -> tuple[bool, str, int]:
+    """Create one registered artifact through an exclusive, descriptor-pinned write."""
+    key = _artifact_registry_key(path)
+    with _ARTIFACT_RECEIPT_LOCK:
+        contract = _ARTIFACT_RECEIPTS.get(key)
+    if contract is None or not contract.active:
+        return False, "artifact_contract_unavailable", 0
+    if key != _artifact_registry_key(contract.artifact_output_path):
+        return False, "artifact_write_path_denied", 0
+    if not artifact_content_fits(content):
+        return False, "artifact_write_too_large", 0
+    payload = content.encode("utf-8")
+    flags = (
+        os.O_WRONLY
+        | os.O_CREAT
+        | os.O_EXCL
+        | getattr(os, "O_BINARY", 0)
+        | getattr(os, "O_NOFOLLOW", 0)
+    )
+    fd: int | None = None
+    created_identity: tuple[int, int] | None = None
+    try:
+        fd = os.open(contract.artifact_output_path, flags, 0o600)
+        opened = os.fstat(fd)
+        created_identity = _stat_identity(opened)
+        if created_identity is None or not stat.S_ISREG(opened.st_mode):
+            raise OSError("artifact_identity_unavailable")
+        visible = os.lstat(contract.artifact_output_path)
+        if stat.S_ISLNK(visible.st_mode) or _stat_identity(visible) != created_identity:
+            raise OSError("artifact_path_changed")
+        offset = 0
+        while offset < len(payload):
+            offset += os.write(fd, payload[offset:])
+        os.fsync(fd)
+        final_fd = os.fstat(fd)
+        final_path = os.lstat(contract.artifact_output_path)
+        if (
+            _stat_identity(final_fd) != created_identity
+            or _stat_identity(final_path) != created_identity
+            or final_fd.st_size != len(payload)
+        ):
+            raise OSError("artifact_path_changed")
+        contract._artifact_identity = created_identity
+        return True, "", len(payload)
+    except OSError as exc:
+        return False, _artifact_error_code(exc, "artifact_write_failed"), 0
+    finally:
+        if fd is not None:
+            os.close(fd)
+        if created_identity is not None:
+            try:
+                current = os.lstat(contract.artifact_output_path)
+                if _stat_identity(current) == created_identity and contract._artifact_identity != created_identity:
+                    os.unlink(contract.artifact_output_path)
+            except OSError:
+                pass
+
+
+def is_registered_artifact_path(path: str) -> bool:
+    with _ARTIFACT_RECEIPT_LOCK:
+        return _artifact_registry_key(path) in _ARTIFACT_RECEIPTS
+
+
+def registered_artifact_identity_matches(path: str, opened: os.stat_result) -> bool:
+    """Bind provider delivery to the inode verified by the canonical writer/finalizer."""
+    with _ARTIFACT_RECEIPT_LOCK:
+        contract = _ARTIFACT_RECEIPTS.get(_artifact_registry_key(path))
+        if contract is None:
+            return True
+        return (
+            contract._artifact_identity is not None
+            and contract._artifact_identity == _stat_identity(opened)
+        )
+
+
 def record_artifact_written(contract: TaskExecutionContract) -> bool:
     """Atomically record the bytes actually present after the canonical writer ran."""
     try:
         path = os.path.realpath(contract.artifact_output_path)
         if validate_artifact_output_path(path, contract.artifact_root) is not None:
-            _write_artifact_receipt(contract, state="failed_preflight", error_code="invalid_output_path")
+            finalize_artifact_contract(
+                contract,
+                state="failed_preflight",
+                error_code="invalid_output_path",
+            )
             return False
-        stat = os.lstat(path)
-        if os.path.islink(path) or stat.st_size > MAX_ARTIFACT_BYTES:
-            _write_artifact_receipt(contract, state="failed_preflight", error_code="unsafe_or_oversize")
-            return False
-        with open(path, "rb") as artifact:
-            payload = artifact.read()
-        if len(payload) != stat.st_size:
-            _write_artifact_receipt(contract, state="ambiguous", error_code="artifact_changed_during_read")
-            return False
+        payload, identity = _verified_artifact_bytes(contract)
+        contract._artifact_identity = identity
         _write_artifact_receipt(
             contract,
             state="written",
@@ -477,19 +620,51 @@ def record_artifact_written(contract: TaskExecutionContract) -> bool:
             size=len(payload),
         )
         return True
-    except OSError:
-        _write_artifact_receipt(contract, state="failed_preflight", error_code="artifact_unreadable")
+    except OSError as exc:
+        finalize_artifact_contract(
+            contract,
+            state="failed_preflight",
+            error_code=_artifact_error_code(exc, "artifact_unreadable"),
+        )
         return False
 
 
 def record_artifact_dispatch(path: str, *, state: str, message_id: Any = None, error_code: str = "") -> str | None:
     """Advance a registered artifact receipt without persisting user content."""
+    cleanup_contract = None
     with _ARTIFACT_RECEIPT_LOCK:
-        contract = _ARTIFACT_RECEIPTS.get(os.path.realpath(path))
-    if contract is None:
-        return None
-    _write_artifact_receipt(contract, state=state, message_id=message_id, error_code=error_code)
+        key = _artifact_registry_key(path)
+        contract = _ARTIFACT_RECEIPTS.get(key)
+        if contract is None:
+            return None
+        receipt = _write_artifact_receipt_locked(
+            contract,
+            state=state,
+            message_id=message_id,
+            error_code=error_code,
+        )
+        if receipt.get("state") in _TERMINAL_RECEIPT_STATES:
+            _ARTIFACT_RECEIPTS.pop(key, None)
+            cleanup_contract = contract
+    if cleanup_contract is not None:
+        _cleanup_task_owned_artifact(cleanup_contract)
     return contract.correlation_id
+
+
+def finalize_artifact_contract(
+    contract: TaskExecutionContract,
+    *,
+    state: str,
+    error_code: str,
+) -> None:
+    """Terminalize a turn that cannot reach provider dispatch."""
+    if state not in _TERMINAL_RECEIPT_STATES:
+        raise ValueError("artifact terminal state required")
+    key = _artifact_registry_key(contract.artifact_output_path)
+    with _ARTIFACT_RECEIPT_LOCK:
+        _write_artifact_receipt_locked(contract, state=state, error_code=error_code)
+        _ARTIFACT_RECEIPTS.pop(key, None)
+    _cleanup_task_owned_artifact(contract)
 
 
 def _write_artifact_receipt(
@@ -500,15 +675,40 @@ def _write_artifact_receipt(
     size: int | None = None,
     message_id: Any = None,
     error_code: str = "",
-) -> None:
+) -> dict[str, Any]:
+    with _ARTIFACT_RECEIPT_LOCK:
+        return _write_artifact_receipt_locked(
+            contract,
+            state=state,
+            sha256=sha256,
+            size=size,
+            message_id=message_id,
+            error_code=error_code,
+        )
+
+
+def _write_artifact_receipt_locked(
+    contract: TaskExecutionContract,
+    *,
+    state: str,
+    sha256: str = "",
+    size: int | None = None,
+    message_id: Any = None,
+    error_code: str = "",
+) -> dict[str, Any]:
     if not contract.artifact_receipt_path:
-        return
+        return {}
     prior: dict[str, Any] = {}
     try:
         with open(contract.artifact_receipt_path, "r", encoding="utf-8") as source:
             prior = json.load(source)
     except (OSError, ValueError):
         pass
+    prior_state = str(prior.get("state", ""))
+    if prior_state in _TERMINAL_RECEIPT_STATES:
+        return prior
+    if state not in _ALLOWED_RECEIPT_TRANSITIONS.get(prior_state, frozenset()):
+        return prior
     receipt = {
         "id": contract.artifact_id,
         "turn": contract.correlation_id,
@@ -517,7 +717,8 @@ def _write_artifact_receipt(
         "bytes": size if size is not None else prior.get("bytes", 0),
         "mime": contract.artifact_mime_type,
         "state": state,
-        "attempt_count": int(prior.get("attempt_count", 0)) + (1 if state == "dispatching" else 0),
+        "attempt_count": int(prior.get("attempt_count", 0))
+        + (1 if state == "dispatching" and prior_state != "dispatching" else 0),
         "platform_message_id": str(message_id) if message_id is not None else prior.get("platform_message_id", ""),
         "error_code": error_code,
     }
@@ -533,6 +734,28 @@ def _write_artifact_receipt(
             os.unlink(temporary)
         except (OSError, UnboundLocalError):
             pass
+    return receipt
+
+
+def _cleanup_task_owned_artifact(contract: TaskExecutionContract) -> None:
+    """Remove only the verified output and its dedicated, now-empty task directory."""
+    root = os.path.abspath(contract.artifact_root)
+    if not contract.artifact_id or os.path.basename(root) != contract.artifact_id:
+        return
+    output = os.path.abspath(contract.artifact_output_path)
+    if os.path.dirname(output) != root:
+        return
+    if contract._artifact_identity is not None:
+        try:
+            current = os.lstat(output)
+            if _stat_identity(current) == contract._artifact_identity:
+                os.unlink(output)
+        except OSError:
+            pass
+    try:
+        os.rmdir(root)
+    except OSError:
+        pass
 
 
 def _trusted_request_text(text: str) -> str:
@@ -546,6 +769,21 @@ def clear_task_execution_contract(agent: Any) -> None:
     """Clear and expire any policy left by the previous request."""
     contract = getattr(agent, "_task_execution_contract", None)
     if contract is not None:
+        key = _artifact_registry_key(getattr(contract, "artifact_output_path", ""))
+        with _ARTIFACT_RECEIPT_LOCK:
+            registered = _ARTIFACT_RECEIPTS.get(key) is contract
+            receipt = {}
+            try:
+                with open(contract.artifact_receipt_path, "r", encoding="utf-8") as source:
+                    receipt = json.load(source)
+            except (OSError, ValueError, TypeError):
+                pass
+        if registered and receipt.get("state") == "allocated":
+            finalize_artifact_contract(
+                contract,
+                state="failed_preflight",
+                error_code="artifact_turn_ended_before_write",
+            )
         deactivate = getattr(contract, "deactivate", None)
         if callable(deactivate):
             deactivate()

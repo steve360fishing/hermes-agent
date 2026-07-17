@@ -11,6 +11,7 @@ We mock the telegram module at import time to avoid collection errors.
 import asyncio
 import os
 import sys
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock, patch
 
@@ -737,6 +738,63 @@ class TestSendDocument:
         assert result.message_id == "101"
         assert captured["filename"] == "example.txt"
         assert SUPPORTED_DOCUMENT_TYPES[".txt"] == "text/plain"
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejects_path_swap_without_o_nofollow(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        original = tmp_path / "report.txt"
+        replacement = tmp_path / "replacement.txt"
+        original.write_bytes(b"trusted")
+        replacement.write_bytes(b"attacker")
+        real_open = os.open
+        swapped = False
+
+        def swap_then_open(path, flags, *args, **kwargs):
+            nonlocal swapped
+            if os.path.abspath(path) == os.path.abspath(original) and not swapped:
+                swapped = True
+                os.replace(replacement, original)
+            return real_open(path, flags, *args, **kwargs)
+
+        monkeypatch.setattr(os, "O_NOFOLLOW", 0, raising=False)
+        monkeypatch.setattr(os, "open", swap_then_open)
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(original)
+        )
+
+        assert result.success is False
+        assert result.error == "document_path_changed"
+        connected_adapter._bot.send_document.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_send_document_rejects_artifact_replaced_after_write_verification(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import build_task_execution_contract, record_artifact_written
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver report.txt containing safe text.",
+            task_id="post-write-swap",
+            platform="telegram",
+        )
+        artifact = Path(contract.artifact_output_path)
+        artifact.write_bytes(b"trusted")
+        assert record_artifact_written(contract) is True
+        replacement = tmp_path / "replacement.txt"
+        replacement.write_bytes(b"attacker")
+        os.replace(replacement, artifact)
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(artifact)
+        )
+
+        assert result.success is False
+        assert result.error == "document_path_changed"
+        connected_adapter._bot.send_document.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_document_file_not_found(self, connected_adapter):
