@@ -70,79 +70,33 @@
     "cron/scheduler.py",
     "gateway/platforms/base.py"
   ],
+  "lifecycle_transition_graph": [
+    {"edge_id": "artifact-request-classify-propagate", "contract": "artifact_request", "type": "decision_to_propagation", "from": "agent/task_execution_contract.py:_classify", "to": "agent/conversation_loop.py:_effective_request_system_prompt"},
+    {"edge_id": "artifact-request-propagate-enforce", "contract": "artifact_request", "type": "propagation_to_enforcement", "from": "agent/conversation_loop.py:_effective_request_system_prompt", "to": "agent/task_execution_contract.py:TaskExecutionContract.before_tool"},
+    {"edge_id": "artifact-request-enforce-recover", "contract": "artifact_request", "type": "enforcement_to_recovery", "from": "agent/task_execution_contract.py:TaskExecutionContract.before_tool", "to": "agent/turn_finalizer.py:_finalize_turn_impl"},
+    {"edge_id": "artifact-delivery-allocate-validate", "contract": "artifact_delivery", "type": "allocation_to_validation", "from": "agent/task_execution_contract.py:build_task_execution_contract", "to": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool"},
+    {"edge_id": "artifact-delivery-validate-deliver", "contract": "artifact_delivery", "type": "validation_to_delivery", "from": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool", "to": "cron/scheduler.py:_send_media_via_adapter"},
+    {"edge_id": "artifact-delivery-deliver-recover", "contract": "artifact_delivery", "type": "delivery_to_recovery", "from": "cron/scheduler.py:_send_media_via_adapter", "to": "agent/turn_finalizer.py:_finalize_turn_impl"},
+    {"edge_id": "safe-mode-decide-enforce", "contract": "safe_mode", "type": "decision_to_enforcement", "from": "hermes_cli/main.py:_apply_safe_mode", "to": "hermes_cli/plugins.py:PluginManager.discover_and_load"},
+    {"edge_id": "safe-mode-enforce-lifecycle", "contract": "safe_mode", "type": "enforcement_to_lifecycle", "from": "hermes_cli/plugins.py:PluginManager.discover_and_load", "to": "hermes_cli/main.py:_prepare_agent_startup"},
+    {"edge_id": "incident-fallback-decide-enforce", "contract": "incident_fallback", "type": "decision_to_enforcement", "from": "agent/chat_completion_helpers.py:try_activate_fallback", "to": "agent/openrouter_fallback_guard.py:_cap_fallback_output"},
+    {"edge_id": "incident-fallback-enforce-recover", "contract": "incident_fallback", "type": "enforcement_to_recovery", "from": "agent/openrouter_fallback_guard.py:_cap_fallback_output", "to": "agent/agent_runtime_helpers.py:restore_primary_runtime"},
+    {"edge_id": "cron-restrictions-decide-enforce", "contract": "cron_restrictions", "type": "decision_to_enforcement", "from": "cron/jobs.py:create_job", "to": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets"},
+    {"edge_id": "cron-restrictions-enforce-recover", "contract": "cron_restrictions", "type": "enforcement_to_recovery", "from": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets", "to": "cron/jobs.py:update_job"}
+  ],
   "lifecycle_relationships": [
-    {
-      "contract": "artifact_request",
-      "from": "agent/task_execution_contract.py:_classify",
-      "to": "agent/conversation_loop.py:_effective_request_system_prompt",
-      "invariant": "A classified artifact request is propagated into the active turn."
-    },
-    {
-      "contract": "artifact_request",
-      "from": "agent/conversation_loop.py:_effective_request_system_prompt",
-      "to": "agent/task_execution_contract.py:TaskExecutionContract.before_tool",
-      "invariant": "The propagated request contract is enforced before a tool call."
-    },
-    {
-      "contract": "artifact_request",
-      "from": "agent/task_execution_contract.py:TaskExecutionContract.before_tool",
-      "to": "agent/turn_finalizer.py:_finalize_turn_impl",
-      "invariant": "Request-scoped enforcement is cleared during finalization."
-    },
-    {
-      "contract": "artifact_delivery",
-      "from": "agent/task_execution_contract.py:build_task_execution_contract",
-      "to": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool",
-      "invariant": "Allocated artifact output is validated before delivery."
-    },
-    {
-      "contract": "artifact_delivery",
-      "from": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool",
-      "to": "cron/scheduler.py:_send_media_via_adapter",
-      "invariant": "Only validated artifact paths may cross a delivery adapter."
-    },
-    {
-      "contract": "artifact_delivery",
-      "from": "cron/scheduler.py:_send_media_via_adapter",
-      "to": "agent/turn_finalizer.py:_finalize_turn_impl",
-      "invariant": "Delivery completion or rejection reaches finalizer recovery."
-    },
-    {
-      "contract": "safe_mode",
-      "from": "hermes_cli/main.py:_apply_safe_mode",
-      "to": "hermes_cli/plugins.py:PluginManager.discover_and_load",
-      "invariant": "Safe-mode decisions constrain plugin discovery for the session lifecycle."
-    },
-    {
-      "contract": "safe_mode",
-      "from": "hermes_cli/plugins.py:PluginManager.discover_and_load",
-      "to": "hermes_cli/main.py:_prepare_agent_startup",
-      "invariant": "Restricted plugin state is preserved through startup lifecycle preparation."
-    },
-    {
-      "contract": "incident_fallback",
-      "from": "agent/chat_completion_helpers.py:try_activate_fallback",
-      "to": "agent/openrouter_fallback_guard.py:_cap_fallback_output",
-      "invariant": "Fallback activation cannot exceed the enforced provider capability cap."
-    },
-    {
-      "contract": "incident_fallback",
-      "from": "agent/openrouter_fallback_guard.py:_cap_fallback_output",
-      "to": "agent/agent_runtime_helpers.py:restore_primary_runtime",
-      "invariant": "Fallback recovery restores primary runtime authority."
-    },
-    {
-      "contract": "cron_restrictions",
-      "from": "cron/jobs.py:create_job",
-      "to": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets",
-      "invariant": "Persisted job allowlists remain bounded when scheduler toolsets are resolved."
-    },
-    {
-      "contract": "cron_restrictions",
-      "from": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets",
-      "to": "cron/jobs.py:update_job",
-      "invariant": "Cron policy recovery updates the persisted restriction rather than expanding defaults."
-    }
+    {"edge_id": "artifact-request-classify-propagate", "contract": "artifact_request", "type": "decision_to_propagation", "from": "agent/task_execution_contract.py:_classify", "to": "agent/conversation_loop.py:_effective_request_system_prompt", "invariant": "A classified artifact request is propagated into the active turn."},
+    {"edge_id": "artifact-request-propagate-enforce", "contract": "artifact_request", "type": "propagation_to_enforcement", "from": "agent/conversation_loop.py:_effective_request_system_prompt", "to": "agent/task_execution_contract.py:TaskExecutionContract.before_tool", "invariant": "The propagated request contract is enforced before a tool call."},
+    {"edge_id": "artifact-request-enforce-recover", "contract": "artifact_request", "type": "enforcement_to_recovery", "from": "agent/task_execution_contract.py:TaskExecutionContract.before_tool", "to": "agent/turn_finalizer.py:_finalize_turn_impl", "invariant": "Request-scoped enforcement is cleared during finalization."},
+    {"edge_id": "artifact-delivery-allocate-validate", "contract": "artifact_delivery", "type": "allocation_to_validation", "from": "agent/task_execution_contract.py:build_task_execution_contract", "to": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool", "invariant": "Allocated artifact output is validated before delivery."},
+    {"edge_id": "artifact-delivery-validate-deliver", "contract": "artifact_delivery", "type": "validation_to_delivery", "from": "agent/task_execution_contract.py:TaskExecutionContract.preflight_tool", "to": "cron/scheduler.py:_send_media_via_adapter", "invariant": "Only validated artifact paths may cross a delivery adapter."},
+    {"edge_id": "artifact-delivery-deliver-recover", "contract": "artifact_delivery", "type": "delivery_to_recovery", "from": "cron/scheduler.py:_send_media_via_adapter", "to": "agent/turn_finalizer.py:_finalize_turn_impl", "invariant": "Delivery completion or rejection reaches finalizer recovery."},
+    {"edge_id": "safe-mode-decide-enforce", "contract": "safe_mode", "type": "decision_to_enforcement", "from": "hermes_cli/main.py:_apply_safe_mode", "to": "hermes_cli/plugins.py:PluginManager.discover_and_load", "invariant": "Safe-mode decisions constrain plugin discovery for the session lifecycle."},
+    {"edge_id": "safe-mode-enforce-lifecycle", "contract": "safe_mode", "type": "enforcement_to_lifecycle", "from": "hermes_cli/plugins.py:PluginManager.discover_and_load", "to": "hermes_cli/main.py:_prepare_agent_startup", "invariant": "Restricted plugin state is preserved through startup lifecycle preparation."},
+    {"edge_id": "incident-fallback-decide-enforce", "contract": "incident_fallback", "type": "decision_to_enforcement", "from": "agent/chat_completion_helpers.py:try_activate_fallback", "to": "agent/openrouter_fallback_guard.py:_cap_fallback_output", "invariant": "Fallback activation cannot exceed the enforced provider capability cap."},
+    {"edge_id": "incident-fallback-enforce-recover", "contract": "incident_fallback", "type": "enforcement_to_recovery", "from": "agent/openrouter_fallback_guard.py:_cap_fallback_output", "to": "agent/agent_runtime_helpers.py:restore_primary_runtime", "invariant": "Fallback recovery restores primary runtime authority."},
+    {"edge_id": "cron-restrictions-decide-enforce", "contract": "cron_restrictions", "type": "decision_to_enforcement", "from": "cron/jobs.py:create_job", "to": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets", "invariant": "Persisted job allowlists remain bounded when scheduler toolsets are resolved."},
+    {"edge_id": "cron-restrictions-enforce-recover", "contract": "cron_restrictions", "type": "enforcement_to_recovery", "from": "cron/scheduler.py:_merge_mcp_into_per_job_toolsets", "to": "cron/jobs.py:update_job", "invariant": "Cron policy recovery updates the persisted restriction rather than expanding defaults."}
   ],
   "lifecycle_graphs": {
     "artifact_delivery": {
@@ -2446,6 +2400,72 @@
       "symbol": "__module__",
       "disposition": "covered",
       "rationale": "module-scope fallback policy dependencies are covered as enforcement."
+    },
+    {
+      "id": "batch_runner.py:_process_single_prompt", "contract": "cron_restrictions", "role": "propagation", "path": "batch_runner.py", "symbol": "_process_single_prompt", "disposition": "covered", "rationale": "Propagates an explicit toolset selection into a batch agent without widening cron authority."
+    },
+    {
+      "id": "cli.py:HermesCLI", "contract": "cron_restrictions", "role": "enforcement", "path": "cli.py", "symbol": "HermesCLI", "disposition": "reviewed_exclusion", "rationale": "Class container inherits token matches from child CLI methods; it is not a cron execution boundary."
+    },
+    {
+      "id": "cli.py:HermesCLI.__init__", "contract": "cron_restrictions", "role": "enforcement", "path": "cli.py", "symbol": "HermesCLI.__init__", "disposition": "reviewed_exclusion", "rationale": "Initializes interactive CLI toolsets and does not construct scheduled cron agents."
+    },
+    {
+      "id": "cli.py:HermesCLI.show_banner", "contract": "cron_restrictions", "role": "decision", "path": "cli.py", "symbol": "HermesCLI.show_banner", "disposition": "reviewed_exclusion", "rationale": "Displays interactive CLI toolset state without changing cron authority."
+    },
+    {
+      "id": "cli.py:HermesCLI._show_status", "contract": "cron_restrictions", "role": "decision", "path": "cli.py", "symbol": "HermesCLI._show_status", "disposition": "reviewed_exclusion", "rationale": "Reports interactive CLI status only; it does not resolve cron toolsets."
+    },
+    {
+      "id": "cli.py:HermesCLI.show_tools", "contract": "cron_restrictions", "role": "decision", "path": "cli.py", "symbol": "HermesCLI.show_tools", "disposition": "reviewed_exclusion", "rationale": "Displays interactive tool configuration without executing a cron job."
+    },
+    {
+      "id": "cli.py:HermesCLI.show_toolsets", "contract": "cron_restrictions", "role": "decision", "path": "cli.py", "symbol": "HermesCLI.show_toolsets", "disposition": "reviewed_exclusion", "rationale": "Displays interactive toolset configuration without executing a cron job."
+    },
+    {
+      "id": "cli.py:HermesCLI.show_config", "contract": "cron_restrictions", "role": "decision", "path": "cli.py", "symbol": "HermesCLI.show_config", "disposition": "reviewed_exclusion", "rationale": "Displays configuration and does not apply scheduled-job authority."
+    },
+    {
+      "id": "cli.py:HermesCLI.process_command", "contract": "cron_restrictions", "role": "decision", "path": "cli.py", "symbol": "HermesCLI.process_command", "disposition": "reviewed_exclusion", "rationale": "Routes interactive commands; cron policy is enforced in the scheduler path."
+    },
+    {
+      "id": "cli.py:HermesCLI._reload_mcp", "contract": "cron_restrictions", "role": "enforcement", "path": "cli.py", "symbol": "HermesCLI._reload_mcp", "disposition": "reviewed_exclusion", "rationale": "Reloads MCP tools for the interactive CLI and cannot widen a cron run."
+    },
+    {
+      "id": "hermes_cli/config.py:__module__", "contract": "cron_restrictions", "role": "propagation", "path": "hermes_cli/config.py", "symbol": "__module__", "disposition": "reviewed_exclusion", "rationale": "Module-level config defaults mention toolsets but do not resolve scheduled-job authority."
+    },
+    {
+      "id": "hermes_cli/tools_config.py:validate_cron_toolset_overlays", "contract": "cron_restrictions", "role": "enforcement", "path": "hermes_cli/tools_config.py", "symbol": "validate_cron_toolset_overlays", "disposition": "covered", "rationale": "Rejects malformed cron enabled and disabled authority overlays before resolution."
+    },
+    {
+      "id": "run_agent.py:AIAgent", "contract": "cron_restrictions", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent", "disposition": "reviewed_exclusion", "rationale": "Class container inherits child toolset matches; concrete scheduler resolution is registered separately."
+    },
+    {
+      "id": "run_agent.py:AIAgent.__init__", "contract": "cron_restrictions", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent.__init__", "disposition": "covered", "rationale": "Consumes the scheduler's pre-resolved enabled and disabled toolset envelope."
+    },
+    {
+      "id": "run_agent.py:main", "contract": "cron_restrictions", "role": "decision", "path": "run_agent.py", "symbol": "main", "disposition": "reviewed_exclusion", "rationale": "CLI entrypoint toolset selection is independent from scheduled cron execution."
+    },
+    {
+      "id": "cli.py:HermesCLI", "contract": "incident_fallback", "role": "enforcement", "path": "cli.py", "symbol": "HermesCLI", "disposition": "reviewed_exclusion", "rationale": "Class container inherits fallback token matches from child status methods."
+    },
+    {
+      "id": "cli.py:HermesCLI._get_status_bar_snapshot", "contract": "incident_fallback", "role": "enforcement", "path": "cli.py", "symbol": "HermesCLI._get_status_bar_snapshot", "disposition": "reviewed_exclusion", "rationale": "Reads fallback status for display and cannot activate or widen fallback authority."
+    },
+    {
+      "id": "run_agent.py:AIAgent", "contract": "incident_fallback", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent", "disposition": "reviewed_exclusion", "rationale": "Class container inherits child fallback matches; concrete transitions are registered separately."
+    },
+    {
+      "id": "run_agent.py:AIAgent._emit_pending_fallback_notice", "contract": "incident_fallback", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent._emit_pending_fallback_notice", "disposition": "covered", "rationale": "Surfaces a pending fallback activation without changing provider authority."
+    },
+    {
+      "id": "run_agent.py:AIAgent._try_activate_fallback", "contract": "incident_fallback", "role": "decision", "path": "run_agent.py", "symbol": "AIAgent._try_activate_fallback", "disposition": "covered", "rationale": "Makes the agent-level fallback activation decision through the guarded helper."
+    },
+    {
+      "id": "run_agent.py:AIAgent._has_pending_fallback", "contract": "incident_fallback", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent._has_pending_fallback", "disposition": "covered", "rationale": "Checks pending fallback state used to preserve the active authority boundary."
+    },
+    {
+      "id": "run_agent.py:AIAgent._needs_thinking_reasoning_pad", "contract": "incident_fallback", "role": "enforcement", "path": "run_agent.py", "symbol": "AIAgent._needs_thinking_reasoning_pad", "disposition": "reviewed_exclusion", "rationale": "Fallback token is used only to shape reasoning metadata, not provider activation."
     }
   ]
 }

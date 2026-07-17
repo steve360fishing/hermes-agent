@@ -134,8 +134,10 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     past config.yaml's denylist).
     """
     disabled = ["cronjob", "messaging", "clarify"]
-    agent_cfg = (cfg or {}).get("agent") or {}
     try:
+        from hermes_cli.tools_config import validate_cron_toolset_overlays
+        validate_cron_toolset_overlays(cfg or {})
+        agent_cfg = (cfg or {}).get("agent") or {}
         if not isinstance(agent_cfg, dict):
             raise ValueError("agent overlay must be an object")
         user_disabled = _strict_toolset_list(agent_cfg.get("disabled_toolsets", []), "agent.disabled_toolsets")
@@ -204,6 +206,8 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | tuple[st
     surprise $4.63 run).
     """
     try:
+        from hermes_cli.tools_config import validate_cron_toolset_overlays
+        validate_cron_toolset_overlays(cfg or {})
         agent_cfg = (cfg or {}).get("agent") or {}
         if not isinstance(agent_cfg, dict):
             raise ValueError("agent overlay must be an object")
@@ -2910,28 +2914,24 @@ def run_job(
             if os.path.exists(_cfg_path):
                 with open(_cfg_path, encoding="utf-8") as _f:
                     _cfg = yaml.safe_load(_f) or {}
-                # Managed scope: a scheduled job must honor administrator-pinned
-                # model / reasoning / toolsets / provider_routing too. This loader
-                # builds its own dict, so overlay managed values via the shared
-                # helper (fail-open, no-op when no managed scope).
-                try:
-                    from hermes_cli import managed_scope
-                    _cfg = managed_scope.apply_managed_overlay(_cfg)
-                except Exception:
-                    pass
-                _cfg = _expand_env_vars(_cfg)
-                # Coerce null/missing to {} so a falsy default never
-                # clobbers an already-resolved env value with ``None``.
-                _model_cfg = _cfg.get("model") or {}
-                if not job.get("model"):
-                    if isinstance(_model_cfg, str):
-                        model = _model_cfg
-                    elif isinstance(_model_cfg, dict):
-                        # Mirror the CLI/oneshot resolution: prefer ``default``,
-                        # accept a ``model`` alias, overwrite only when truthy.
-                        _default = _model_cfg.get("default") or _model_cfg.get("model")
-                        if _default:
-                            model = _default
+            # Cron is non-interactive and may spend money or invoke tools. A
+            # managed policy that cannot be loaded/applied is a hard boundary
+            # failure, including when no user config.yaml exists.
+            from hermes_cli import managed_scope
+            _cfg = managed_scope.apply_managed_overlay_strict(_cfg)
+            _cfg = _expand_env_vars(_cfg)
+            # Coerce null/missing to {} so a falsy default never
+            # clobbers an already-resolved env value with ``None``.
+            _model_cfg = _cfg.get("model") or {}
+            if not job.get("model"):
+                if isinstance(_model_cfg, str):
+                    model = _model_cfg
+                elif isinstance(_model_cfg, dict):
+                    # Mirror the CLI/oneshot resolution: prefer ``default``,
+                    # accept a ``model`` alias, overwrite only when truthy.
+                    _default = _model_cfg.get("default") or _model_cfg.get("model")
+                    if _default:
+                        model = _default
         except Exception as e:
             logger.warning("Job '%s': failed to load config.yaml; blocking execution: %s", job_id, e)
             raise RuntimeError(f"Cron job '{job_name}' blocked: config.yaml could not be loaded") from e
@@ -2948,6 +2948,11 @@ def run_job(
                 f"`cronjob action=update job_id={job_id} model=<name>` or set a "
                 "default with `hermes model <name>`."
             )
+
+        # Freeze cron authority before provider resolution, MCP discovery, or
+        # agent construction. Malformed overlays resolve to empty authority.
+        _cron_enabled_toolsets = _resolve_cron_enabled_toolsets(job, _cfg)
+        _cron_disabled_toolsets = _resolve_cron_disabled_toolsets(_cfg)
 
         # Apply IPv4 preference if configured.
         try:
@@ -3153,8 +3158,8 @@ def run_job(
             providers_order=pr.get("order"),
             provider_sort=pr.get("sort"),
             openrouter_min_coding_score=(_cfg.get("openrouter") or {}).get("min_coding_score"),
-            enabled_toolsets=_resolve_cron_enabled_toolsets(job, _cfg),
-            disabled_toolsets=_resolve_cron_disabled_toolsets(_cfg),
+            enabled_toolsets=_cron_enabled_toolsets,
+            disabled_toolsets=_cron_disabled_toolsets,
             quiet_mode=True,
             # Cron jobs should always inherit the user's SOUL.md identity from
             # HERMES_HOME. When a workdir is configured, also inject project

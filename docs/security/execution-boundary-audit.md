@@ -16,10 +16,11 @@ layer rejects, or where a turn-scoped restriction survives into another turn.
   runtime root; and
 - contract-specific semantic tokens in those files.
 
-The checked-in registry currently has 231 source-specific records for the 111
-discoverable source sites across five contract families. The counts are
-recomputed by the checker; registry records may legitimately cover one site
-under more than one contract.
+The checked-in registry currently classifies all 253 discoverable source sites
+across five contract families. The checker recomputes that union without
+intersecting a semantic match with a contract rule's path list, and the
+regression floor prevents the denominator from falling below 225 unless the
+registry is explicitly reconciled.
 
 | Contract | Required roles |
 | --- | --- |
@@ -38,12 +39,18 @@ that Python import analysis can enumerate every runtime plugin. CI fails when:
 - a contract is missing a required role; or
 - the registry references a missing source path.
 - a tracked source cannot be read or parsed;
-- a lifecycle edge is duplicate, reversed, or outside its contract's explicit
-  role-transition order; or
+- a lifecycle edge is duplicate, reversed, contradictory, unrelated to its
+  registered edge identity, or outside its contract's explicit role-transition
+  order; or
 - duplicate JSON keys or a non-redacted inventory schema are supplied.
 
 Reviewed exclusions require a written rationale. New sites are never accepted
 implicitly.
+
+Lifecycle relationships are machine-checked against the registry's canonical
+transition graph. Each relationship names an edge identity, contract, type,
+and exact endpoints; prose is explanatory evidence and is not used to infer
+whether two relationships contradict one another.
 
 ## Documented boundary families
 

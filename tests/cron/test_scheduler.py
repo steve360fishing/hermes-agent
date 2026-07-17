@@ -129,6 +129,12 @@ class TestCronToolsetValidation:
         assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
         assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
 
+    @pytest.mark.parametrize("invalid", ["web", {"web": True}, ["web", 1], ["web", ""]])
+    def test_invalid_platform_cron_toolsets_fail_closed(self, invalid):
+        cfg = {"platform_toolsets": {"cron": invalid}}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
+        assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
+
     def test_invalid_managed_overlay_object_fails_closed(self):
         cfg = {"agent": ["not-a-mapping"]}
         assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
@@ -1309,6 +1315,32 @@ class TestRunJobSessionPersistence:
 
         kwargs = mock_agent_cls.call_args.kwargs
         assert kwargs["enabled_toolsets"] == ["web", "terminal", "file"]
+
+    def test_managed_overlay_error_stops_before_provider_mcp_or_agent(self, tmp_path):
+        job = {
+            "id": "managed-overlay-error",
+            "name": "managed overlay error",
+            "prompt": "hello",
+            "model": "test/model",
+        }
+        provider = MagicMock()
+        discover_mcp = MagicMock()
+        overlay = MagicMock(side_effect=RuntimeError("managed policy unreadable"))
+        extra = (
+            patch("hermes_cli.managed_scope.apply_managed_overlay_strict", new=overlay),
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", new=provider),
+            patch("tools.mcp_tool.discover_mcp_tools", new=discover_mcp),
+        )
+
+        with self._run_job_patches(tmp_path, extra=extra) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "config.yaml could not be loaded" in (error or "")
+        overlay.assert_called_once()
+        provider.assert_not_called()
+        discover_mcp.assert_not_called()
+        mock_agent_cls.assert_not_called()
 
     def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
         """agent.disabled_toolsets must be honoured in cron — issue #25752.

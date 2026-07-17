@@ -288,8 +288,6 @@ def _discover_sites_with_errors(repo_root: Path, scan_paths: Iterable[str]) -> t
         for symbol, node, segment in visitor.symbols:
             lowered = segment.lower()
             for rule in DISCOVERY_RULES:
-                if relative not in rule.paths:
-                    continue
                 if any(token in lowered for token in rule.tokens):
                     site = Site(rule.contract, relative, symbol, getattr(node, "lineno", 1))
                     sites[(rule.contract, site.key)] = site
@@ -410,8 +408,56 @@ def validate_registry(
         (site.get("contract"), site.get("id")): site
         for site in registry.get("sites", [])
     }
+    transition_graph = registry.get("lifecycle_transition_graph")
+    graph_by_id: dict[str, dict[str, Any]] = {}
+    graph_edges: dict[str, set[tuple[str, str]]] = {}
+    if not isinstance(transition_graph, list):
+        errors.append("lifecycle transition graph must be a list")
+        transition_graph = []
+    for index, transition in enumerate(transition_graph):
+        prefix = f"lifecycle_transition_graph[{index}]"
+        if not isinstance(transition, dict):
+            errors.append(f"{prefix}: must be an object")
+            continue
+        edge_id = transition.get("edge_id")
+        contract = transition.get("contract")
+        source_id = transition.get("from")
+        target_id = transition.get("to")
+        edge_type = transition.get("type")
+        if not isinstance(edge_id, str) or not edge_id.strip():
+            errors.append(f"{prefix}: edge_id is required")
+            continue
+        if edge_id in graph_by_id:
+            errors.append(f"{prefix}: duplicate transition edge_id {edge_id!r}")
+            continue
+        graph_by_id[edge_id] = transition
+        if contract not in REQUIRED_CONTRACTS:
+            errors.append(f"{prefix}: unknown contract {contract!r}")
+            continue
+        source = sites_by_contract_id.get((contract, source_id))
+        target = sites_by_contract_id.get((contract, target_id))
+        if source is None or target is None:
+            errors.append(f"{prefix}: endpoints must reference registered sites in {contract}")
+            continue
+        role_transition = (str(source.get("role")), str(target.get("role")))
+        expected_type = f"{role_transition[0]}_to_{role_transition[1]}"
+        if edge_type != expected_type:
+            errors.append(f"{prefix}: type must equal {expected_type!r}")
+        if role_transition not in LIFECYCLE_ROLE_TRANSITIONS[contract]:
+            errors.append(
+                f"{prefix}: invalid lifecycle role transition {role_transition[0]} -> {role_transition[1]} for {contract}"
+            )
+        edge = (str(source_id), str(target_id))
+        contract_edges = graph_edges.setdefault(contract, set())
+        if edge in contract_edges:
+            errors.append(f"{prefix}: duplicate transition endpoints {edge[0]} -> {edge[1]}")
+        if (edge[1], edge[0]) in contract_edges:
+            errors.append(f"{prefix}: reverse transition endpoints {edge[0]} -> {edge[1]}")
+        contract_edges.add(edge)
+
     relationship_roles: dict[str, set[str]] = {}
     lifecycle_edges: dict[str, set[tuple[str, str]]] = {}
+    relationship_edge_ids: dict[tuple[str, str], tuple[str, str, str]] = {}
     relationships = registry.get("lifecycle_relationships")
     if not isinstance(relationships, list):
         errors.append("lifecycle relationships must be a list")
@@ -422,6 +468,20 @@ def validate_registry(
             errors.append(f"{prefix}: must be an object")
             continue
         contract = relationship.get("contract")
+        edge_id = relationship.get("edge_id")
+        edge_type = relationship.get("type")
+        source_id = str(relationship.get("from"))
+        target_id = str(relationship.get("to"))
+        identity = (str(contract), str(edge_id))
+        descriptor = (source_id, target_id, str(edge_type))
+        prior_descriptor = relationship_edge_ids.get(identity)
+        if prior_descriptor is not None:
+            if prior_descriptor == descriptor:
+                errors.append(f"{prefix}: duplicate lifecycle edge {edge_id!r}")
+            else:
+                errors.append(f"{prefix}: contradictory lifecycle edge {edge_id!r}")
+        else:
+            relationship_edge_ids[identity] = descriptor
         source = sites_by_contract_id.get((contract, relationship.get("from")))
         target = sites_by_contract_id.get((contract, relationship.get("to")))
         invariant = relationship.get("invariant")
@@ -434,10 +494,14 @@ def validate_registry(
         if source.get("contract") != contract or target.get("contract") != contract:
             errors.append(f"{prefix}: endpoints must belong to {contract}")
             continue
+        canonical = graph_by_id.get(str(edge_id))
+        if canonical is None or any(
+            relationship.get(field) != canonical.get(field)
+            for field in ("edge_id", "contract", "type", "from", "to")
+        ):
+            errors.append(f"{prefix}: edge does not match the registered transition graph")
         if not isinstance(invariant, str) or not invariant.strip():
             errors.append(f"{prefix}: invariant is required")
-        source_id = str(relationship.get("from"))
-        target_id = str(relationship.get("to"))
         edge = (source_id, target_id)
         contract_edges = lifecycle_edges.setdefault(contract, set())
         if edge in contract_edges:
@@ -457,6 +521,9 @@ def validate_registry(
         missing = set(required_roles) - relationship_roles.get(contract, set())
         if missing:
             errors.append(f"{contract}: lifecycle relationships missing roles {sorted(missing)}")
+    represented_graph_edges = {edge_id for _contract, edge_id in relationship_edge_ids}
+    for edge_id in sorted(set(graph_by_id) - represented_graph_edges):
+        errors.append(f"lifecycle transition graph edge {edge_id!r} has no relationship")
     return errors
 
 

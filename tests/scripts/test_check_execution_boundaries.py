@@ -35,6 +35,8 @@ def test_repository_execution_boundary_registry_is_complete():
     assert result.returncode == 0, result.stdout + result.stderr
     assert "unclassified=0" in result.stdout
     assert "invalid=0" in result.stdout
+    discovered = int(result.stdout.split("discovered=", 1)[1].split()[0])
+    assert discovered >= 225
 
 
 def test_unclassified_restriction_site_fails_closed(tmp_path):
@@ -197,6 +199,53 @@ def test_discovery_denominator_is_the_union_of_entrypoints_roots_and_rule_paths(
     sites = checker.discover_sites(tmp_path, ["cli.py", "agent"])
 
     assert [(site.path, site.symbol) for site in sites] == [("outside/boundary.py", "boundary")]
+
+
+def test_discovery_finds_token_bearing_symbol_in_arbitrary_runtime_root_path(tmp_path):
+    checker = _load_checker()
+    (tmp_path / "agent").mkdir()
+    target = tmp_path / "agent" / "new_boundary.py"
+    target.write_text("def boundary():\n    artifact_only = True\n", encoding="utf-8")
+
+    sites = checker.discover_sites(tmp_path, ["agent"])
+
+    assert ("artifact_request", "agent/new_boundary.py", "boundary") in {
+        (site.contract, site.path, site.symbol) for site in sites
+    }
+
+
+def test_lifecycle_relationships_must_match_registered_transition_graph():
+    checker = _load_checker()
+    data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    assert data.get("lifecycle_transition_graph"), "registry must declare its canonical transition graph"
+    first = data["lifecycle_relationships"][0]
+
+    unrelated = deepcopy(data)
+    unrelated["lifecycle_relationships"][0] = {
+        **first,
+        "from": "agent/task_execution_contract.py:build_task_execution_contract",
+    }
+    assert any(
+        "registered transition graph" in error
+        for error in checker.validate_registry(REPO_ROOT, unrelated)
+    )
+
+    contradictory = deepcopy(data)
+    contradictory["lifecycle_relationships"].append(
+        {**first, "to": "agent/turn_finalizer.py:_finalize_turn_impl"}
+    )
+    errors = checker.validate_registry(REPO_ROOT, contradictory)
+    assert any("contradictory lifecycle edge" in error for error in errors)
+
+    wrong_type = deepcopy(data)
+    wrong_type["lifecycle_relationships"][0] = {
+        **first,
+        "type": "enforcement_to_recovery",
+    }
+    assert any(
+        "registered transition graph" in error
+        for error in checker.validate_registry(REPO_ROOT, wrong_type)
+    )
 
 
 def test_discovery_rejects_unparseable_and_unreadable_tracked_source(tmp_path, monkeypatch):
