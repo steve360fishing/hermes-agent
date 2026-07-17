@@ -592,7 +592,7 @@ USER hermes
 Build it and use it in place of the official image:
 
 ```sh
-docker build -t my-hermes:latest .
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t my-hermes:latest .
 docker run -d \
   --name hermes \
   --restart unless-stopped \

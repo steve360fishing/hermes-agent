@@ -135,7 +135,7 @@ Edit `S6ServiceManager._render_run_script` in `hermes_cli/service_manager.py`. T
 ### Run the docker test harness
 
 ```sh
-docker build -t hermes-agent-harness:latest .
+docker build --build-arg HERMES_GIT_SHA="$(git rev-parse HEAD)" -t hermes-agent-harness:latest .
 HERMES_TEST_IMAGE=hermes-agent-harness:latest scripts/run_tests.sh tests/docker/ -v
 # Expect 19 passed, 0 xfailed against the s6 image
 ```
