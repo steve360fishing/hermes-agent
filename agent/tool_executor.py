@@ -692,14 +692,10 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
         deadline = time.monotonic() + timeout_s if timeout_s is not None else None
         if runnable_calls:
             max_workers = min(len(runnable_calls), _MAX_TOOL_WORKERS)
-            # Daemon workers: an interrupted/timed-out batch is abandoned with
-            # shutdown(wait=False), but stdlib ThreadPoolExecutor workers are
-            # non-daemon and registered in concurrent.futures' atexit hook,
-            # which joins them unconditionally — so one wedged tool thread
-            # would block interpreter exit forever (multi-minute CLI exits).
+            # Daemon workers retain the existing process-exit behavior, but a
+            # batch never returns until its cooperative workers have exited.
             from tools.daemon_pool import DaemonThreadPoolExecutor
             executor = DaemonThreadPoolExecutor(max_workers=max_workers)
-            abandon_executor = False
             try:
                 for submit_index, (i, tc, name, args) in enumerate(runnable_calls):
                     # Propagate the agent turn's ContextVars (e.g.
@@ -766,7 +762,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                         break
 
                     if deadline is not None and time.monotonic() >= deadline:
-                        abandon_executor = True
                         timed_out_indices = {
                             future_to_index[f]
                             for f in not_done
@@ -800,7 +795,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     # read_file) will run to completion. Cancel any futures
                     # that haven't started yet so we don't block on them.
                     if agent._interrupt_requested:
-                        abandon_executor = True
                         if not _interrupt_logged:
                             _interrupt_logged = True
                             agent._vprint(
@@ -810,9 +804,6 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             )
                         for f in not_done:
                             f.cancel()
-                        # Give already-running tools a moment to notice the
-                        # per-thread interrupt signal and exit gracefully.
-                        concurrent.futures.wait(not_done, timeout=3.0)
                         break
 
                     _conc_elapsed = int(time.time() - _conc_start)
@@ -828,14 +819,13 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                             f"{len(not_done)} remaining: {', '.join(_still_running[:3])})"
                         )
             finally:
-                # On abandon (interrupt or deadline) we intentionally do NOT
-                # join hung workers: wait=False returns immediately and
-                # cancel_futures drops queued-but-unstarted work. A wedged tool
-                # thread is left running detached — the deliberate tradeoff vs.
-                # deadlocking the whole batch. Normal completion joins (wait=True).
+                # Cancellation is cooperative: the per-worker interrupt above
+                # must be observed before this call returns.  Returning before
+                # join would leave a worker able to mutate results/session
+                # state after the turn has already emitted its terminal result.
                 executor.shutdown(
-                    wait=not abandon_executor,
-                    cancel_futures=abandon_executor,
+                    wait=True,
+                    cancel_futures=bool(timed_out_indices or agent._interrupt_requested),
                 )
     finally:
         if spinner:

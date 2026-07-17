@@ -64,6 +64,14 @@ REQUIRED_ARTIFACT_LIFECYCLE_EDGES = {
     ("telegram_descriptor", "receipt_transition"),
 }
 
+LIFECYCLE_ROLE_TRANSITIONS: dict[str, set[tuple[str, str]]] = {
+    "artifact_request": {("decision", "propagation"), ("propagation", "enforcement"), ("enforcement", "recovery")},
+    "artifact_delivery": {("allocation", "validation"), ("validation", "delivery"), ("delivery", "recovery")},
+    "safe_mode": {("decision", "enforcement"), ("enforcement", "lifecycle")},
+    "incident_fallback": {("decision", "enforcement"), ("enforcement", "recovery")},
+    "cron_restrictions": {("decision", "enforcement"), ("enforcement", "recovery")},
+}
+
 ENTRYPOINTS = (
     "cli.py",
     "run_agent.py",
@@ -225,7 +233,7 @@ class _SymbolVisitor(ast.NodeVisitor):
 
 
 def _tracked_python_paths(repo_root: Path, scan_paths: Iterable[str]) -> list[Path]:
-    roots = tuple(scan_paths)
+    roots = tuple(dict.fromkeys(scan_paths))
     result = subprocess.run(
         ["git", "ls-files", "-z", "--", *roots],
         cwd=repo_root,
@@ -288,8 +296,13 @@ def _discover_sites_with_errors(repo_root: Path, scan_paths: Iterable[str]) -> t
     return sorted(sites.values(), key=lambda site: (site.contract, site.path, site.line, site.symbol)), errors
 
 
+def _discovery_denominator(scan_paths: Iterable[str]) -> tuple[str, ...]:
+    """Return the complete static denominator, including semantic rule paths."""
+    return tuple(dict.fromkeys((*scan_paths, *(path for rule in DISCOVERY_RULES for path in rule.paths))))
+
+
 def discover_sites(repo_root: Path, scan_paths: Iterable[str]) -> list[Site]:
-    return _discover_sites_with_errors(repo_root, scan_paths)[0]
+    return _discover_sites_with_errors(repo_root, _discovery_denominator(scan_paths))[0]
 
 
 def _all_symbols(repo_root: Path, relative_path: str) -> set[str]:
@@ -398,6 +411,7 @@ def validate_registry(
         for site in registry.get("sites", [])
     }
     relationship_roles: dict[str, set[str]] = {}
+    lifecycle_edges: dict[str, set[tuple[str, str]]] = {}
     relationships = registry.get("lifecycle_relationships")
     if not isinstance(relationships, list):
         errors.append("lifecycle relationships must be a list")
@@ -422,6 +436,20 @@ def validate_registry(
             continue
         if not isinstance(invariant, str) or not invariant.strip():
             errors.append(f"{prefix}: invariant is required")
+        source_id = str(relationship.get("from"))
+        target_id = str(relationship.get("to"))
+        edge = (source_id, target_id)
+        contract_edges = lifecycle_edges.setdefault(contract, set())
+        if edge in contract_edges:
+            errors.append(f"{prefix}: duplicate lifecycle edge {source_id} -> {target_id}")
+        if (target_id, source_id) in contract_edges:
+            errors.append(f"{prefix}: reverse lifecycle edge {source_id} -> {target_id}")
+        contract_edges.add(edge)
+        role_transition = (str(source.get("role")), str(target.get("role")))
+        if role_transition not in LIFECYCLE_ROLE_TRANSITIONS[contract]:
+            errors.append(
+                f"{prefix}: invalid lifecycle role transition {role_transition[0]} -> {role_transition[1]} for {contract}"
+            )
         relationship_roles.setdefault(contract, set()).update(
             {str(source.get("role")), str(target.get("role"))}
         )
@@ -433,8 +461,8 @@ def validate_registry(
 
 
 def audit_repository(repo_root: Path, registry: dict[str, Any]) -> AuditReport:
-    scan_paths = tuple(registry.get("entrypoints", ENTRYPOINTS)) + tuple(
-        registry.get("runtime_roots", RUNTIME_ROOTS)
+    scan_paths = _discovery_denominator(
+        (*tuple(registry.get("entrypoints", ENTRYPOINTS)), *tuple(registry.get("runtime_roots", RUNTIME_ROOTS)))
     )
     discovered, discovery_errors = _discover_sites_with_errors(repo_root, scan_paths)
     invalid = discovery_errors + validate_registry(repo_root, registry, discovered_sites=discovered)
@@ -468,6 +496,29 @@ def _secret_like(name: str) -> bool:
     return any(token in upper for token in ("KEY", "TOKEN", "SECRET", "PASSWORD", "CREDENTIAL", "COOKIE"))
 
 
+def _sha256(path: Path) -> str:
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+def _reject_duplicate_keys(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
+    result: dict[str, Any] = {}
+    for key, value in pairs:
+        if key in result:
+            raise ValueError(f"duplicate JSON key: {key!r}")
+        result[key] = value
+    return result
+
+
+def _sanitize_inventory(data: Any, kind: str) -> dict[str, list[str]]:
+    key = "plugins" if kind == "plugins" else "transports"
+    if not isinstance(data, dict) or set(data) != {key}:
+        raise ValueError(f"{kind} inventory schema must contain only {key!r}")
+    names = data[key]
+    if not isinstance(names, list) or any(not isinstance(name, str) or not name.strip() for name in names):
+        raise ValueError(f"{kind} inventory schema requires a list of non-empty strings")
+    return {key: list(names)}
+
+
 def build_runtime_manifest(
     *,
     repo_root: Path,
@@ -475,7 +526,27 @@ def build_runtime_manifest(
     boundary_core_modules: Iterable[str] = (),
     plugin_inventory: Any = None,
     transport_inventory: Any = None,
+    registry_path: Path | None = None,
+    plugin_inventory_path: Path | None = None,
+    transport_inventory_path: Path | None = None,
 ) -> dict[str, Any]:
+    registry_path = registry_path or (repo_root / REGISTRY_PATH)
+    if not registry_path.is_file():
+        raise ValueError(f"missing registry for manifest: {registry_path}")
+    missing_core = [path for path in sorted(set(boundary_core_modules)) if not (repo_root / path).is_file()]
+    if missing_core:
+        raise ValueError(f"missing boundary core module(s): {', '.join(missing_core)}")
+    missing_entrypoints = [path for path in ENTRYPOINTS if not (repo_root / path).is_file()]
+    if missing_entrypoints:
+        raise ValueError(f"missing entrypoint(s) for manifest: {', '.join(missing_entrypoints)}")
+    if plugin_inventory_path is not None:
+        plugin_inventory = _load_inventory(plugin_inventory_path, "plugins")
+    elif plugin_inventory is not None:
+        plugin_inventory = _sanitize_inventory(plugin_inventory, "plugins")
+    if transport_inventory_path is not None:
+        transport_inventory = _load_inventory(transport_inventory_path, "transports")
+    elif transport_inventory is not None:
+        transport_inventory = _sanitize_inventory(transport_inventory, "transports")
     environment: dict[str, dict[str, bool]] = {}
     for name in sorted(set(environment_names)):
         environment[name] = {"present": os.environ.get(name) is not None}
@@ -486,17 +557,17 @@ def build_runtime_manifest(
             "git_tree": _git_value(repo_root, "rev-parse", "HEAD^{tree}"),
         },
         "entrypoint_hashes": {
-            path: hashlib.sha256((repo_root / path).read_bytes()).hexdigest()
+            path: _sha256(repo_root / path)
             for path in ENTRYPOINTS
-            if (repo_root / path).is_file()
         },
         "boundary_core_hashes": {
-            path: hashlib.sha256((repo_root / path).read_bytes()).hexdigest()
+            path: _sha256(repo_root / path)
             for path in sorted(set(boundary_core_modules))
-            if (repo_root / path).is_file()
         },
-        "checker_hash": hashlib.sha256(Path(__file__).read_bytes()).hexdigest(),
-        "registry_hash": hashlib.sha256((repo_root / REGISTRY_PATH).read_bytes()).hexdigest(),
+        "checker_hash": _sha256(Path(__file__)),
+        "registry_hash": _sha256(registry_path),
+        "plugin_inventory_hash": _sha256(plugin_inventory_path) if plugin_inventory_path is not None else None,
+        "transport_inventory_hash": _sha256(transport_inventory_path) if transport_inventory_path is not None else None,
         "plugin_inventory": plugin_inventory,
         "transport_inventory": transport_inventory,
         "environment": environment,
@@ -505,15 +576,15 @@ def build_runtime_manifest(
 
 def _load_registry(path: Path) -> dict[str, Any]:
     with path.open("r", encoding="utf-8") as handle:
-        data = json.load(handle)
+        data = json.load(handle, object_pairs_hook=_reject_duplicate_keys)
     if not isinstance(data, dict):
         raise ValueError("registry root must be an object")
     return data
 
 
-def _load_inventory(path: Path) -> Any:
+def _load_inventory(path: Path, kind: str) -> dict[str, list[str]]:
     with path.open("r", encoding="utf-8") as handle:
-        return json.load(handle)
+        return _sanitize_inventory(json.load(handle, object_pairs_hook=_reject_duplicate_keys), kind)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -537,8 +608,8 @@ def main(argv: list[str] | None = None) -> int:
             print("execution-boundary audit error: --manifest-out requires explicit plugin and transport inventories", file=sys.stderr)
             return 2
         try:
-            plugin_inventory = _load_inventory(args.plugin_inventory)
-            transport_inventory = _load_inventory(args.transport_inventory)
+            plugin_inventory = _load_inventory(args.plugin_inventory, "plugins")
+            transport_inventory = _load_inventory(args.transport_inventory, "transports")
         except (OSError, ValueError, json.JSONDecodeError) as exc:
             print(f"execution-boundary audit error: {exc}", file=sys.stderr)
             return 2
@@ -548,6 +619,9 @@ def main(argv: list[str] | None = None) -> int:
             boundary_core_modules=registry.get("boundary_core_modules", []),
             plugin_inventory=plugin_inventory,
             transport_inventory=transport_inventory,
+            registry_path=registry_path,
+            plugin_inventory_path=args.plugin_inventory,
+            transport_inventory_path=args.transport_inventory,
         )
         args.manifest_out.parent.mkdir(parents=True, exist_ok=True)
         args.manifest_out.write_text(

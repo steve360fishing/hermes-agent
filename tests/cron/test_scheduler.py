@@ -9,7 +9,7 @@ from unittest.mock import AsyncMock, patch, MagicMock
 
 import pytest
 
-from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _merge_mcp_into_per_job_toolsets, _run_agent_with_inactivity_timeout
+from cron.scheduler import _resolve_origin, _resolve_delivery_target, _deliver_result, _send_media_via_adapter, run_job, SILENT_MARKER, _build_job_prompt, _resolve_cron_enabled_toolsets, _resolve_cron_disabled_toolsets, _merge_mcp_into_per_job_toolsets, _run_agent_with_inactivity_timeout
 from tools.env_passthrough import clear_env_passthrough
 from tools.credential_files import clear_credential_files
 
@@ -116,6 +116,23 @@ class TestCronInactivityQuarantine:
             release.set()
             with pytest.raises(TimeoutError, match="idle for"):
                 timed_out.result(timeout=1)
+
+
+class TestCronToolsetValidation:
+    @pytest.mark.parametrize("invalid", ["web", {"web": True}, ["web", 1], ["web", ""]])
+    def test_invalid_job_enabled_toolsets_fail_closed(self, invalid):
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": invalid}, {}) == ()
+
+    @pytest.mark.parametrize("invalid", ["terminal", {"terminal": True}, ["terminal", 1], ["terminal", ""]])
+    def test_invalid_managed_disabled_toolsets_fail_closed(self, invalid):
+        cfg = {"agent": {"disabled_toolsets": invalid}}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
+        assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
+
+    def test_invalid_managed_overlay_object_fails_closed(self):
+        cfg = {"agent": ["not-a-mapping"]}
+        assert _resolve_cron_enabled_toolsets({"enabled_toolsets": ["web"]}, cfg) == ()
+        assert _resolve_cron_disabled_toolsets(cfg) == ["cronjob", "messaging", "clarify"]
 
 
 class TestResolveOrigin:

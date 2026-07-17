@@ -113,6 +113,13 @@ class CronPromptInjectionBlocked(Exception):
     """
 
 
+def _strict_toolset_list(value: Any, field: str) -> list[str]:
+    """Accept only persisted, non-empty ``list[str]`` toolset overlays."""
+    if not isinstance(value, list) or any(not isinstance(name, str) or not name.strip() for name in value):
+        raise ValueError(f"{field} must be a list of non-empty strings")
+    return list(value)
+
+
 def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """Toolsets a cron-spawned agent must never receive.
 
@@ -128,9 +135,15 @@ def _resolve_cron_disabled_toolsets(cfg: dict) -> list[str]:
     """
     disabled = ["cronjob", "messaging", "clarify"]
     agent_cfg = (cfg or {}).get("agent") or {}
-    user_disabled = agent_cfg.get("disabled_toolsets") or []
+    try:
+        if not isinstance(agent_cfg, dict):
+            raise ValueError("agent overlay must be an object")
+        user_disabled = _strict_toolset_list(agent_cfg.get("disabled_toolsets", []), "agent.disabled_toolsets")
+    except ValueError as exc:
+        logger.warning("Invalid managed cron toolset overlay; preserving protected denials: %s", exc)
+        return disabled
     for name in user_disabled:
-        name = str(name).strip()
+        name = name.strip()
         if name and name not in disabled:
             disabled.append(name)
     return disabled
@@ -190,10 +203,16 @@ def _resolve_cron_enabled_toolsets(job: dict, cfg: dict) -> list[str] | tuple[st
     get cron WITHOUT ``moa`` by default (issue reported by Norbert —
     surprise $4.63 run).
     """
-    per_job = job.get("enabled_toolsets")
-    if per_job:
-        return _merge_mcp_into_per_job_toolsets(list(per_job), cfg or {})
     try:
+        agent_cfg = (cfg or {}).get("agent") or {}
+        if not isinstance(agent_cfg, dict):
+            raise ValueError("agent overlay must be an object")
+        _strict_toolset_list(agent_cfg.get("disabled_toolsets", []), "agent.disabled_toolsets")
+        per_job = job.get("enabled_toolsets")
+        if per_job is not None:
+            per_job = _strict_toolset_list(per_job, "enabled_toolsets")
+            if per_job:
+                return _merge_mcp_into_per_job_toolsets(per_job, cfg or {})
         from hermes_cli.tools_config import _get_platform_tools  # lazy: avoid heavy import at cron module load
         return sorted(_get_platform_tools(cfg or {}, "cron"))
     except Exception as exc:

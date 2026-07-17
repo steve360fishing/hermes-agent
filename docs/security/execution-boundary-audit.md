@@ -7,15 +7,19 @@ layer rejects, or where a turn-scoped restriction survives into another turn.
 
 ## Coverage denominator
 
-`scripts/check_execution_boundaries.py` scans a conservative union of:
+`scripts/check_execution_boundaries.py` scans the exact union of:
 
 - eight shipped Python entrypoints;
 - ten runtime roots that can be loaded dynamically by profiles, plugins,
   providers, cron, gateways, or adapters; and
-- contract-specific semantic tokens in the files that implement each boundary.
+- every contract-specific rule path, even when it is outside an entrypoint or
+  runtime root; and
+- contract-specific semantic tokens in those files.
 
-The checked-in registry currently classifies 225 source sites across five
-contract families:
+The checked-in registry currently has 231 source-specific records for the 111
+discoverable source sites across five contract families. The counts are
+recomputed by the checker; registry records may legitimately cover one site
+under more than one contract.
 
 | Contract | Required roles |
 | --- | --- |
@@ -33,6 +37,10 @@ that Python import analysis can enumerate every runtime plugin. CI fails when:
 - a registered symbol or identifier is stale;
 - a contract is missing a required role; or
 - the registry references a missing source path.
+- a tracked source cannot be read or parsed;
+- a lifecycle edge is duplicate, reversed, or outside its contract's explicit
+  role-transition order; or
+- duplicate JSON keys or a non-redacted inventory schema are supplied.
 
 Reviewed exclusions require a written rationale. New sites are never accepted
 implicitly.
@@ -91,11 +99,14 @@ The checker can emit a sanitized manifest with `--manifest-out`, plus explicit
 
 - source commit and tree;
 - SHA-256 hashes for all shipped entrypoints and registry-declared boundary
-  core modules, plus the checker and registry themselves;
-- explicit effective plugin and transport inventories; and
+  core modules, plus the checker, the actual supplied registry, and the actual
+  supplied inventories;
+- explicit effective plugin and transport inventories using only
+  `{ "plugins": ["name"] }` and `{ "transports": ["name"] }` schemas; and
 - configured environment names and presence only.
 
-No environment values are emitted, including values for non-secret names. The
+No environment values are emitted, including values for non-secret names. A
+manifest fails rather than silently omitting a declared core module. The
 manifest is evidence, not configuration, and it does not mutate the runtime.
 
 ## Live read-only snapshot (2026-07-16)

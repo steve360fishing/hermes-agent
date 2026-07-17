@@ -5,6 +5,7 @@ import copy
 import json
 import subprocess
 import sys
+from copy import deepcopy
 from pathlib import Path
 
 
@@ -127,6 +128,29 @@ def test_registry_requires_real_artifact_lifecycle_graph():
     assert any("artifact lifecycle" in error for error in errors)
 
 
+def test_registry_rejects_duplicate_reverse_and_invalid_lifecycle_edges():
+    checker = _load_checker()
+    data = json.loads(REGISTRY.read_text(encoding="utf-8"))
+    first = data["lifecycle_relationships"][0]
+
+    duplicate = deepcopy(data)
+    duplicate["lifecycle_relationships"].append(dict(first))
+    assert any("duplicate lifecycle edge" in error for error in checker.validate_registry(REPO_ROOT, duplicate))
+
+    reverse = deepcopy(data)
+    reverse["lifecycle_relationships"].append(
+        {**first, "from": first["to"], "to": first["from"]}
+    )
+    assert any("reverse lifecycle edge" in error for error in checker.validate_registry(REPO_ROOT, reverse))
+
+    invalid = deepcopy(data)
+    invalid["lifecycle_relationships"][0] = {
+        **first,
+        "to": "agent/turn_finalizer.py:_finalize_turn_impl",
+    }
+    assert any("invalid lifecycle role transition" in error for error in checker.validate_registry(REPO_ROOT, invalid))
+
+
 def test_runtime_manifest_redacts_secret_values(tmp_path, monkeypatch):
     checker = _load_checker()
     monkeypatch.setenv("OPENROUTER_API_KEY", "must-not-leak")
@@ -160,6 +184,21 @@ def test_discovery_covers_entrypoints_runtime_roots_and_module_scope(tmp_path):
     }
 
 
+def test_discovery_denominator_is_the_union_of_entrypoints_roots_and_rule_paths(tmp_path, monkeypatch):
+    checker = _load_checker()
+    (tmp_path / "outside").mkdir()
+    target = tmp_path / "outside" / "boundary.py"
+    target.write_text("def boundary():\n    artifact_only = True\n", encoding="utf-8")
+    rule = checker.DiscoveryRule("artifact_request", ("outside/boundary.py",), ("artifact_only",))
+    monkeypatch.setattr(checker, "DISCOVERY_RULES", (rule,))
+    monkeypatch.setattr(checker, "ENTRYPOINTS", ("cli.py",))
+    monkeypatch.setattr(checker, "RUNTIME_ROOTS", ("agent",))
+
+    sites = checker.discover_sites(tmp_path, ["cli.py", "agent"])
+
+    assert [(site.path, site.symbol) for site in sites] == [("outside/boundary.py", "boundary")]
+
+
 def test_discovery_rejects_unparseable_and_unreadable_tracked_source(tmp_path, monkeypatch):
     checker = _load_checker()
     broken = tmp_path / "agent.py"
@@ -174,17 +213,89 @@ def test_discovery_rejects_unparseable_and_unreadable_tracked_source(tmp_path, m
     assert any(error.startswith("unparseable tracked source: agent.py") for error in report.invalid)
 
 
-def test_manifest_hashes_boundary_core_and_explicit_inventories():
+def test_discovery_rejects_unreadable_tracked_source(tmp_path, monkeypatch):
     checker = _load_checker()
+    source = tmp_path / "agent.py"
+    source.write_text("artifact_only = True\n", encoding="utf-8")
+    monkeypatch.setattr(checker, "_tracked_python_paths", lambda *_: [source])
+    original_read_text = Path.read_text
+
+    def unreadable(path, *args, **kwargs):
+        if path == source:
+            raise OSError("access denied")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", unreadable)
+    report = checker.audit_repository(
+        tmp_path,
+        {"schema_version": 1, "entrypoints": list(checker.ENTRYPOINTS), "runtime_roots": list(checker.RUNTIME_ROOTS), "contracts": checker.REQUIRED_CONTRACTS, "sites": []},
+    )
+
+    assert any(error.startswith("unreadable tracked source: agent.py") for error in report.invalid)
+
+
+def test_registry_loader_rejects_duplicate_json_keys(tmp_path):
+    checker = _load_checker()
+    registry = tmp_path / "registry.json"
+    registry.write_text('{"schema_version": 1, "schema_version": 2}', encoding="utf-8")
+
+    try:
+        checker._load_registry(registry)
+    except ValueError as exc:
+        assert "duplicate JSON key" in str(exc)
+    else:
+        raise AssertionError("duplicate registry keys must be rejected")
+
+
+def test_manifest_rejects_missing_core_files_and_hashes_supplied_inputs(tmp_path):
+    checker = _load_checker()
+    registry = tmp_path / "registry.json"
+    plugin_inventory = tmp_path / "plugins.json"
+    transport_inventory = tmp_path / "transports.json"
+    registry.write_text('{"registry": true}', encoding="utf-8")
+    plugin_inventory.write_text('{"plugins": ["example"]}', encoding="utf-8")
+    transport_inventory.write_text('{"transports": ["telegram"]}', encoding="utf-8")
+
+    try:
+        checker.build_runtime_manifest(
+            repo_root=REPO_ROOT,
+            environment_names=[],
+            boundary_core_modules=["missing/core.py"],
+            registry_path=registry,
+            plugin_inventory_path=plugin_inventory,
+            transport_inventory_path=transport_inventory,
+        )
+    except ValueError as exc:
+        assert "missing boundary core module" in str(exc)
+    else:
+        raise AssertionError("missing declared core modules must fail the manifest")
+
     manifest = checker.build_runtime_manifest(
         repo_root=REPO_ROOT,
         environment_names=["HERMES_PROFILE"],
         boundary_core_modules=["cron/scheduler.py"],
-        plugin_inventory={"plugins": ["example"]},
-        transport_inventory={"transports": ["telegram"]},
+        registry_path=registry,
+        plugin_inventory_path=plugin_inventory,
+        transport_inventory_path=transport_inventory,
     )
 
     assert manifest["boundary_core_hashes"]["cron/scheduler.py"]
     assert manifest["plugin_inventory"] == {"plugins": ["example"]}
     assert manifest["transport_inventory"] == {"transports": ["telegram"]}
+    assert manifest["registry_hash"] == checker._sha256(registry)
+    assert manifest["plugin_inventory_hash"] == checker._sha256(plugin_inventory)
+    assert manifest["transport_inventory_hash"] == checker._sha256(transport_inventory)
     assert manifest["source_identity"]["git_tree"]
+
+
+def test_manifest_inventory_schema_drops_secret_bearing_fields(tmp_path):
+    checker = _load_checker()
+    inventory = tmp_path / "plugins.json"
+    inventory.write_text('{"plugins": ["example"], "token": "must-not-leak"}', encoding="utf-8")
+
+    try:
+        checker._load_inventory(inventory, "plugins")
+    except ValueError as exc:
+        assert "inventory schema" in str(exc)
+    else:
+        raise AssertionError("secret-bearing inventory fields must be rejected")
