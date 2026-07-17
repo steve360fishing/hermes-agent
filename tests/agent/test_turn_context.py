@@ -8,6 +8,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 
 from __future__ import annotations
 
+import logging
 import types
 from unittest.mock import MagicMock, patch
 
@@ -196,6 +197,78 @@ def test_subsequent_normal_turn_expires_stale_artifact_contract():
     assert agent._tool_guardrails.execution_contract.before_tool(
         "terminal", {"command": "true"}
     ).allowed is True
+
+
+def test_subsequent_normal_turn_filters_expired_artifact_history(
+    monkeypatch,
+    caplog,
+):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    agent = _FakeAgent()
+    artifact_path = (
+        "/opt/data/hermes-artifacts/"
+        "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+    )
+    history = [
+        {"role": "user", "content": "Create recovery.txt and attach it."},
+        {
+            "role": "assistant",
+            "content": "",
+            "tool_calls": [
+                {
+                    "id": "old-artifact-call",
+                    "type": "function",
+                    "function": {
+                        "name": "write_file",
+                        "arguments": (
+                            '{"path":"'
+                            + artifact_path
+                            + '","content":"old artifact policy"}'
+                        ),
+                    },
+                }
+            ],
+        },
+        {
+            "role": "tool",
+            "tool_call_id": "old-artifact-call",
+            "tool_name": "write_file",
+            "content": '{"resolved_path":"' + artifact_path + '"}',
+        },
+        {"role": "assistant", "content": "MEDIA:" + artifact_path},
+    ]
+
+    with caplog.at_level(logging.INFO, logger="agent.turn_context"):
+        ctx = _build(
+            agent,
+            user_message="Continue the normal work.",
+            conversation_history=history,
+        )
+
+    assert ctx.messages == [{"role": "user", "content": "Continue the normal work."}]
+    assert "normal capabilities" in ctx.task_execution_contract.system_guidance
+    assert (
+        "artifact history elided: session=sess-1"
+        in caplog.text
+    )
+    assert "lane=normal removed=4" in caplog.text
+
+
+def test_normal_history_preserves_identity_for_already_durable_messages():
+    agent = _FakeAgent()
+    history = [
+        {"role": "user", "content": "Earlier safe request."},
+        {"role": "assistant", "content": "Earlier safe response."},
+    ]
+
+    ctx = _build(
+        agent,
+        user_message="Continue the normal work.",
+        conversation_history=history,
+    )
+
+    assert ctx.messages[0] is history[0]
+    assert ctx.messages[1] is history[1]
 
 
 def test_applies_agent_side_effects():

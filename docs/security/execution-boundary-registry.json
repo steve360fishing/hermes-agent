@@ -1346,6 +1346,15 @@
       "rationale": "decision boundary for the artifact request contract."
     },
     {
+      "id": "agent/task_execution_contract.py:_artifact_only_disabled",
+      "contract": "artifact_request",
+      "role": "decision",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "_artifact_only_disabled",
+      "disposition": "covered",
+      "rationale": "Fails closed when artifact-only configuration is disabled or unreadable."
+    },
+    {
       "id": "agent/task_execution_contract.py:build_task_execution_contract",
       "contract": "artifact_request",
       "role": "decision",
@@ -1362,6 +1371,33 @@
       "symbol": "clear_task_execution_contract",
       "disposition": "covered",
       "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/task_execution_contract.py:detach_task_execution_contract",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "detach_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "Detaches request-local artifact authority from the cached agent before turn cleanup performs I/O."
+    },
+    {
+      "id": "agent/task_execution_contract.py:finalize_detached_task_execution_contract",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "finalize_detached_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "Finalizes detached artifact receipts and cleanup outside the gateway cache lock."
+    },
+    {
+      "id": "agent/task_execution_contract.py:finalize_detached_task_execution_contract",
+      "contract": "artifact_delivery",
+      "role": "recovery",
+      "path": "agent/task_execution_contract.py",
+      "symbol": "finalize_detached_task_execution_contract",
+      "disposition": "covered",
+      "rationale": "Finalizes or reconciles the detached durable artifact-delivery receipt outside the gateway cache lock."
     },
     {
       "id": "agent/task_execution_contract.py:effective_request_system_prompt",
@@ -1461,6 +1497,51 @@
       "symbol": "finalize_turn",
       "disposition": "covered",
       "rationale": "recovery boundary for the artifact request contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner",
+      "disposition": "reviewed_exclusion",
+      "rationale": "The class container inherits artifact recovery matches from the concrete cache lifecycle methods registered separately."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._init_cached_agent_for_turn",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._init_cached_agent_for_turn",
+      "disposition": "covered",
+      "rationale": "Reconciles any prior request-local contract before a cached agent begins a new turn."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_agent_inner",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_agent_inner",
+      "disposition": "covered",
+      "rationale": "Owns request-local artifact cleanup across normal completion and turn-setup failure."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_agent_inner.run_sync",
+      "contract": "artifact_request",
+      "role": "recovery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_agent_inner.run_sync",
+      "disposition": "covered",
+      "rationale": "Runs detached artifact receipt finalization outside the gateway cache lock."
+    },
+    {
+      "id": "hermes_cli/config.py:__module__",
+      "contract": "artifact_request",
+      "role": "propagation",
+      "path": "hermes_cli/config.py",
+      "symbol": "__module__",
+      "disposition": "covered",
+      "rationale": "Defines the artifact-only recovery switch default consumed by request classification."
     },
     {
       "id": "acp_adapter/server.py:HermesACPAgent",

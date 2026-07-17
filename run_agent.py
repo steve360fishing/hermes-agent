@@ -1689,8 +1689,28 @@ class AIAgent:
         # retry/failure sentinels must not survive into the real transcript).
         self._drop_trailing_empty_response_scaffolding(messages)
         self._session_messages = messages
-        self._save_session_log(messages)
-        self._flush_messages_to_session_db(messages, conversation_history)
+        session_log_messages = messages
+        flush_history = conversation_history
+        durable_history = getattr(self, "_session_log_durable_history", None)
+        if durable_history is not None:
+            current_user = getattr(self, "_session_log_current_turn_user", None)
+            current_turn_idx = next(
+                (
+                    index
+                    for index, message in enumerate(messages)
+                    if message is current_user
+                ),
+                None,
+            )
+            if current_turn_idx is None:
+                fallback_idx = getattr(self, "_persist_user_message_idx", len(messages))
+                current_turn_idx = min(max(int(fallback_idx or 0), 0), len(messages))
+            api_history = messages[:current_turn_idx]
+            current_turn = messages[current_turn_idx:]
+            session_log_messages = [*durable_history, *current_turn]
+            flush_history = [*(conversation_history or []), *api_history]
+        self._save_session_log(session_log_messages)
+        self._flush_messages_to_session_db(messages, flush_history)
 
     def _drop_trailing_empty_response_scaffolding(self, messages: List[Dict]) -> None:
         """Remove private empty-response retry/failure scaffolding from transcript tails.

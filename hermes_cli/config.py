@@ -1050,6 +1050,10 @@ DEFAULT_CONFIG = {
         # compounds over a long conversation.  Costs ~70 tokens in the cached
         # system prompt.  Set False to disable globally.
         "parallel_tool_call_guidance": True,
+        # Request-local optimization for simple TXT/Markdown artifact turns.
+        # Disable to route all file requests through the ordinary agent while
+        # retaining the global writer and media-delivery security policies.
+        "artifact_only_enabled": True,
         # Local-environment toolchain probe — surfaces Python/pip/uv/PEP-668
         # state in the system prompt when something non-default is detected
         # (e.g. python3 has no pip module, pip→python version mismatch, PEP

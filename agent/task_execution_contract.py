@@ -15,6 +15,7 @@ import stat
 import tempfile
 import threading
 import time
+import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -27,7 +28,7 @@ from agent.file_safety import get_safe_write_roots, is_write_denied
 
 NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
-POLICY_VERSION = "artifact-only-v2"
+POLICY_VERSION = "artifact-only-v3"
 MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
 MAX_PENDING_ARTIFACTS = 16
 MAX_PENDING_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -75,7 +76,8 @@ _FILE_DELIVERY_VERB = re.compile(
     re.IGNORECASE,
 )
 _EXTERNAL_DELIVERY_TARGET = re.compile(
-    r"\b(?:email|gmail|outlook|sms|text\s+message|customer|client|recipient|"
+    r"\b(?:email|gmail|outlook|sms|text\s+message|"
+    r"customer(?![- ]ready)|client(?![- ]ready)|recipient|"
     r"webhook|upload\s+to)\b",
     re.IGNORECASE,
 )
@@ -85,9 +87,34 @@ _ARTIFACT_NOUN = re.compile(
     r"brief\b(?!\s+(?:update|status|summary)))",
     re.IGNORECASE,
 )
-_ARTIFACT_VERB = re.compile(
-    r"\b(?:return|give|write|draft|create|produce|generate|make)\b",
+_DIRECT_ARTIFACT_REQUEST = re.compile(
+    r"\b(?:return|give(?:\s+me)?|write|draft|create|produce|generate|"
+    r"make(?!\s+sure\b))\b"
+    r"(?:(?![.!?;\n]).){0,100}"
+    r"\b(?:gpt\s+image\s+prompt|image\s+prompt|prompt|caption|copy|creative\s+brief|"
+    r"brief\b(?!\s+(?:update|status|summary)))",
     re.IGNORECASE,
+)
+_DIRECT_FILE_REQUEST = re.compile(
+    r"(?:^|[\n.!?]\s*)"
+    r"(?:all\s+right[,:\s]+|alright[,:\s]+|ok(?:ay)?[,:\s]+)?"
+    r"(?:please\s+|(?:can|could|would)\s+you\s+(?:please\s+)?|"
+    r"i\s+(?:want|need)(?:\s+you)?\s+to\s+)?"
+    r"(?:return|give|write|draft|create|produce|generate|make|deliver|send|attach)\b",
+    re.IGNORECASE,
+)
+_DIRECT_FILE_BRIDGE = re.compile(
+    r"^\s*"
+    r"(?:(?:and\s+)?(?:deliver|attach|return|send|write|create)\s+)?"
+    r"(?:(?:me|us)\s+)?"
+    r"(?:(?:a|an|the|this|that|my|our|one)\s+)?"
+    r"(?:(?:plain[- ]?text|text|markdown|md|txt|final|finished|complete|"
+    r"completed|small|simple|short|downloadable|attached|attachment|copy|"
+    r"file|document|named|called|as|content|to)\s+){0,6}$",
+    re.IGNORECASE,
+)
+_SPLITLINE_BOUNDARIES = frozenset(
+    {"\n", "\r", "\v", "\f", "\x1c", "\x1d", "\x1e", "\x85", "\u2028", "\u2029"}
 )
 _EXPLICIT_ONLY = re.compile(
     r"\b(?:prompt[- ]only|return\s+only|give\s+me\s+only|paste[- ]ready)\b",
@@ -96,13 +123,45 @@ _EXPLICIT_ONLY = re.compile(
 _OPERATIONAL_REQUEST = re.compile(
     r"\b(?:research|search|look\s*up|browse|render|export|build|implement|"
     r"execute|run|reconcile|sync|publish|post|send|deploy|restart|install|"
+    r"diagnose|troubleshoot|investigate|inspect|analy[sz]e|explain|fix|"
+    r"continue|resume|"
     r"edit\s+(?:the\s+)?(?:file|ledger|manifest|record)|update\s+(?:the\s+)?"
     r"(?:file|ledger|manifest|record)|png|jpe?g|image\s+file)\b",
+    re.IGNORECASE,
+)
+_MENTIONED_FILE_REFERENCE_SUFFIX = re.compile(
+    r"^\s*[\"'`)\]}]*\s*"
+    r"(?:was|were|is|are|had\s+been|has\s+been|is\s+not|are\s+not|"
+    r"was\s+not|were\s+not|isn't|aren't|wasn't|weren't)\b",
+    re.IGNORECASE,
+)
+_DIRECT_FILE_REQUEST_SUFFIX = re.compile(
+    r"^\s*(?:(?:"
+    r"(?:as\s+(?:(?:a|an|the)\s+)?"
+    r"(?:(?:plain[- ]?text|text|markdown|md|txt)\s+)?"
+    r"(?:file|document|attachment))|"
+    r"(?:(?:for|to)\s+(?:me|us))|"
+    r"(?:(?:and\s+)?(?:attach|deliver|send|return)\s+(?:it\s+)?"
+    r"(?:(?:to|for)\s+(?:me|us))?)|"
+    r"(?:(?:containing|with)\s+[^;\n\r\v\f\x1c-\x1e\x85\u2028\u2029]{1,160})"
+    r")\s*)*[.!?]?\s*$",
     re.IGNORECASE,
 )
 _URL = re.compile(r"https://[^\s<>'\"]+", re.IGNORECASE)
 _NEGATED_CONSTRAINT = re.compile(
     r"\b(?:do\s+not|don't|without)\b(?:(?:\.(?:txt|md|markdown))|[^.;,\n])*",
+    re.IGNORECASE,
+)
+_ARTIFACT_ID = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
+_ARTIFACT_EXECUTION_CONTRACT_MARKER = "request execution contract (artifact_only"
+_MEDIA_PATH = re.compile(
+    r"MEDIA:\s*(?P<path>(?:[A-Za-z]:[/\\]|/)[^\s\"'`]+)",
+    re.IGNORECASE,
+)
+_BARE_LOCAL_ARTIFACT_PATH = re.compile(
+    r"(?<![/:\w.])"
+    r"(?P<path>(?:~/|/|[A-Za-z]:[/\\])"
+    r"(?:[\w.\-]+[/\\])*[\w.\-]+\.(?:txt|md|markdown))\b",
     re.IGNORECASE,
 )
 
@@ -156,11 +215,23 @@ class TaskExecutionContract:
         default_factory=tuple,
         repr=False,
     )
+    _expired_artifact_history_messages: int = field(default=0, repr=False)
+    _expired_artifact_paths: frozenset[str] = field(
+        default_factory=frozenset,
+        repr=False,
+    )
     active: bool = True
 
     @property
     def system_guidance(self) -> str:
         if self.lane != ARTIFACT_ONLY:
+            if self._expired_artifact_history_messages:
+                return (
+                    "REQUEST RECOVERY NOTICE (normal capabilities):\n"
+                    "Expired request-local artifact-only tool traces were removed from "
+                    "the model context. Follow only the current request. If it asks for "
+                    "a file, use the normal guarded file workflow and a new safe path."
+                )
             return ""
         if self.preflight_error:
             return ""
@@ -189,6 +260,16 @@ class TaskExecutionContract:
 
     def before_tool(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolAuthorization:
         if self.lane != ARTIFACT_ONLY:
+            if (
+                tool_name == "write_file"
+                and self.references_expired_artifact(args)
+            ):
+                return ToolAuthorization(
+                    False,
+                    "expired_artifact_path_reuse",
+                    "That request-local artifact path expired after its original turn. "
+                    "Continue the current request normally or choose a new safe path.",
+                )
             return ToolAuthorization(True)
         if not self.active:
             return ToolAuthorization(
@@ -294,7 +375,7 @@ class TaskExecutionContract:
         Denied shapes are consumed here to retain the finite attempt budget.
         """
         if self.lane != ARTIFACT_ONLY:
-            return ToolAuthorization(True)
+            return self.before_tool(tool_name, args)
         args = args if isinstance(args, Mapping) else {}
         with self._lock:
             tool_budget_exhausted = self._tool_calls >= self.max_tool_calls
@@ -341,9 +422,12 @@ class TaskExecutionContract:
             self._truncated_chars += len(text) - len(kept)
             return kept + "\n[Tool result truncated by artifact-only policy.]"
 
-    def bound_conversation_history(self, history: Any) -> list[dict[str, str]]:
+    def bound_conversation_history(self, history: Any) -> list[dict[str, Any]]:
         if self.lane != ARTIFACT_ONLY:
-            return list(history) if history else []
+            sanitized, removed, paths = _strip_expired_artifact_history(history)
+            self._expired_artifact_history_messages = removed
+            self._expired_artifact_paths = paths
+            return sanitized
         candidates: list[dict[str, str]] = []
         for message in list(history or []):
             if not isinstance(message, Mapping):
@@ -372,6 +456,15 @@ class TaskExecutionContract:
             remaining -= len(content)
         bounded.reverse()
         return bounded
+
+    def references_expired_artifact(self, value: Any) -> bool:
+        if not self._expired_artifact_paths:
+            return False
+        return bool(
+            self._expired_artifact_paths.intersection(
+                _task_artifact_paths(value, allow_historical_roots=True)
+            )
+        )
 
     def first_event_latency_ms(self, event_timestamp: Any) -> int | None:
         if not isinstance(event_timestamp, (int, float)):
@@ -426,6 +519,9 @@ def build_task_execution_contract(
         affirmative_text
     )
     lane, reason = _classify(trusted_text, file_requested=file_requested)
+    if lane == ARTIFACT_ONLY and _artifact_only_disabled():
+        lane = NORMAL
+        reason = "artifact_only_disabled"
     output_path = ""
     artifact_root = ""
     artifact_route = "none"
@@ -484,7 +580,11 @@ def build_task_execution_contract(
         _artifact_parent_chain=artifact_parent_chain,
         _receipt_parent_chain=receipt_parent_chain,
     )
-    if contract.artifact_file_requested and not contract.preflight_error:
+    if (
+        contract.lane == ARTIFACT_ONLY
+        and contract.artifact_file_requested
+        and not contract.preflight_error
+    ):
         with _ARTIFACT_RECEIPT_LOCK:
             key = _artifact_registry_key(contract.artifact_output_path)
             _ARTIFACT_RECEIPTS[key] = contract
@@ -1190,6 +1290,8 @@ def _orphan_contract_from_receipt(
         _artifact_parent_chain=chain,
         _receipt_parent_chain=receipt_chain,
     )
+    if receipt.get("state") == "allocated":
+        return contract
     try:
         payload, identity = _verified_artifact_bytes(contract)
     except OSError:
@@ -1219,7 +1321,11 @@ def _reconcile_artifact_store(artifact_base: str) -> None:
             modified = receipt_path.stat().st_mtime_ns
         except (OSError, ValueError, TypeError):
             continue
-        if not isinstance(receipt, dict) or receipt.get("state") not in {"written", "dispatching"}:
+        if not isinstance(receipt, dict) or receipt.get("state") not in {
+            "allocated",
+            "written",
+            "dispatching",
+        }:
             continue
         records.append((modified, str(receipt.get("id", "")), receipt, receipt_path))
     records.sort(key=lambda item: (item[0], item[1]))
@@ -1231,7 +1337,11 @@ def _reconcile_artifact_store(artifact_base: str) -> None:
             terminal_state = "ambiguous" if receipt.get("state") == "dispatching" else "failed_preflight"
             selected[artifact_id] = (receipt, receipt_path, terminal_state)
 
-    pending = [item for item in records if item[1] not in selected]
+    pending = [
+        item
+        for item in records
+        if item[1] not in selected and item[2].get("state") != "allocated"
+    ]
     pending_bytes = sum(max(0, int(item[2].get("bytes", 0) or 0)) for item in pending)
     while len(pending) > MAX_PENDING_ARTIFACTS or pending_bytes > MAX_PENDING_ARTIFACT_BYTES:
         _modified, artifact_id, receipt, receipt_path = pending.pop(0)
@@ -1311,38 +1421,59 @@ def _trusted_request_text(text: str) -> str:
     return re.sub(r"`[^`\r\n]*`", "", text)
 
 
-def clear_task_execution_contract(agent: Any) -> None:
-    """Clear and expire any policy left by the previous request."""
+def detach_task_execution_contract(agent: Any) -> TaskExecutionContract | None:
+    """Clear request-local policy pointers without receipt filesystem I/O."""
     contract = getattr(agent, "_task_execution_contract", None)
-    persistence_error: ArtifactReceiptPersistenceError | None = None
-    if contract is not None:
-        key = _artifact_registry_key(getattr(contract, "artifact_output_path", ""))
-        with _ARTIFACT_RECEIPT_LOCK:
-            registered = _ARTIFACT_RECEIPTS.get(key) is contract
-            try:
-                receipt = _load_artifact_receipt_locked(contract, required=registered)
-            except ArtifactReceiptPersistenceError as exc:
-                receipt = {}
-                persistence_error = exc
-        if registered and receipt.get("state") == "allocated":
-            try:
-                finalize_artifact_contract(
-                    contract,
-                    state="failed_preflight",
-                    error_code="artifact_turn_ended_before_write",
-                )
-            except ArtifactReceiptPersistenceError as exc:
-                persistence_error = exc
-        deactivate = getattr(contract, "deactivate", None)
-        if callable(deactivate):
-            deactivate()
+    deactivate = getattr(contract, "deactivate", None)
+    if callable(deactivate):
+        deactivate()
     agent._task_execution_contract = None
     guardrails = getattr(agent, "_tool_guardrails", None)
     setter = getattr(guardrails, "set_execution_contract", None)
     if callable(setter):
-        setter(None)
+        try:
+            setter(None)
+        except Exception:
+            if hasattr(guardrails, "_execution_contract"):
+                guardrails._execution_contract = None
+    return contract
+
+
+def finalize_detached_task_execution_contract(
+    contract: TaskExecutionContract | None,
+    *,
+    error_code: str = "artifact_turn_ended_before_write",
+) -> None:
+    """Terminalize an allocated contract after its live pointers are detached."""
+    if contract is None:
+        return
+    contract.deactivate()
+    persistence_error: ArtifactReceiptPersistenceError | None = None
+    key = _artifact_registry_key(getattr(contract, "artifact_output_path", ""))
+    with _ARTIFACT_RECEIPT_LOCK:
+        registered = _ARTIFACT_RECEIPTS.get(key) is contract
+        try:
+            receipt = _load_artifact_receipt_locked(contract, required=registered)
+        except ArtifactReceiptPersistenceError as exc:
+            receipt = {}
+            persistence_error = exc
+    if registered and receipt.get("state") == "allocated":
+        try:
+            finalize_artifact_contract(
+                contract,
+                state="failed_preflight",
+                error_code=error_code,
+            )
+        except ArtifactReceiptPersistenceError as exc:
+            persistence_error = exc
     if persistence_error is not None:
         raise persistence_error
+
+
+def clear_task_execution_contract(agent: Any) -> None:
+    """Finalize, clear, and expire any policy left by the previous request."""
+    contract = detach_task_execution_contract(agent)
+    finalize_detached_task_execution_contract(contract)
 
 
 def validate_artifact_output_path(path: str, artifact_root: str) -> str | None:
@@ -1507,7 +1638,7 @@ def _classify(text: str, *, file_requested: bool = False) -> tuple[str, str]:
     )
     if (
         file_requested
-        and _FILE_DELIVERY_VERB.search(affirmative_text)
+        and _has_direct_file_request_clause(affirmative_text)
         and not _EXTERNAL_DELIVERY_TARGET.search(delivery_context)
     ):
         operational_terms = [
@@ -1518,9 +1649,247 @@ def _classify(text: str, *, file_requested: bool = False) -> tuple[str, str]:
             return ARTIFACT_ONLY, "explicit_text_file_artifact"
     if _OPERATIONAL_REQUEST.search(affirmative_text):
         return NORMAL, "operational_or_research_request"
-    if _ARTIFACT_NOUN.search(text) and (_ARTIFACT_VERB.search(text) or _EXPLICIT_ONLY.search(text)):
+    if _DIRECT_ARTIFACT_REQUEST.search(affirmative_text) or (
+        _ARTIFACT_NOUN.search(affirmative_text)
+        and _EXPLICIT_ONLY.search(affirmative_text)
+    ):
         return ARTIFACT_ONLY, "explicit_text_artifact"
     return NORMAL, "ambiguous_request"
+
+
+def _has_direct_file_request_clause(text: str) -> bool:
+    """Require the request verb and requested file to occur in one clause."""
+    for verb_match in _DIRECT_FILE_REQUEST.finditer(text):
+        evidence_matches = [
+            match
+            for match in (
+                _QUOTED_FILENAME.search(text, verb_match.end()),
+                _BARE_FILENAME.search(text, verb_match.end()),
+                _TEXT_FILE_REQUEST.search(text, verb_match.end()),
+            )
+            if match is not None
+        ]
+        if not evidence_matches:
+            continue
+        evidence = min(evidence_matches, key=lambda match: match.start())
+        between = text[verb_match.end() : evidence.start()]
+        after = text[evidence.end() :]
+        # This is an optimization, not a capability boundary. Ambiguous prose
+        # safely falls back to the full normal agent, which can still write and
+        # deliver files through the standard guarded tools.
+        if (
+            len(between) > 64
+            or any(character in _SPLITLINE_BOUNDARIES for character in between)
+            or any(
+            unicodedata.category(character).startswith("P") for character in between
+            )
+            or _DIRECT_FILE_BRIDGE.fullmatch(between) is None
+            or _MENTIONED_FILE_REFERENCE_SUFFIX.search(after) is not None
+            or _DIRECT_FILE_REQUEST_SUFFIX.fullmatch(after) is None
+        ):
+            continue
+        return True
+    return False
+
+
+def _artifact_only_disabled() -> bool:
+    """Read the recovery switch from config.yaml, never from the secrets file."""
+    try:
+        from hermes_cli.config import load_config_readonly
+
+        config = load_config_readonly() or {}
+        agent_config = config.get("agent") or {}
+    except Exception:
+        return True
+    return agent_config.get("artifact_only_enabled") is False
+
+
+def _task_artifact_paths(
+    value: Any,
+    *,
+    allow_historical_roots: bool = False,
+) -> set[str]:
+    if isinstance(value, Mapping):
+        paths: set[str] = set()
+        for nested in value.values():
+            paths.update(
+                _task_artifact_paths(
+                    nested,
+                    allow_historical_roots=allow_historical_roots,
+                )
+            )
+        return paths
+    if isinstance(value, (list, tuple, set, frozenset)):
+        paths: set[str] = set()
+        for nested in value:
+            paths.update(
+                _task_artifact_paths(
+                    nested,
+                    allow_historical_roots=allow_historical_roots,
+                )
+            )
+        return paths
+    if not isinstance(value, str):
+        return set()
+
+    text = value.strip()
+    if not text:
+        return set()
+    try:
+        decoded = json.loads(text)
+    except (TypeError, ValueError, json.JSONDecodeError):
+        decoded = None
+    if decoded is not None and not isinstance(decoded, str):
+        return _task_artifact_paths(
+            decoded,
+            allow_historical_roots=allow_historical_roots,
+        )
+
+    candidates = {text.strip(" \t\r\n\"'`")}
+    candidates.update(match.group("path") for match in _MEDIA_PATH.finditer(text))
+    candidates.update(
+        match.group("path") for match in _BARE_LOCAL_ARTIFACT_PATH.finditer(text)
+    )
+    paths: set[str] = set()
+    for candidate in candidates:
+        try:
+            expanded = os.path.abspath(os.path.expanduser(candidate))
+            extension = os.path.splitext(expanded)[1].lower()
+            task_root = os.path.dirname(expanded)
+            if extension not in _SUPPORTED_ARTIFACT_TYPES:
+                continue
+            if not _ARTIFACT_ID.fullmatch(os.path.basename(task_root)):
+                continue
+            store_root = os.path.normcase(os.path.realpath(os.path.dirname(task_root)))
+            approved_roots = {
+                os.path.normcase(os.path.realpath(os.path.expanduser(root)))
+                for root, _route in _artifact_root_candidates()
+            }
+            if store_root not in approved_roots and not allow_historical_roots:
+                continue
+            paths.add(os.path.normcase(os.path.realpath(expanded)))
+        except (OSError, ValueError):
+            continue
+    return paths
+
+
+def _partition_artifact_tool_calls(
+    message: Mapping[str, Any],
+) -> tuple[set[str], set[str], list[Any] | None]:
+    raw_calls = message.get("tool_calls")
+    if isinstance(raw_calls, str):
+        try:
+            raw_calls = json.loads(raw_calls)
+        except (TypeError, ValueError, json.JSONDecodeError):
+            return set(), set(), None
+    if not isinstance(raw_calls, list):
+        return set(), set(), None
+
+    call_ids: set[str] = set()
+    paths: set[str] = set()
+    retained: list[Any] = []
+    for call in raw_calls:
+        if not isinstance(call, Mapping):
+            retained.append(call)
+            continue
+        function = call.get("function")
+        if not isinstance(function, Mapping):
+            function = call
+        if function.get("name") != "write_file":
+            retained.append(call)
+            continue
+        arguments = function.get("arguments")
+        artifact_paths = _task_artifact_paths(
+            arguments,
+            allow_historical_roots=True,
+        )
+        if not artifact_paths:
+            retained.append(call)
+            continue
+        call_id = call.get("id") or call.get("call_id")
+        if call_id:
+            call_ids.add(str(call_id))
+        paths.update(artifact_paths)
+    return call_ids, paths, retained
+
+
+def _strip_expired_artifact_history(
+    history: Any,
+) -> tuple[list[dict[str, Any]], int, frozenset[str]]:
+    """Remove complete expired artifact turns from the API-bound history.
+
+    Untouched dictionaries retain object identity so persistence recognizes
+    them as already durable. The SessionDB transcript itself is never changed.
+    """
+    messages = [
+        item if isinstance(item, dict) else dict(item)
+        for item in list(history or [])
+        if isinstance(item, Mapping)
+    ]
+    artifact_call_ids: set[str] = set()
+    artifact_paths: set[str] = set()
+    artifact_trace_indices: set[int] = set()
+    remove_indices: set[int] = set()
+
+    for index, message in enumerate(messages):
+        if message.get("role") == "assistant":
+            call_ids, paths, _retained = _partition_artifact_tool_calls(message)
+            artifact_call_ids.update(call_ids)
+            artifact_paths.update(paths)
+            if paths:
+                artifact_trace_indices.add(index)
+        content = message.get("content")
+        if (
+            message.get("role") in {"system", "developer"}
+            and isinstance(content, str)
+            and _ARTIFACT_EXECUTION_CONTRACT_MARKER in content.lower()
+        ):
+            remove_indices.add(index)
+
+    for index, message in enumerate(messages):
+        if message.get("role") != "tool":
+            continue
+        tool_call_id = str(message.get("tool_call_id") or "")
+        paths = _task_artifact_paths(message, allow_historical_roots=True)
+        tool_name = message.get("tool_name") or message.get("name")
+        if tool_call_id in artifact_call_ids or (
+            tool_name == "write_file" and paths
+        ):
+            artifact_paths.update(paths)
+            artifact_trace_indices.add(index)
+
+    for index, message in enumerate(messages):
+        if message.get("role") != "assistant" or message.get("tool_calls"):
+            continue
+        paths = _task_artifact_paths(message, allow_historical_roots=True)
+        content = message.get("content")
+        is_direct_media_response = (
+            isinstance(content, str)
+            and re.match(r"^\s*MEDIA:", content, re.IGNORECASE) is not None
+        )
+        if paths.intersection(artifact_paths) or (
+            is_direct_media_response and paths
+        ):
+            artifact_paths.update(paths)
+            artifact_trace_indices.add(index)
+
+    user_starts = [
+        index for index, message in enumerate(messages) if message.get("role") == "user"
+    ]
+    for trace_index in artifact_trace_indices:
+        preceding = [index for index in user_starts if index <= trace_index]
+        if not preceding:
+            remove_indices.add(trace_index)
+            continue
+        start = preceding[-1]
+        following = [index for index in user_starts if index > start]
+        end = following[0] if following else len(messages)
+        remove_indices.update(range(start, end))
+
+    sanitized = [
+        message for index, message in enumerate(messages) if index not in remove_indices
+    ]
+    return sanitized, len(remove_indices), frozenset(artifact_paths)
 
 
 def _tool_urls(args: Mapping[str, Any]) -> list[str]:

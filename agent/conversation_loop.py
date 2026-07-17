@@ -657,9 +657,32 @@ def run_conversation(
             ra=_ra,
         )
     except Exception:
-        from agent.task_execution_contract import clear_task_execution_contract
+        from agent.task_execution_contract import (
+            clear_task_execution_contract,
+            finalize_detached_task_execution_contract,
+        )
 
-        clear_task_execution_contract(agent)
+        adopted_contract = (
+            getattr(agent, "_task_execution_contract", None) is _prebuilt_task_contract
+        )
+        try:
+            clear_task_execution_contract(agent)
+        except Exception:
+            logger.warning(
+                "attached artifact contract cleanup failed during turn setup",
+                exc_info=True,
+            )
+        if not adopted_contract:
+            try:
+                finalize_detached_task_execution_contract(
+                    _prebuilt_task_contract,
+                    error_code="artifact_turn_setup_failed_before_adoption",
+                )
+            except Exception:
+                logger.warning(
+                    "unadopted artifact contract cleanup failed during turn setup",
+                    exc_info=True,
+                )
         raise
     user_message = _ctx.user_message
     original_user_message = _ctx.original_user_message

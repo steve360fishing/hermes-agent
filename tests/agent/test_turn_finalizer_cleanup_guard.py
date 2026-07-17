@@ -366,6 +366,65 @@ def test_artifact_contract_suppresses_background_skill_review():
     assert agent.background_review_calls == 0
 
 
+def test_normal_turn_blocks_expired_artifact_media_reference(monkeypatch):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    agent = _StubAgent(raise_in=())
+    artifact_path = (
+        "/opt/data/hermes-artifacts/"
+        "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+    )
+    contract = build_task_execution_contract(
+        "Continue the tournament planning.",
+        task_id="normal-recovery-turn",
+        platform="telegram",
+    )
+    contract.bound_conversation_history(
+        [{"role": "assistant", "content": f"MEDIA:{artifact_path}"}]
+    )
+    agent._task_execution_contract = contract
+
+    result = _run(
+        agent,
+        final_response=f"MEDIA:{artifact_path}",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert "MEDIA:" not in result["final_response"]
+    assert "expired attachment route was blocked" in result["final_response"]
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "expired_artifact_path_reuse_blocked"
+
+
+def test_normal_turn_blocks_expired_bare_artifact_path_in_prose(monkeypatch):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
+    agent = _StubAgent(raise_in=())
+    artifact_path = (
+        "/opt/data/hermes-artifacts/"
+        "68fc2177cc474858a2c9b998f3b8be6f/recovery.txt"
+    )
+    contract = build_task_execution_contract(
+        "Continue the tournament planning.",
+        task_id="normal-recovery-bare-path",
+        platform="telegram",
+    )
+    contract.bound_conversation_history(
+        [{"role": "assistant", "content": f"MEDIA:{artifact_path}"}]
+    )
+    agent._task_execution_contract = contract
+
+    result = _run(
+        agent,
+        final_response=f"Here is the old file again: {artifact_path}",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert artifact_path not in result["final_response"]
+    assert result["failed"] is True
+    assert result["turn_exit_reason"] == "expired_artifact_path_reuse_blocked"
+
+
 def test_artifact_max_iteration_does_not_mutate_kanban_state():
     agent = _StubAgent(raise_in=())
     agent._task_execution_contract = build_task_execution_contract(
