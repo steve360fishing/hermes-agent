@@ -32,6 +32,12 @@ from plugins.platforms.telegram import liveness  # noqa: E402
 SHA = "a" * 40
 
 
+@pytest.fixture(autouse=True)
+def baked_artifact_sha(monkeypatch):
+    monkeypatch.setattr(liveness, "_read_baked_build_sha", lambda: SHA)
+    monkeypatch.delenv("HERMES_REVISION", raising=False)
+
+
 def test_marker_success_is_atomic_schema_v1_and_mode_0600(tmp_path, monkeypatch):
     marker = tmp_path / liveness.MARKER_NAME
     monkeypatch.setattr(liveness.time, "time", lambda: 1_000.0)
@@ -72,6 +78,22 @@ def test_marker_fails_closed_without_a_full_source_sha(tmp_path, monkeypatch):
     marker = tmp_path / liveness.MARKER_NAME
 
     assert not liveness.write_polling_liveness_marker(path=marker)
+    assert not marker.exists()
+
+
+def test_marker_requires_environment_revision_to_match_baked_artifact(tmp_path, monkeypatch):
+    marker = tmp_path / liveness.MARKER_NAME
+    monkeypatch.setenv("HERMES_REVISION", "b" * 40)
+
+    assert not liveness.write_polling_liveness_marker(path=marker)
+    assert not liveness.write_polling_liveness_marker(path=marker, source_sha=SHA)
+    assert not marker.exists()
+
+
+def test_marker_rejects_caller_sha_that_does_not_match_baked_artifact(tmp_path):
+    marker = tmp_path / liveness.MARKER_NAME
+
+    assert not liveness.write_polling_liveness_marker(path=marker, source_sha="b" * 40)
     assert not marker.exists()
 
 
@@ -126,3 +148,56 @@ async def test_failed_provider_probe_does_not_write_false_heartbeat(monkeypatch)
 
     assert wrote == []
     adapter._handle_polling_network_error.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_pending_consumer_health_probe_cannot_refresh_marker():
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._webhook_mode = False
+    adapter._app = MagicMock()
+    adapter._app.updater.running = True
+    adapter._polling_error_task = None
+    adapter._polling_pending_stuck_count = 0
+    adapter._polling_not_running_count = 0
+    adapter._handle_polling_network_error = AsyncMock()
+    adapter.platform = tg_adapter.Platform.TELEGRAM
+    bot = MagicMock()
+    bot.get_webhook_info = AsyncMock(return_value=MagicMock(pending_update_count=1))
+
+    adapter._record_polling_liveness = MagicMock()
+    if await adapter._probe_pending_updates(bot, 1):
+        adapter._record_polling_liveness()
+
+    adapter._record_polling_liveness.assert_not_called()
+
+
+@pytest.mark.asyncio
+async def test_inbound_update_refreshes_marker_when_active_poller_delivers_it():
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._webhook_mode = False
+    adapter._app = MagicMock()
+    adapter._app.updater.running = True
+    adapter._polling_error_task = None
+    adapter._record_polling_liveness = MagicMock()
+    update = MagicMock()
+    update.effective_message = None
+    update.message = None
+
+    await adapter._handle_text_message(update, MagicMock())
+
+    adapter._record_polling_liveness.assert_called_once_with()
+
+
+@pytest.mark.asyncio
+async def test_reconnect_or_stopped_updater_cannot_refresh_inbound_marker():
+    adapter = TelegramAdapter.__new__(TelegramAdapter)
+    adapter._webhook_mode = False
+    adapter._app = MagicMock()
+    adapter._app.updater.running = False
+    adapter._polling_error_task = MagicMock()
+    adapter._polling_error_task.done.return_value = False
+    adapter._record_polling_liveness = MagicMock()
+
+    adapter._record_inbound_polling_liveness()
+
+    adapter._record_polling_liveness.assert_not_called()

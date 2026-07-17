@@ -2241,7 +2241,6 @@ class TelegramAdapter(BasePlatformAdapter):
                 self.name, attempt,
             )
             self._polling_network_error_count = 0
-            self._record_polling_liveness()
             # start_polling() succeeding IS the recovery signal: the long-poll
             # connection is live again, so clear the degraded flag immediately
             # rather than blocking all outbound sends for the full
@@ -2491,7 +2490,6 @@ class TelegramAdapter(BasePlatformAdapter):
         try:
             await asyncio.wait_for(self._app.bot.get_me(), PROBE_TIMEOUT)
             self._send_path_degraded = False
-            self._record_polling_liveness()
         except Exception as probe_err:
             logger.warning(
                 "[%s] Polling heartbeat probe failed %ds after reconnect: %s",
@@ -2500,7 +2498,7 @@ class TelegramAdapter(BasePlatformAdapter):
             await self._handle_polling_network_error(probe_err)
 
     def _record_polling_liveness(self) -> None:
-        """Persist only real successful polling/connectivity evidence.
+        """Persist a marker after a defensible receive-path observation.
 
         The marker is deliberately best-effort: a filesystem failure must make
         the host watchdog fail closed, never take down an otherwise live
@@ -2509,6 +2507,22 @@ class TelegramAdapter(BasePlatformAdapter):
         """
         if not write_polling_liveness_marker():
             logger.debug("[%s] Telegram liveness marker was not written", self.name)
+
+    def _can_refresh_polling_liveness(self) -> bool:
+        """Return whether this adapter is actively receiving in polling mode."""
+        if getattr(self, "_webhook_mode", False):
+            return False
+        recovery = getattr(self, "_polling_error_task", None)
+        if recovery is not None and not recovery.done():
+            return False
+        app = getattr(self, "_app", None)
+        updater = getattr(app, "updater", None) if app is not None else None
+        return updater is not None and bool(getattr(updater, "running", False))
+
+    def _record_inbound_polling_liveness(self) -> None:
+        """Record an update PTB delivered through the active polling path."""
+        if self._can_refresh_polling_liveness():
+            self._record_polling_liveness()
 
     def _disarm_ptb_retry_loop(self) -> None:
         """Synchronously stop PTB's internal polling retry loop.
@@ -5438,6 +5452,7 @@ class TelegramAdapter(BasePlatformAdapter):
         self, update: "Update", context: "ContextTypes.DEFAULT_TYPE"
     ) -> None:
         """Handle inline keyboard button clicks."""
+        self._record_inbound_polling_liveness()
         query = update.callback_query
         if not query or not query.data:
             return
@@ -7639,6 +7654,7 @@ class TelegramAdapter(BasePlatformAdapter):
         rapid successive text messages from the same user/chat and aggregate
         them into a single MessageEvent before dispatching.
         """
+        self._record_inbound_polling_liveness()
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -7667,6 +7683,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_command(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming command messages."""
+        self._record_inbound_polling_liveness()
         msg = self._effective_update_message(update)
         if not msg or not msg.text:
             return
@@ -7689,6 +7706,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_location_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming location/venue pin messages."""
+        self._record_inbound_polling_liveness()
         msg = self._effective_update_message(update)
         if not msg:
             return
@@ -7893,6 +7911,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
     async def _handle_media_message(self, update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         """Handle incoming media messages, downloading images to local cache."""
+        self._record_inbound_polling_liveness()
         if not update.message:
             return
         if not self._is_user_authorized_from_message(update.message):

@@ -17,13 +17,20 @@ _SOURCE_SHA_PATTERN: Final = re.compile(r"^[0-9a-f]{40}(?:[0-9a-f]{24})?$")
 
 
 def _producer_source_sha() -> str | None:
-    """Return the reviewed build/source revision, never a fabricated value."""
-    candidates = (os.environ.get("HERMES_REVISION"), _read_baked_build_sha())
-    for candidate in candidates:
-        value = candidate.strip() if isinstance(candidate, str) else ""
-        if _SOURCE_SHA_PATTERN.fullmatch(value):
-            return value
-    return None
+    """Return the running artifact SHA, refusing unbound environment values."""
+    baked_sha = _normalized_source_sha(_read_baked_build_sha())
+    if baked_sha is None:
+        return None
+    revision = os.environ.get("HERMES_REVISION")
+    if revision is None:
+        return baked_sha
+    revision_sha = _normalized_source_sha(revision)
+    return baked_sha if revision_sha == baked_sha else None
+
+
+def _normalized_source_sha(value: object) -> str | None:
+    candidate = value.strip() if isinstance(value, str) else ""
+    return candidate if _SOURCE_SHA_PATTERN.fullmatch(candidate) else None
 
 
 def _read_baked_build_sha() -> str | None:
@@ -47,9 +54,11 @@ def write_polling_liveness_marker(*, path: Path | None = None, source_sha: str |
     marker without a full, reviewed producer source SHA.
     """
     target = path or _marker_path()
-    sha = source_sha if source_sha is not None else _producer_source_sha()
-    if not isinstance(sha, str) or not _SOURCE_SHA_PATTERN.fullmatch(sha):
+    running_sha = _producer_source_sha()
+    requested_sha = _normalized_source_sha(source_sha) if source_sha is not None else running_sha
+    if running_sha is None or requested_sha != running_sha:
         return False
+    sha = running_sha
     try:
         parent_info = os.lstat(target.parent)
         if not stat.S_ISDIR(parent_info.st_mode) or stat.S_ISLNK(parent_info.st_mode):
