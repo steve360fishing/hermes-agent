@@ -13176,6 +13176,47 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             _thread_meta = self._thread_metadata_for_source(event.source, self._reply_anchor_for_event(event))
 
+            async def _deliver_document(file_path: str) -> bool:
+                """Do not let a false document result erase a MEDIA-only reply."""
+                correlation_id = None
+                try:
+                    from agent.task_execution_contract import record_artifact_dispatch
+
+                    correlation_id = record_artifact_dispatch(file_path, state="dispatching")
+                except Exception:
+                    pass
+                try:
+                    result = await adapter.send_document(
+                        chat_id=event.source.chat_id,
+                        file_path=file_path,
+                        metadata=_thread_meta,
+                    )
+                except Exception:
+                    result = None
+                if getattr(result, "success", False):
+                    try:
+                        from agent.task_execution_contract import record_artifact_dispatch
+
+                        record_artifact_dispatch(file_path, state="delivered", message_id=getattr(result, "message_id", None))
+                    except Exception:
+                        pass
+                    return True
+                try:
+                    from agent.task_execution_contract import record_artifact_dispatch
+
+                    correlation_id = record_artifact_dispatch(
+                        file_path, state="ambiguous", error_code=str(getattr(result, "error", "document_dispatch_failed"))
+                    ) or correlation_id
+                except Exception:
+                    pass
+                await adapter.send(
+                    chat_id=event.source.chat_id,
+                    content="⚠️ Couldn't deliver the requested attachment."
+                    + (f" Reference: {correlation_id}." if correlation_id else ""),
+                    metadata=_thread_meta,
+                )
+                return False
+
             _VIDEO_EXTS = {'.mp4', '.mov', '.avi', '.mkv', '.webm', '.3gp'}
             _IMAGE_EXTS = {'.jpg', '.jpeg', '.png', '.webp', '.gif'}
 
@@ -13229,11 +13270,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=media_path,
-                            metadata=_thread_meta,
-                        )
+                        await _deliver_document(media_path)
                 except Exception as e:
                     logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
 
@@ -13247,11 +13284,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             metadata=_thread_meta,
                         )
                     else:
-                        await adapter.send_document(
-                            chat_id=event.source.chat_id,
-                            file_path=file_path,
-                            metadata=_thread_meta,
-                        )
+                        await _deliver_document(file_path)
                 except Exception as e:
                     logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
 

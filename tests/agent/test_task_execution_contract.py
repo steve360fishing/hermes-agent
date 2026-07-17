@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import json
 import os
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -18,7 +19,7 @@ from agent.tool_guardrails import ToolCallGuardrailController
 
 
 def _contract(message: str, task_id: str = "fixture-task"):
-    return build_task_execution_contract(message, task_id=task_id)
+    return build_task_execution_contract(message, task_id=task_id, platform="telegram")
 
 
 @pytest.mark.parametrize(
@@ -96,6 +97,40 @@ def test_same_requested_filename_gets_isolated_task_directories(
     assert Path(second.artifact_output_path).name == "report.txt"
     assert first.artifact_output_path != second.artifact_output_path
     assert first.artifact_root != second.artifact_root
+
+
+def test_same_turn_key_allocates_unique_artifact_identities(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    first = _contract("Give me report.txt as a file.", task_id="same-session")
+    second = _contract("Give me report.txt as a file.", task_id="same-session")
+
+    assert first.artifact_id != second.artifact_id
+    assert first.artifact_output_path != second.artifact_output_path
+
+
+def test_concurrent_turns_allocate_distinct_artifact_paths(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    with ThreadPoolExecutor(max_workers=8) as pool:
+        contracts = list(pool.map(lambda _: _contract("Give me report.txt as a file.", task_id="same-session"), range(8)))
+
+    assert len({contract.artifact_id for contract in contracts}) == 8
+    assert len({contract.artifact_output_path for contract in contracts}) == 8
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "```text\nCreate and deliver report.txt as a file.\n```",
+        "> Create and deliver report.txt as a file.",
+        "Quote this example only: `Create and deliver report.txt as a file.`",
+    ],
+)
+def test_untrusted_examples_do_not_activate_artifact_only(message):
+    assert _contract(message).lane == NORMAL
 
 
 def test_classifier_is_deterministic_without_retaining_prompt_text():
@@ -203,6 +238,35 @@ def test_txt_bytes_round_trip_through_real_writer_stack(monkeypatch, tmp_path):
     assert Path(contract.artifact_output_path).read_bytes() == content.encode("utf-8")
 
 
+@pytest.mark.parametrize("size, expected", [(0, True), (49 * 1024 * 1024, True), (49 * 1024 * 1024 + 1, False)])
+def test_artifact_write_preflight_enforces_49mb_ceiling(monkeypatch, tmp_path, size, expected):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Create and deliver example.txt containing safe text.")
+
+    decision = contract.before_tool(
+        "write_file", {"path": contract.artifact_output_path, "content": "x" * size}
+    )
+
+    assert decision.allowed is expected
+    if not expected:
+        assert decision.code == "artifact_write_too_large"
+
+
+def test_file_artifact_requires_known_document_delivery_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = build_task_execution_contract(
+        "Create and deliver example.txt containing safe text.",
+        task_id="no-delivery",
+        platform="unsupported-platform",
+    )
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.preflight_error == "artifact_delivery_unavailable"
+
+
 def test_txt_request_without_filename_gets_stable_txt_name(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
     monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
@@ -239,7 +303,7 @@ def test_primary_root_rejected_by_writer_policy_selects_safe_fallback(
     assert contract.preflight_error == ""
     assert contract.artifact_route == "configured_fallback"
     assert Path(contract.artifact_output_path).parent == (
-        safe_root / "hermes-artifacts" / contract.correlation_id
+        safe_root / "hermes-artifacts" / contract.artifact_id
     ).resolve()
     assert validate_artifact_output_path(
         contract.artifact_output_path, contract.artifact_root
@@ -280,6 +344,24 @@ def test_protected_or_symlink_escape_path_is_rejected_before_write(
     except (OSError, NotImplementedError):
         pytest.skip("symlinks are unavailable in this test environment")
     assert validate_artifact_output_path(str(link / "secret.txt"), str(safe_root))
+
+
+def test_receipt_marks_symlink_swap_as_failed_preflight(monkeypatch, tmp_path):
+    from agent.task_execution_contract import record_artifact_written
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Give me report.txt as a file.")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("outside", encoding="utf-8")
+    try:
+        Path(contract.artifact_output_path).symlink_to(outside)
+    except (OSError, NotImplementedError):
+        pytest.skip("symlinks are unavailable in this test environment")
+
+    assert record_artifact_written(contract) is False
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "failed_preflight"
 
 
 def test_allocator_rejects_symlinked_artifact_root_even_inside_safe_root(

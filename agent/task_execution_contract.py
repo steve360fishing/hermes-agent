@@ -8,11 +8,13 @@ also asks Hermes to research, mutate state, render, execute, or publish.
 from __future__ import annotations
 
 import hashlib
+import json
 import os
 import re
 import tempfile
 import threading
 import time
+import uuid
 from dataclasses import dataclass, field
 from typing import Any, Mapping
 from urllib.parse import urlparse, urlunparse
@@ -23,6 +25,9 @@ from agent.file_safety import get_safe_write_roots, is_write_denied
 NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
 POLICY_VERSION = "artifact-only-v2"
+MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
+_ARTIFACT_RECEIPT_LOCK = threading.Lock()
+_ARTIFACT_RECEIPTS: dict[str, "TaskExecutionContract"] = {}
 
 _SUPPORTED_ARTIFACT_TYPES = {
     ".txt": "text/plain",
@@ -93,7 +98,9 @@ class TaskExecutionContract:
     decision_reason: str
     correlation_id: str
     artifact_output_path: str
+    artifact_id: str = ""
     artifact_root: str = ""
+    artifact_receipt_path: str = ""
     artifact_filename: str = ""
     artifact_extension: str = ""
     artifact_mime_type: str = ""
@@ -228,6 +235,13 @@ class TaskExecutionContract:
                         False,
                         "artifact_write_preflight_denied",
                         "The generated artifact destination no longer passes the writer policy.",
+                    )
+                if not isinstance(args.get("content"), str) or not artifact_content_fits(args["content"]):
+                    self._denied_calls += 1
+                    return ToolAuthorization(
+                        False,
+                        "artifact_write_too_large",
+                        "Artifact attachments are limited to 49 MB.",
                     )
                 self._artifact_writes += 1
                 self._allowed_calls += 1
@@ -369,40 +383,50 @@ class TaskExecutionContract:
             self.active = False
 
 
-def build_task_execution_contract(message: Any, *, task_id: str) -> TaskExecutionContract:
+def build_task_execution_contract(
+    message: Any, *, task_id: str, platform: Any = None
+) -> TaskExecutionContract:
     text = message if isinstance(message, str) else str(message or "")
     correlation_id = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:16]
-    affirmative_text = _NEGATED_CONSTRAINT.sub("", text)
+    trusted_text = _trusted_request_text(text)
+    affirmative_text = _NEGATED_CONSTRAINT.sub("", trusted_text)
     file_requested, requested_filename, requested_extension = _requested_artifact_file(
         affirmative_text
     )
-    lane, reason = _classify(text, file_requested=file_requested)
+    lane, reason = _classify(trusted_text, file_requested=file_requested)
     output_path = ""
     artifact_root = ""
     artifact_route = "none"
     artifact_filename = ""
     artifact_mime_type = ""
     preflight_error = ""
+    artifact_id = uuid.uuid4().hex
+    artifact_receipt_path = ""
     if lane == ARTIFACT_ONLY and file_requested:
         artifact_filename = _safe_artifact_filename(
             requested_filename, requested_extension, correlation_id
         )
         requested_extension = os.path.splitext(artifact_filename)[1].lower()
         artifact_mime_type = _SUPPORTED_ARTIFACT_TYPES[requested_extension]
-        prepared = _prepare_artifact_output(artifact_filename, correlation_id)
+        if platform is not None and not platform_supports_document_delivery(platform):
+            preflight_error = "artifact_delivery_unavailable"
+        prepared = None if preflight_error else _prepare_artifact_output(artifact_filename, artifact_id)
         if prepared is None:
-            preflight_error = "artifact_output_unavailable"
+            preflight_error = preflight_error or "artifact_output_unavailable"
         else:
             artifact_root, output_path, artifact_route = prepared
+            artifact_receipt_path = os.path.join(artifact_root, ".artifact-delivery-receipt.json")
     explicit_urls = frozenset(
         filter(None, (_normalized_url(url.rstrip(".,);]")) for url in _URL.findall(text)))
     )
-    return TaskExecutionContract(
+    contract = TaskExecutionContract(
         lane=lane,
         decision_reason=reason,
         correlation_id=correlation_id,
         artifact_output_path=output_path,
+        artifact_id=artifact_id if file_requested else "",
         artifact_root=artifact_root,
+        artifact_receipt_path=artifact_receipt_path,
         artifact_filename=artifact_filename,
         artifact_extension=requested_extension if file_requested else "",
         artifact_mime_type=artifact_mime_type,
@@ -411,6 +435,111 @@ def build_task_execution_contract(message: Any, *, task_id: str) -> TaskExecutio
         preflight_error=preflight_error,
         explicit_urls=explicit_urls,
     )
+    if contract.artifact_file_requested and not contract.preflight_error:
+        _write_artifact_receipt(contract, state="allocated")
+        with _ARTIFACT_RECEIPT_LOCK:
+            _ARTIFACT_RECEIPTS[os.path.realpath(contract.artifact_output_path)] = contract
+    return contract
+
+
+def platform_supports_document_delivery(platform: Any) -> bool:
+    """Static capability gate used before an attachment-only turn is activated."""
+    return str(getattr(platform, "value", platform) or "").lower() == "telegram"
+
+
+def artifact_content_fits(content: str) -> bool:
+    try:
+        return len(content.encode("utf-8")) <= MAX_ARTIFACT_BYTES
+    except UnicodeError:
+        return False
+
+
+def record_artifact_written(contract: TaskExecutionContract) -> bool:
+    """Atomically record the bytes actually present after the canonical writer ran."""
+    try:
+        path = os.path.realpath(contract.artifact_output_path)
+        if validate_artifact_output_path(path, contract.artifact_root) is not None:
+            _write_artifact_receipt(contract, state="failed_preflight", error_code="invalid_output_path")
+            return False
+        stat = os.lstat(path)
+        if os.path.islink(path) or stat.st_size > MAX_ARTIFACT_BYTES:
+            _write_artifact_receipt(contract, state="failed_preflight", error_code="unsafe_or_oversize")
+            return False
+        with open(path, "rb") as artifact:
+            payload = artifact.read()
+        if len(payload) != stat.st_size:
+            _write_artifact_receipt(contract, state="ambiguous", error_code="artifact_changed_during_read")
+            return False
+        _write_artifact_receipt(
+            contract,
+            state="written",
+            sha256=hashlib.sha256(payload).hexdigest(),
+            size=len(payload),
+        )
+        return True
+    except OSError:
+        _write_artifact_receipt(contract, state="failed_preflight", error_code="artifact_unreadable")
+        return False
+
+
+def record_artifact_dispatch(path: str, *, state: str, message_id: Any = None, error_code: str = "") -> str | None:
+    """Advance a registered artifact receipt without persisting user content."""
+    with _ARTIFACT_RECEIPT_LOCK:
+        contract = _ARTIFACT_RECEIPTS.get(os.path.realpath(path))
+    if contract is None:
+        return None
+    _write_artifact_receipt(contract, state=state, message_id=message_id, error_code=error_code)
+    return contract.correlation_id
+
+
+def _write_artifact_receipt(
+    contract: TaskExecutionContract,
+    *,
+    state: str,
+    sha256: str = "",
+    size: int | None = None,
+    message_id: Any = None,
+    error_code: str = "",
+) -> None:
+    if not contract.artifact_receipt_path:
+        return
+    prior: dict[str, Any] = {}
+    try:
+        with open(contract.artifact_receipt_path, "r", encoding="utf-8") as source:
+            prior = json.load(source)
+    except (OSError, ValueError):
+        pass
+    receipt = {
+        "id": contract.artifact_id,
+        "turn": contract.correlation_id,
+        "path": contract.artifact_output_path,
+        "sha256": sha256 or prior.get("sha256", ""),
+        "bytes": size if size is not None else prior.get("bytes", 0),
+        "mime": contract.artifact_mime_type,
+        "state": state,
+        "attempt_count": int(prior.get("attempt_count", 0)) + (1 if state == "dispatching" else 0),
+        "platform_message_id": str(message_id) if message_id is not None else prior.get("platform_message_id", ""),
+        "error_code": error_code,
+    }
+    try:
+        fd, temporary = tempfile.mkstemp(prefix=".receipt-", dir=contract.artifact_root)
+        with os.fdopen(fd, "w", encoding="utf-8") as destination:
+            json.dump(receipt, destination, sort_keys=True, separators=(",", ":"))
+            destination.flush()
+            os.fsync(destination.fileno())
+        os.replace(temporary, contract.artifact_receipt_path)
+    except OSError:
+        try:
+            os.unlink(temporary)
+        except (OSError, UnboundLocalError):
+            pass
+
+
+def _trusted_request_text(text: str) -> str:
+    """Discard fenced, quoted, and inline-code examples before classification."""
+    text = re.sub(r"```[\s\S]*?```", "", text)
+    text = re.sub(r"(?m)^\s*>.*$", "", text)
+    return re.sub(r"`[^`\r\n]*`", "", text)
 
 
 def clear_task_execution_contract(agent: Any) -> None:

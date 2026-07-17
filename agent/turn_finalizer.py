@@ -71,6 +71,10 @@ def _finalize_turn_impl(
                 )
                 is None
             )
+            if artifact_ready:
+                from agent.task_execution_contract import record_artifact_written
+
+                artifact_ready = record_artifact_written(task_contract)
         except (OSError, ValueError):
             artifact_ready = False
         if artifact_ready:

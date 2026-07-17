@@ -808,8 +808,8 @@ class TestSendDocument:
         assert len(call_kwargs["caption"]) == 1024
 
     @pytest.mark.asyncio
-    async def test_send_document_api_error_falls_back(self, connected_adapter, tmp_path):
-        """If Telegram API raises, falls back to base class text message."""
+    async def test_send_document_api_error_returns_failure_for_gateway_notice(self, connected_adapter, tmp_path):
+        """A dispatch exception stays failed so the gateway emits one safe notice."""
         test_file = tmp_path / "file.pdf"
         test_file.write_bytes(b"data")
 
@@ -817,8 +817,6 @@ class TestSendDocument:
             side_effect=RuntimeError("Telegram API error")
         )
 
-        # The base fallback calls self.send() which is also on _bot, so mock it
-        # to avoid cascading errors.
         connected_adapter.send = AsyncMock(
             return_value=SendResult(success=True, message_id="fallback")
         )
@@ -828,9 +826,9 @@ class TestSendDocument:
             file_path=str(test_file),
         )
 
-        # Should have fallen back to base class
-        assert result.success is True
-        assert result.message_id == "fallback"
+        assert result.success is False
+        assert result.error == "document_dispatch_exception"
+        connected_adapter.send.assert_not_awaited()
 
     @pytest.mark.asyncio
     async def test_send_document_reply_to(self, connected_adapter, tmp_path):

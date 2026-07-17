@@ -82,6 +82,39 @@ async def test_base_adapter_routes_telegram_flac_media_tag_to_document_sender(tm
 
 
 @pytest.mark.asyncio
+async def test_document_false_send_result_emits_safe_visible_failure(tmp_path, monkeypatch):
+    adapter = _MediaRoutingAdapter()
+    event = _event()
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.txt")
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="failure"))
+    adapter.send_document = AsyncMock(return_value=SendResult(success=False, error="rejected"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    assert adapter.send.await_count == 1
+    safe_failure = adapter.send.await_args.kwargs["content"]
+    assert "Couldn't deliver the requested attachment" in safe_failure
+    assert str(media_file) not in safe_failure
+
+
+@pytest.mark.asyncio
+async def test_document_exception_emits_safe_visible_failure(tmp_path, monkeypatch):
+    adapter = _MediaRoutingAdapter()
+    event = _event()
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.txt")
+    adapter._message_handler = AsyncMock(return_value=f"MEDIA:{media_file}")
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="failure"))
+    adapter.send_document = AsyncMock(side_effect=RuntimeError("provider timeout"))
+
+    await adapter._process_message_background(event, build_session_key(event.source))
+
+    safe_failure = adapter.send.await_args.kwargs["content"]
+    assert "Couldn't deliver the requested attachment" in safe_failure
+    assert str(media_file) not in safe_failure
+
+
+@pytest.mark.asyncio
 async def test_base_adapter_routes_non_voice_telegram_ogg_media_tag_to_document_sender(tmp_path, monkeypatch):
     adapter = _MediaRoutingAdapter()
     event = _event()

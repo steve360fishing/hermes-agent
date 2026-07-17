@@ -6213,30 +6213,42 @@ class TelegramAdapter(BasePlatformAdapter):
                 reply_to_mode=self._reply_to_mode
             )
 
-            with open(file_path, "rb") as f:
-                msg = await self._send_with_dm_topic_reply_anchor_retry(
-                    self._bot.send_document,
-                    {
-                        "chat_id": normalize_telegram_chat_id(chat_id),
-                        "document": f,
-                        "filename": display_name,
-                        "caption": caption[:1024] if caption else None,
-                        "reply_to_message_id": reply_to_id,
-                        **thread_kwargs,
-                        **self._notification_kwargs(metadata),
-                    },
-                    metadata,
-                    reply_to_id,
-                    "document",
-                    reset_media=lambda: f.seek(0),
-                )
+            open_flags = os.O_RDONLY
+            nofollow = getattr(os, "O_NOFOLLOW", 0)
+            if nofollow:
+                open_flags |= nofollow
+            fd = os.open(file_path, open_flags)
+            try:
+                if os.path.islink(file_path):
+                    return SendResult(success=False, error="document_path_symlink")
+                with os.fdopen(fd, "rb") as f:
+                    fd = None
+                    msg = await self._send_with_dm_topic_reply_anchor_retry(
+                        self._bot.send_document,
+                        {
+                            "chat_id": normalize_telegram_chat_id(chat_id),
+                            "document": f,
+                            "filename": display_name,
+                            "caption": caption[:1024] if caption else None,
+                            "reply_to_message_id": reply_to_id,
+                            **thread_kwargs,
+                            **self._notification_kwargs(metadata),
+                        },
+                        metadata,
+                        reply_to_id,
+                        "document",
+                        reset_media=lambda: f.seek(0),
+                    )
+            finally:
+                if fd is not None:
+                    os.close(fd)
             return SendResult(success=True, message_id=str(msg.message_id))
         except Exception as e:
             logger.warning(
                 "[%s] Failed to send document: %s",
                 self.name, _redact_telegram_error_text(e),
             )
-            return await super().send_document(chat_id, file_path, caption, file_name, reply_to, metadata=metadata)
+            return SendResult(success=False, error="document_dispatch_exception")
 
     async def send_video(
         self,

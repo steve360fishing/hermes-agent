@@ -8,8 +8,10 @@ for must still be returned.  Previously any of those raised straight out of
 traceback and lost the whole turn.
 """
 
-import pytest
 import os
+import json
+from pathlib import Path
+import pytest
 from unittest.mock import patch
 
 from agent.turn_finalizer import finalize_turn
@@ -290,6 +292,30 @@ def test_successful_artifact_write_forces_exact_media_delivery_response(
 
     assert result["final_response"] == f"MEDIA:{contract.artifact_output_path}"
     assert agent._task_execution_contract is None
+
+
+def test_successful_artifact_write_creates_non_secret_written_receipt(monkeypatch, tmp_path):
+    agent = _StubAgent(raise_in=())
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = build_task_execution_contract(
+        "Create and deliver example.txt containing the supplied copy.",
+        task_id="artifact-receipt",
+        platform="telegram",
+    )
+    Path(contract.artifact_output_path).write_bytes(b"exact bytes\n")
+    agent._task_execution_contract = contract
+    agent._tool_guardrails.set_execution_contract(contract)
+    agent._turn_file_mutation_paths = {contract.artifact_output_path}
+
+    _run(agent, final_response="done", api_call_count=1)
+
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "written"
+    assert receipt["bytes"] == len(b"exact bytes\n")
+    assert receipt["sha256"]
+    assert "content" not in receipt
+    assert "chat_id" not in receipt
 
 
 def test_artifact_contract_suppresses_background_skill_review():
