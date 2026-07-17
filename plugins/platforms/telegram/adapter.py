@@ -95,6 +95,17 @@ def _record_document_transport_attempt(file_path: str) -> None:
     )
 
 
+def _record_document_preflight_failure(file_path: str, error_code: str) -> None:
+    """Terminalize registered artifacts rejected before Telegram is called."""
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    record_artifact_dispatch(
+        file_path,
+        state="failed_preflight",
+        error_code=error_code,
+    )
+
+
 def _consume_abandoned_task(task: asyncio.Task) -> None:
     """Observe a detached task's terminal exception to avoid noisy loop logs."""
     try:
@@ -6254,6 +6265,7 @@ class TelegramAdapter(BasePlatformAdapter):
 
         try:
             if not os.path.exists(file_path):
+                _record_document_preflight_failure(file_path, "document_path_missing")
                 return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
 
             display_name = file_name or os.path.basename(file_path)
@@ -6293,6 +6305,7 @@ class TelegramAdapter(BasePlatformAdapter):
                     os.close(fd)
             return SendResult(success=True, message_id=str(msg.message_id))
         except _UnsafeDocumentPath as e:
+            _record_document_preflight_failure(file_path, str(e) or "document_path_changed")
             return SendResult(success=False, error=str(e) or "document_path_changed")
         except Exception as e:
             logger.warning(

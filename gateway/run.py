@@ -13232,30 +13232,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             async def _deliver_document(file_path: str) -> bool:
                 """Do not let a false document result erase a MEDIA-only reply."""
                 from agent.task_execution_contract import (
-                    ArtifactReceiptPersistenceError,
                     record_artifact_dispatch,
                     registered_artifact_correlation_id,
                 )
 
-                try:
-                    correlation_id = record_artifact_dispatch(file_path, state="dispatching")
-                except ArtifactReceiptPersistenceError:
-                    correlation_id = registered_artifact_correlation_id(file_path)
-                    try:
-                        notice_result = await adapter.send(
-                            chat_id=event.source.chat_id,
-                            content="⚠️ Couldn't deliver the requested attachment."
-                            + (f" Reference: {correlation_id}." if correlation_id else ""),
-                            metadata=_thread_meta,
-                        )
-                    except Exception:
-                        notice_result = None
-                    if not getattr(notice_result, "success", False):
-                        logger.error(
-                            "[%s] Artifact preflight and failure-notice delivery both failed",
-                            adapter.name,
-                        )
-                    return False
+                correlation_id = registered_artifact_correlation_id(file_path)
                 try:
                     result = await adapter.send_document(
                         chat_id=event.source.chat_id,

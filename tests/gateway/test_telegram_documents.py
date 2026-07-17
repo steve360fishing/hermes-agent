@@ -796,6 +796,9 @@ class TestSendDocument:
         assert result.success is False
         assert result.error == "document_path_changed"
         connected_adapter._bot.send_document.assert_not_awaited()
+        receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+        assert receipt["state"] == "failed_preflight"
+        assert receipt["attempt_count"] == 0
 
     @pytest.mark.asyncio
     async def test_send_document_rejects_same_inode_content_rewrite(
@@ -834,7 +837,6 @@ class TestSendDocument:
     ):
         from agent.task_execution_contract import (
             build_task_execution_contract,
-            record_artifact_dispatch,
             record_artifact_written,
         )
 
@@ -848,7 +850,6 @@ class TestSendDocument:
         artifact = Path(contract.artifact_output_path)
         artifact.write_bytes(b"trusted")
         assert record_artifact_written(contract) is True
-        assert record_artifact_dispatch(str(artifact), state="dispatching")
         connected_adapter._should_retry_without_dm_topic_reply_anchor = MagicMock(
             return_value=True
         )

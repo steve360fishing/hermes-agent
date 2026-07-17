@@ -36,12 +36,6 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
-def _artifact_dispatch_start(path: str) -> str | None:
-    from agent.task_execution_contract import record_artifact_dispatch
-
-    return record_artifact_dispatch(path, state="dispatching")
-
-
 def _artifact_dispatch_delivered(path: str, message_id) -> None:
     from agent.task_execution_contract import record_artifact_dispatch
 
@@ -5167,7 +5161,7 @@ class BasePlatformAdapter(ABC):
                                 metadata=_final_thread_metadata,
                             )
                         else:
-                            _artifact_correlation = _artifact_dispatch_start(media_path)
+                            _artifact_correlation = _artifact_correlation_for_path(media_path)
                             media_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,

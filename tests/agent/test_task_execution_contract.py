@@ -15,6 +15,7 @@ from agent.task_execution_contract import (
     build_task_execution_contract,
     validate_artifact_output_path,
 )
+import agent.conversation_loop as conversation_loop
 from agent.conversation_loop import _effective_request_system_prompt
 from agent.tool_guardrails import ToolCallGuardrailController
 
@@ -516,6 +517,39 @@ def test_written_artifact_backlog_enforces_byte_cap(monkeypatch, tmp_path):
     assert sum(receipt["bytes"] for receipt in pending) <= 10
 
 
+def test_dispatching_artifact_backlog_enforces_count_and_byte_caps(monkeypatch, tmp_path):
+    import agent.task_execution_contract as contract_module
+    from agent.task_execution_contract import record_artifact_dispatch, record_artifact_written
+
+    artifact_base = tmp_path / "artifacts"
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(artifact_base))
+    monkeypatch.setattr(contract_module, "MAX_PENDING_ARTIFACTS", 2)
+    monkeypatch.setattr(contract_module, "MAX_PENDING_ARTIFACT_BYTES", 10)
+    contracts = []
+    for index in range(3):
+        contract = _contract(
+            f"Give me dispatch-{index}.txt as a file.",
+            task_id=f"dispatch-cap-{index}",
+        )
+        Path(contract.artifact_output_path).write_bytes(b"12345678")
+        assert record_artifact_written(contract) is True
+        assert record_artifact_dispatch(contract.artifact_output_path, state="dispatching")
+        contracts.append(contract)
+        contract_module._reconcile_artifact_store(str(artifact_base))
+
+    receipts = [
+        json.loads(path.read_text(encoding="utf-8"))
+        for path in (artifact_base / ".receipts").glob("*.json")
+    ]
+    pending = [item for item in receipts if item["state"] in {"written", "dispatching"}]
+    assert len(pending) <= 2
+    assert sum(int(item["bytes"]) for item in pending) <= 10
+    oldest = json.loads(Path(contracts[0].artifact_receipt_path).read_text(encoding="utf-8"))
+    assert oldest["state"] == "ambiguous"
+    assert oldest["error_code"] == "artifact_dispatch_abandoned"
+
+
 def test_startup_reconciliation_expires_durable_orphan(monkeypatch, tmp_path):
     import agent.task_execution_contract as contract_module
     from agent.task_execution_contract import _ARTIFACT_RECEIPTS, record_artifact_written
@@ -555,6 +589,46 @@ def test_file_artifact_mode_rejects_missing_platform(monkeypatch, tmp_path):
     assert contract.lane == NORMAL
     assert contract.preflight_error == "artifact_delivery_unavailable"
     assert contract.artifact_output_path == ""
+
+
+def test_conversation_contract_prepares_txt_artifact_only_for_telegram(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    captured = {}
+
+    def stop_after_turn_preparation(*args, **kwargs):
+        contract = kwargs["task_execution_contract"]
+        captured["contract"] = contract
+        assert contract.lane == ARTIFACT_ONLY
+        assert contract.artifact_extension == ".txt"
+        assert contract.artifact_output_path.endswith("report.txt")
+        raise RuntimeError("turn-preparation-complete")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", stop_after_turn_preparation)
+    telegram_agent = SimpleNamespace(platform="telegram", _task_execution_contract=None)
+
+    with pytest.raises(RuntimeError, match="turn-preparation-complete"):
+        conversation_loop.run_conversation(
+            telegram_agent,
+            "Create and deliver report.txt containing safe text.",
+            task_id="telegram-conversation-artifact",
+        )
+
+    assert captured["contract"].artifact_route != "none"
+
+    other_agent = SimpleNamespace(
+        platform="discord",
+        _task_execution_contract=None,
+        model="test-model",
+        provider="test-provider",
+    )
+    result = conversation_loop.run_conversation(
+        other_agent,
+        "Create and deliver report.txt containing safe text.",
+        task_id="discord-conversation-artifact",
+    )
+    assert result["turn_exit_reason"] == "artifact_output_preflight_failed"
+    assert result["task_execution"]["decision_reason"] == "artifact_delivery_unavailable"
 
 
 def test_allocator_rejects_symlinked_artifact_root_even_inside_safe_root(

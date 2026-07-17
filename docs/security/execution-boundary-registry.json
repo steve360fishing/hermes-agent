@@ -251,13 +251,13 @@
       "rationale": "Clears request-local policy while preserving stale durable state on persistence failure."
     },
     {
-      "id": "gateway/platforms/base.py:_artifact_dispatch_start",
+      "id": "plugins/platforms/telegram/adapter.py:_record_document_preflight_failure",
       "contract": "artifact_delivery",
-      "role": "delivery",
-      "path": "gateway/platforms/base.py",
-      "symbol": "_artifact_dispatch_start",
+      "role": "validation",
+      "path": "plugins/platforms/telegram/adapter.py",
+      "symbol": "_record_document_preflight_failure",
       "disposition": "covered",
-      "rationale": "Non-streaming gateway dispatch transition boundary."
+      "rationale": "Terminalizes descriptor validation failures before any Telegram provider attempt."
     },
     {
       "id": "gateway/platforms/base.py:_artifact_dispatch_delivered",

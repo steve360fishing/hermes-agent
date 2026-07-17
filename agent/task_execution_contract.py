@@ -1230,12 +1230,15 @@ def _reconcile_artifact_store(artifact_base: str) -> None:
             terminal_state = "ambiguous" if receipt.get("state") == "dispatching" else "failed_preflight"
             selected[artifact_id] = (receipt, receipt_path, terminal_state)
 
-    pending = [item for item in records if item[1] not in selected and item[2].get("state") == "written"]
+    pending = [item for item in records if item[1] not in selected]
     pending_bytes = sum(max(0, int(item[2].get("bytes", 0) or 0)) for item in pending)
     while len(pending) > MAX_PENDING_ARTIFACTS or pending_bytes > MAX_PENDING_ARTIFACT_BYTES:
         _modified, artifact_id, receipt, receipt_path = pending.pop(0)
         pending_bytes -= max(0, int(receipt.get("bytes", 0) or 0))
-        selected[artifact_id] = (receipt, receipt_path, "failed_preflight")
+        terminal_state = (
+            "ambiguous" if receipt.get("state") == "dispatching" else "failed_preflight"
+        )
+        selected[artifact_id] = (receipt, receipt_path, terminal_state)
 
     cleanup: list[TaskExecutionContract] = []
     with _ARTIFACT_RECEIPT_LOCK:
