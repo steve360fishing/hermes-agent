@@ -129,7 +129,7 @@ def _load_managed_config(*, strict: bool) -> dict:
     parsed = _cached_read(
         managed_dir / "config.yaml",
         _CONFIG_CACHE,
-        lambda f: yaml.safe_load(f) or {},
+        yaml.safe_load,
         strict=strict,
     )
     if isinstance(parsed, dict):

@@ -90,3 +90,20 @@ def test_strict_overlay_raises_when_overlay_application_fails(managed, monkeypat
     monkeypatch.setattr(config_module, "_deep_merge", fail_merge)
     with pytest.raises(managed_scope.ManagedScopeError, match="failed to apply"):
         managed_scope.apply_managed_overlay_strict({"model": {"default": "user/model"}})
+
+
+@pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n", "null\n"])
+def test_strict_overlay_rejects_every_non_mapping_yaml_root(managed, body):
+    from hermes_cli import managed_scope
+
+    _write(managed, body)
+    with pytest.raises(managed_scope.ManagedScopeError, match="root must be an object"):
+        managed_scope.apply_managed_overlay_strict({"model": {"default": "user/model"}})
+
+
+def test_strict_overlay_accepts_empty_mapping(managed):
+    from hermes_cli import managed_scope
+
+    source = {"model": {"default": "user/model"}}
+    _write(managed, "{}\n")
+    assert managed_scope.apply_managed_overlay_strict(source) == source

@@ -1342,6 +1342,75 @@ class TestRunJobSessionPersistence:
         discover_mcp.assert_not_called()
         mock_agent_cls.assert_not_called()
 
+    @pytest.mark.parametrize("body", ["[]\n", "false\n", "0\n", "null\n"])
+    def test_non_mapping_managed_root_stops_before_provider_mcp_or_agent(
+        self, tmp_path, monkeypatch, body,
+    ):
+        job = {
+            "id": "managed-overlay-non-mapping",
+            "name": "managed overlay non-mapping",
+            "prompt": "hello",
+            "model": "test/model",
+        }
+        managed_dir = tmp_path / "managed"
+        managed_dir.mkdir()
+        (managed_dir / "config.yaml").write_text(body, encoding="utf-8")
+        monkeypatch.setenv("HERMES_MANAGED_DIR", str(managed_dir))
+
+        from hermes_cli import managed_scope
+
+        managed_scope.invalidate_managed_cache()
+        provider = MagicMock()
+        discover_mcp = MagicMock()
+        extra = (
+            patch("hermes_cli.runtime_provider.resolve_runtime_provider", new=provider),
+            patch("tools.mcp_tool.discover_mcp_tools", new=discover_mcp),
+        )
+
+        with self._run_job_patches(tmp_path, extra=extra) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is False
+        assert "config.yaml could not be loaded" in (error or "")
+        provider.assert_not_called()
+        discover_mcp.assert_not_called()
+        mock_agent_cls.assert_not_called()
+
+    def test_empty_cron_authority_stays_toolless_with_inherited_kanban_task(
+        self, tmp_path, monkeypatch,
+    ):
+        (tmp_path / "config.yaml").write_text(
+            "platform_toolsets:\n  cron: web\n",
+            encoding="utf-8",
+        )
+        monkeypatch.setenv("HERMES_KANBAN_TASK", "inherited-parent-task")
+        job = {
+            "id": "fail-closed-kanban",
+            "name": "fail closed kanban",
+            "prompt": "hello",
+            "model": "test/model",
+        }
+
+        with self._run_job_patches(tmp_path) as (_fake_db, mock_agent_cls):
+            success, _output, _final_response, error = run_job(job)
+
+        assert success is True, error
+        kwargs = mock_agent_cls.call_args.kwargs
+        assert kwargs["enabled_toolsets"] == ()
+
+        from model_tools import _clear_tool_defs_cache, get_tool_definitions
+
+        _clear_tool_defs_cache()
+        try:
+            tools = get_tool_definitions(
+                enabled_toolsets=kwargs["enabled_toolsets"],
+                disabled_toolsets=kwargs["disabled_toolsets"],
+                quiet_mode=True,
+            )
+        finally:
+            _clear_tool_defs_cache()
+        assert tools == []
+
     def test_run_job_disabled_toolsets_layer_user_config_on_baseline(self, tmp_path):
         """agent.disabled_toolsets must be honoured in cron — issue #25752.
 
