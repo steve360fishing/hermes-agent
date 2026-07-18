@@ -135,6 +135,31 @@ if [ -L /run/hermes-rescue-reporter ] || \
 fi
 install -d -o hermes-rescue -g hermes -m 0750 /run/hermes-rescue-reporter
 
+# Durable reporter identity, aggregate continuity, and opt-in marker. Once a
+# rescue key has configured telemetry, the marker remains across reporter and
+# /run restarts so Hermes cannot silently fall back to unaccounted execution.
+RESCUE_CONTINUITY_DIR=/var/lib/hermes-rescue
+RESCUE_REQUIRED_MARKER="$RESCUE_CONTINUITY_DIR/telemetry-required-v1.json"
+install -d -o hermes-rescue -g hermes -m 0750 "$RESCUE_CONTINUITY_DIR"
+if [ -L "$RESCUE_REQUIRED_MARKER" ] || \
+        { [ -e "$RESCUE_REQUIRED_MARKER" ] && [ ! -f "$RESCUE_REQUIRED_MARKER" ]; }; then
+    echo "[stage2] Fatal: rescue telemetry marker is not a regular file" >&2
+    exit 1
+fi
+if [ -f /run/hermes-rescue-secrets/hmac-current ] && \
+        [ ! -e "$RESCUE_REQUIRED_MARKER" ]; then
+    marker_tmp="$(mktemp "$RESCUE_CONTINUITY_DIR/.telemetry-required.XXXXXX")"
+    printf '%s' '{"required":true,"schema_version":"hermes-rescue-telemetry-required-v1"}' \
+        > "$marker_tmp"
+    chown hermes-rescue:hermes "$marker_tmp"
+    chmod 0440 "$marker_tmp"
+    mv "$marker_tmp" "$RESCUE_REQUIRED_MARKER"
+fi
+if [ -e "$RESCUE_REQUIRED_MARKER" ]; then
+    chown hermes-rescue:hermes "$RESCUE_REQUIRED_MARKER"
+    chmod 0440 "$RESCUE_REQUIRED_MARKER"
+fi
+
 # --- Docker socket group membership (docker-in-docker / DooD) ---
 # When the user bind-mounts the host Docker daemon socket
 # (`-v /var/run/docker.sock:/var/run/docker.sock`) to use the `docker`

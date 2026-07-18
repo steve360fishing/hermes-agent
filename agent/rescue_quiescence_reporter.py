@@ -24,6 +24,7 @@ from agent.rescue_plane_core import (
     atomic_write_secure,
     _secure_read,
     read_hmac_key,
+    recover_snapshot_sequence,
     sign_quiescence_snapshot,
 )
 
@@ -32,6 +33,7 @@ _EVENT_BASE = frozenset({"schema_version", "event", "event_id", "turn_id"})
 _EVENT_WORK = _EVENT_BASE | {"work_id"}
 _EVENT_TURN_START = _EVENT_BASE | {"lane", "artifact_requested"}
 _POLICY_RETENTION_SECONDS = 120.0
+_CONTINUITY_INITIALIZED = b"hermes-rescue-continuity-initialized-v1"
 
 
 class ReporterCapacityExhausted(ValueError):
@@ -429,6 +431,7 @@ class QuiescenceReporter:
         self,
         *,
         runtime_dir: Path,
+        continuity_dir: Path,
         keyring: KeyRing,
         source_sha: str,
         image_id: str,
@@ -436,10 +439,15 @@ class QuiescenceReporter:
         max_turns: int = 256,
     ) -> None:
         self.runtime_dir = runtime_dir
+        self.continuity_dir = continuity_dir
         self.socket_path = runtime_dir / "events.sock"
-        self.state_path = runtime_dir / "reporter-state-v1.json"
         self.output_path = runtime_dir / "quiescence-v1.json"
-        self.producer_state_path = runtime_dir / "producer-state-v1.json"
+        self.continuity_state_path = continuity_dir / "continuity-state-v1.json"
+        self.continuity_initialized_path = (
+            continuity_dir / "continuity-initialized-v1"
+        )
+        self.state_path = self.continuity_state_path
+        self.producer_state_path = self.continuity_state_path
         self.keyring = keyring
         self.source_sha = source_sha
         self.image_id = image_id
@@ -453,44 +461,53 @@ class QuiescenceReporter:
         ):
             raise PermissionError("insecure reporter runtime directory")
         self.runtime_gid = runtime_info.st_gid
-        self.producer_epoch, self.sequence = self._load_or_create_producer_state()
+        continuity_info = continuity_dir.lstat()
+        if (
+            continuity_dir.is_symlink()
+            or not stat.S_ISDIR(continuity_info.st_mode)
+            or continuity_info.st_uid != os.getuid()
+            or continuity_info.st_gid != self.runtime_gid
+            or stat.S_IMODE(continuity_info.st_mode) != 0o750
+        ):
+            raise PermissionError("insecure reporter continuity directory")
+        self.continuity_gid = continuity_info.st_gid
+        self.count_floor = {
+            "turn": 0,
+            "tool": 0,
+            "provider": 0,
+        }
+        self.policy_evidence_floor: list[dict[str, Any]] = []
+        self.state = ReporterState(max_turns=max_turns)
+        self.producer_epoch = ""
+        self.sequence = 0
+        self._load_or_create_continuity()
+        self._lock = threading.RLock()
+
+    def _load_or_create_continuity(self) -> None:
         try:
-            persisted = _secure_read(
-                self.state_path,
+            raw = _secure_read(
+                self.continuity_state_path,
                 expected_uid=os.getuid(),
-                expected_gid=self.runtime_gid,
+                expected_gid=self.continuity_gid,
                 file_mode=0o600,
                 parent_mode=0o750,
                 max_bytes=2_000_000,
             )
         except FileNotFoundError:
-            self.state = ReporterState(max_turns=max_turns)
-        else:
-            self.state = ReporterState.from_payload(_strict_json_object(persisted))
-        self._lock = threading.RLock()
-
-    def _load_or_create_producer_state(self) -> tuple[str, int]:
-        try:
-            raw = _secure_read(
-                self.producer_state_path,
-                expected_uid=os.getuid(),
-                expected_gid=self.runtime_gid,
-                file_mode=0o600,
-                parent_mode=0o750,
-                max_bytes=1024,
-            )
-        except FileNotFoundError:
-            if self.output_path.exists():
-                raise ValueError("producer state missing beside existing snapshot")
-            epoch = secrets.token_hex(16)
-            self.producer_epoch = epoch
-            self.sequence = 0
-            self._persist_producer_state()
-            return epoch, 0
+            self._recover_or_initialize_continuity()
+            return
         payload = _strict_json_object(raw)
         if (
-            set(payload) != {"schema_version", "producer_epoch", "sequence"}
-            or payload["schema_version"] != "hermes-rescue-producer-state-v1"
+            set(payload)
+            != {
+                "schema_version",
+                "producer_epoch",
+                "sequence",
+                "aggregate",
+                "active_count_floor",
+                "policy_evidence_floor",
+            }
+            or payload["schema_version"] != "hermes-rescue-continuity-state-v1"
             or type(payload["producer_epoch"]) is not str
             or not __import__("re").fullmatch(
                 r"[0-9a-f]{32}", payload["producer_epoch"]
@@ -498,17 +515,132 @@ class QuiescenceReporter:
             or type(payload["sequence"]) is not int
             or not 0 <= payload["sequence"] <= (2**63 - 1)
         ):
-            raise ValueError("corrupt producer state")
-        return str(payload["producer_epoch"]), int(payload["sequence"])
+            raise ValueError("corrupt continuity state")
+        floor = payload["active_count_floor"]
+        if (
+            type(floor) is not dict
+            or set(floor) != {"turn", "tool", "provider"}
+            or any(type(value) is not int or not 0 <= value <= 100_000 for value in floor.values())
+            or type(payload["policy_evidence_floor"]) is not list
+            or len(payload["policy_evidence_floor"]) > 256
+        ):
+            raise ValueError("corrupt continuity state")
+        self.state = ReporterState.from_payload(payload["aggregate"])
+        self.producer_epoch = str(payload["producer_epoch"])
+        self.sequence = int(payload["sequence"])
+        self.count_floor = dict(floor)
+        self.policy_evidence_floor = [
+            dict(item) for item in payload["policy_evidence_floor"]
+        ]
+        self._validate_policy_evidence_floor()
+        self._persist_initialized_marker()
 
-    def _persist_producer_state(self) -> None:
+    def _recover_or_initialize_continuity(self) -> None:
+        initialized = self._continuity_was_initialized()
+        try:
+            raw = _secure_read(
+                self.output_path,
+                expected_uid=os.getuid(),
+                expected_gid=self.runtime_gid,
+                file_mode=0o600,
+                parent_mode=0o750,
+                max_bytes=2_000_000,
+            )
+        except FileNotFoundError:
+            if initialized:
+                raise ValueError("continuity state missing after initialization")
+            self.producer_epoch = secrets.token_hex(16)
+            self.sequence = 0
+            self._persist_continuity_state()
+            self._persist_initialized_marker()
+            return
+        snapshot = _strict_json_object(raw)
+        sequence = recover_snapshot_sequence(
+            self.output_path,
+            keyring=self.keyring,
+            expected_uid=os.getuid(),
+            expected_gid=self.runtime_gid,
+        )
+        self.producer_epoch = str(snapshot["producer_epoch"])
+        self.sequence = sequence
+        self.state.telemetry_health = "degraded"
+        self.count_floor = {
+            "turn": int(snapshot["active_turn_count"]),
+            "tool": int(snapshot["active_tool_count"]),
+            "provider": int(snapshot["active_provider_action_count"]),
+        }
+        self.policy_evidence_floor = [
+            dict(item) for item in snapshot["policy_evidence"]
+        ]
+        self._validate_policy_evidence_floor()
+        self._persist_continuity_state()
+        self._persist_initialized_marker()
+
+    def _continuity_was_initialized(self) -> bool:
+        try:
+            raw = _secure_read(
+                self.continuity_initialized_path,
+                expected_uid=os.getuid(),
+                expected_gid=self.continuity_gid,
+                file_mode=0o400,
+                parent_mode=0o750,
+                max_bytes=128,
+            )
+        except FileNotFoundError:
+            return False
+        if raw != _CONTINUITY_INITIALIZED:
+            raise ValueError("corrupt continuity initialization marker")
+        return True
+
+    def _persist_initialized_marker(self) -> None:
+        if self._continuity_was_initialized():
+            return
         atomic_write_secure(
-            self.producer_state_path,
+            self.continuity_initialized_path,
+            _CONTINUITY_INITIALIZED,
+            mode=0o400,
+            expected_parent_uid=os.getuid(),
+            expected_parent_gid=self.continuity_gid,
+        )
+
+    def _validate_policy_evidence_floor(self) -> None:
+        for item in self.policy_evidence_floor:
+            if (
+                type(item) is not dict
+                or set(item)
+                != {
+                    "turn_id",
+                    "lane",
+                    "artifact_requested",
+                    "started_at",
+                    "completed_at",
+                }
+                or not _bounded_text(item["turn_id"])
+                or item["lane"] not in {"normal", "artifact_only"}
+                or type(item["artifact_requested"]) is not bool
+                or type(item["started_at"]) not in {int, float}
+                or not math.isfinite(float(item["started_at"]))
+                or (
+                    item["completed_at"] is not None
+                    and (
+                        type(item["completed_at"]) not in {int, float}
+                        or not math.isfinite(float(item["completed_at"]))
+                    )
+                )
+            ):
+                raise ValueError("corrupt continuity policy evidence")
+
+    def _persist_continuity_state(self) -> None:
+        atomic_write_secure(
+            self.continuity_state_path,
             json.dumps(
                 {
-                    "schema_version": "hermes-rescue-producer-state-v1",
+                    "schema_version": "hermes-rescue-continuity-state-v1",
                     "producer_epoch": self.producer_epoch,
                     "sequence": self.sequence,
+                    "aggregate": self.state.to_payload(),
+                    "active_count_floor": self.count_floor,
+                    "policy_evidence_floor": self.policy_evidence_floor,
                 },
                 sort_keys=True,
                 separators=(",", ":"),
@@ -516,8 +648,11 @@ class QuiescenceReporter:
             ).encode("ascii"),
             mode=0o600,
             expected_parent_uid=os.getuid(),
-            expected_parent_gid=self.runtime_gid,
+            expected_parent_gid=self.continuity_gid,
         )
+
+    def _persist_producer_state(self) -> None:
+        self._persist_continuity_state()
 
     def _invalidate_snapshot(self) -> None:
         if os.name != "posix":
@@ -553,18 +688,7 @@ class QuiescenceReporter:
             os.close(parent_fd)
 
     def _persist_state(self) -> None:
-        atomic_write_secure(
-            self.state_path,
-            json.dumps(
-                self.state.to_payload(),
-                sort_keys=True,
-                separators=(",", ":"),
-                allow_nan=False,
-            ).encode("ascii"),
-            mode=0o600,
-            expected_parent_uid=os.getuid(),
-            expected_parent_gid=self.runtime_gid,
-        )
+        self._persist_continuity_state()
 
     def process_event(
         self,
@@ -629,6 +753,16 @@ class QuiescenceReporter:
             self.sequence += 1
             self._persist_producer_state()
             active_turns, active_tools, active_providers = self.state.active_counts()
+            active_turns = max(active_turns, self.count_floor["turn"])
+            active_tools = max(active_tools, self.count_floor["tool"])
+            active_providers = max(active_providers, self.count_floor["provider"])
+            policy_evidence = list(self.policy_evidence_floor)
+            retained_turn_ids = {item["turn_id"] for item in policy_evidence}
+            policy_evidence.extend(
+                item
+                for item in self.state.policy_evidence()
+                if item["turn_id"] not in retained_turn_ids
+            )
             unsigned = {
                 "schema_version": QUIESCENCE_SCHEMA_VERSION,
                 "producer_epoch": self.producer_epoch,
@@ -642,7 +776,7 @@ class QuiescenceReporter:
                 "source_sha": self.source_sha,
                 "image_id": self.image_id,
                 "telemetry_health": self.state.telemetry_health,
-                "policy_evidence": self.state.policy_evidence(),
+                "policy_evidence": policy_evidence,
             }
             snapshot = sign_quiescence_snapshot(unsigned, self.keyring, now=current)
             atomic_write_secure(
@@ -748,6 +882,9 @@ def main() -> int:
         "--runtime-dir", type=Path, default=Path("/run/hermes-rescue-reporter")
     )
     parser.add_argument(
+        "--continuity-dir", type=Path, default=Path("/var/lib/hermes-rescue")
+    )
+    parser.add_argument(
         "--current-key",
         type=Path,
         default=Path("/run/hermes-rescue-secrets/hmac-current"),
@@ -797,6 +934,15 @@ def main() -> int:
     ):
         raise PermissionError("insecure reporter runtime directory")
     runtime_gid = runtime_info.st_gid
+    continuity_info = args.continuity_dir.lstat()
+    if (
+        args.continuity_dir.is_symlink()
+        or not stat.S_ISDIR(continuity_info.st_mode)
+        or continuity_info.st_uid != reporter_uid
+        or continuity_info.st_gid != runtime_gid
+        or stat.S_IMODE(continuity_info.st_mode) != 0o750
+    ):
+        raise PermissionError("insecure reporter continuity directory")
     current = KeySlot(
         _read_identity(
             args.current_key_id_file,
@@ -843,6 +989,7 @@ def main() -> int:
     )
     QuiescenceReporter(
         runtime_dir=args.runtime_dir,
+        continuity_dir=args.continuity_dir,
         keyring=keyring,
         source_sha=source_sha,
         image_id=image_id,

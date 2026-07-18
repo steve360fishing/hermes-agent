@@ -24,6 +24,14 @@ from typing import Any, Iterator, Mapping
 
 SAFE_MODE_OVERLAY_PATH = Path("/var/run/hermes-rescue/safe-mode-v1.json")
 RESCUE_EVENT_SOCKET_PATH = Path("/run/hermes-rescue-reporter/events.sock")
+RESCUE_TELEMETRY_REQUIRED_PATH = Path(
+    "/var/lib/hermes-rescue/telemetry-required-v1.json"
+)
+RESCUE_REPORTER_UID = 10001
+TELEMETRY_REQUIRED_MARKER = (
+    b'{"required":true,"schema_version":'
+    b'"hermes-rescue-telemetry-required-v1"}'
+)
 QUIESCENCE_SCHEMA_VERSION = "hermes-quiescence-snapshot-v1"
 EVENT_SCHEMA_VERSION = "hermes-rescue-event-v1"
 SAFE_MODE_SCHEMA_VERSION = "hermes-safe-mode-v1"
@@ -929,13 +937,50 @@ class RescueTelemetryClient:
             )
 
 
+def _rescue_telemetry_is_required() -> bool:
+    try:
+        parent_info = RESCUE_TELEMETRY_REQUIRED_PATH.parent.lstat()
+        marker_info = RESCUE_TELEMETRY_REQUIRED_PATH.lstat()
+    except FileNotFoundError:
+        return False
+    except OSError as exc:
+        raise RescueTelemetryUnavailable("rescue telemetry marker unavailable") from exc
+    if (
+        RESCUE_TELEMETRY_REQUIRED_PATH.parent.is_symlink()
+        or not stat.S_ISDIR(parent_info.st_mode)
+        or parent_info.st_uid != RESCUE_REPORTER_UID
+        or parent_info.st_gid not in os.getgroups()
+        or stat.S_IMODE(parent_info.st_mode) != 0o750
+        or RESCUE_TELEMETRY_REQUIRED_PATH.is_symlink()
+        or not stat.S_ISREG(marker_info.st_mode)
+    ):
+        raise RescueTelemetryUnavailable("insecure rescue telemetry marker")
+    try:
+        raw = _secure_read(
+            RESCUE_TELEMETRY_REQUIRED_PATH,
+            expected_uid=RESCUE_REPORTER_UID,
+            expected_gid=parent_info.st_gid,
+            file_mode=0o440,
+            parent_mode=0o750,
+            max_bytes=256,
+        )
+    except (OSError, PermissionError) as exc:
+        raise RescueTelemetryUnavailable("insecure rescue telemetry marker") from exc
+    if raw != TELEMETRY_REQUIRED_MARKER:
+        raise RescueTelemetryUnavailable("invalid rescue telemetry marker")
+    return True
+
+
 def get_rescue_telemetry_client() -> RescueTelemetryClient | None:
-    """Telemetry is opt-in by a Linux Unix socket; Windows and absence are inert."""
+    """Return configured telemetry or fail closed across a required restart gap."""
     if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
         return None
+    required = _rescue_telemetry_is_required()
     try:
         info = RESCUE_EVENT_SOCKET_PATH.lstat()
     except OSError:
+        if required:
+            raise RescueTelemetryUnavailable("required rescue telemetry unavailable")
         return None
     if (
         not stat.S_ISSOCK(info.st_mode)
@@ -943,5 +988,7 @@ def get_rescue_telemetry_client() -> RescueTelemetryClient | None:
         or info.st_uid == os.getuid()
         or info.st_gid not in os.getgroups()
     ):
+        if required:
+            raise RescueTelemetryUnavailable("required rescue telemetry socket is insecure")
         return None
     return RescueTelemetryClient(RESCUE_EVENT_SOCKET_PATH)

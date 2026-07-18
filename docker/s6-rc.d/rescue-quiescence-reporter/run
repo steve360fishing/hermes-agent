@@ -12,6 +12,7 @@ key=/run/hermes-rescue-secrets/hmac-current
 exec s6-setuidgid hermes-rescue \
     /opt/hermes/.venv/bin/python -m agent.rescue_quiescence_reporter serve \
     --runtime-dir /run/hermes-rescue-reporter \
+    --continuity-dir /var/lib/hermes-rescue \
     --current-key "$key" \
     --expected-reporter-uid "$(id -u hermes-rescue)" \
     --expected-hermes-uid "$(id -u hermes)"

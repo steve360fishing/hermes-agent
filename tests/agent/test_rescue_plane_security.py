@@ -48,6 +48,31 @@ def _reporter(runtime_dir: Path, *, max_turns: int = 8):
     runtime_dir.chmod(0o750)
     return QuiescenceReporter(
         runtime_dir=runtime_dir,
+        continuity_dir=runtime_dir,
+        keyring=KeyRing(current=KeySlot("current", b"q" * 32)),
+        source_sha="a" * 40,
+        image_id="sha256:" + "b" * 64,
+        expected_hermes_uid=os.getuid(),
+        max_turns=max_turns,
+    )
+
+
+def _durable_reporter(
+    runtime_dir: Path,
+    continuity_dir: Path,
+    *,
+    max_turns: int = 8,
+):
+    from agent.rescue_plane_core import KeyRing, KeySlot
+    from agent.rescue_quiescence_reporter import QuiescenceReporter
+
+    runtime_dir.mkdir(mode=0o750, exist_ok=True)
+    runtime_dir.chmod(0o750)
+    continuity_dir.mkdir(mode=0o750, exist_ok=True)
+    continuity_dir.chmod(0o750)
+    return QuiescenceReporter(
+        runtime_dir=runtime_dir,
+        continuity_dir=continuity_dir,
         keyring=KeyRing(current=KeySlot("current", b"q" * 32)),
         source_sha="a" * 40,
         image_id="sha256:" + "b" * 64,
@@ -185,20 +210,97 @@ def test_reporter_outputs_keep_runtime_gid_for_three_emissions_and_s6_style_rest
 
 
 @linux_only
-def test_reporter_does_not_regenerate_missing_or_corrupt_producer_state(
+def test_reporter_recovers_missing_signed_continuity_but_rejects_corruption(
     tmp_path: Path,
 ) -> None:
     reporter = _reporter(tmp_path)
-    reporter.emit_snapshot(now=10.0)
+    before = reporter.emit_snapshot(now=10.0)
     reporter.producer_state_path.unlink()
-    with pytest.raises(ValueError, match="producer state missing"):
+    recovered = _reporter(tmp_path)
+    after = recovered.emit_snapshot(now=11.0)
+    assert after["producer_epoch"] == before["producer_epoch"]
+    assert after["sequence"] == before["sequence"] + 1
+    assert after["telemetry_health"] == "degraded"
+
+    recovered.continuity_state_path.write_text("{}", encoding="ascii")
+    recovered.continuity_state_path.chmod(0o600)
+    with pytest.raises(ValueError, match="corrupt continuity state"):
         _reporter(tmp_path)
 
-    reporter.output_path.unlink()
-    reporter.producer_state_path.write_text("{}", encoding="ascii")
-    reporter.producer_state_path.chmod(0o600)
-    with pytest.raises(ValueError, match="corrupt producer state"):
-        _reporter(tmp_path)
+
+@linux_only
+def test_partial_aggregate_loss_with_live_provider_recovers_sticky_degraded(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.process_event(
+        json.dumps(
+            {
+                "schema_version": "hermes-rescue-event-v1",
+                "event": "provider_start",
+                "event_id": "provider-start",
+                "turn_id": "turn-live",
+                "work_id": "provider-live",
+            }
+        ).encode("ascii"),
+        peer_pid=os.getpid(),
+        peer_uid=os.getuid(),
+        now=10.0,
+    )
+    live = reporter.emit_snapshot(now=11.0)
+    reporter.continuity_state_path.unlink()
+
+    restarted = _durable_reporter(runtime, continuity)
+    recovered = restarted.emit_snapshot(now=12.0)
+
+    assert recovered["producer_epoch"] == live["producer_epoch"]
+    assert recovered["sequence"] == live["sequence"] + 1
+    assert recovered["active_provider_action_count"] >= 1
+    assert recovered["telemetry_health"] == "degraded"
+    restarted_again = _durable_reporter(runtime, continuity)
+    sticky = restarted_again.emit_snapshot(now=13.0)
+    assert sticky["producer_epoch"] == live["producer_epoch"]
+    assert sticky["sequence"] == recovered["sequence"] + 1
+    assert sticky["active_provider_action_count"] >= 1
+    assert sticky["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_full_runtime_loss_preserves_epoch_sequence_and_host_replay(
+    tmp_path: Path,
+) -> None:
+    import shutil
+
+    from agent.rescue_plane_core import validate_quiescence_snapshot
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    before = reporter.emit_snapshot(now=10.0)
+    replay = _replay_state(tmp_path / "host-replay.json")
+    assert validate_quiescence_snapshot(
+        before,
+        keyring=reporter.keyring,
+        now=10.1,
+        replay_state=replay,
+    ).valid
+
+    shutil.rmtree(runtime)
+    runtime.mkdir(mode=0o750)
+    runtime.chmod(0o750)
+    restarted = _durable_reporter(runtime, continuity)
+    after = restarted.emit_snapshot(now=11.0)
+
+    assert after["producer_epoch"] == before["producer_epoch"]
+    assert after["sequence"] == before["sequence"] + 1
+    assert validate_quiescence_snapshot(
+        after,
+        keyring=reporter.keyring,
+        now=11.1,
+        replay_state=replay,
+    ).valid
 
 
 @linux_only
@@ -939,6 +1041,7 @@ def test_kernel_peer_events_aggregate_across_processes_and_crash_degrades(tmp_pa
     tmp_path.chmod(0o750)
     reporter = QuiescenceReporter(
         runtime_dir=tmp_path,
+        continuity_dir=tmp_path,
         keyring=KeyRing(current=KeySlot("current", b"q" * 32)),
         source_sha="a" * 40,
         image_id="sha256:" + "b" * 64,
@@ -1019,10 +1122,14 @@ def test_s6_service_is_executable_drops_uid_and_has_no_failure_mask() -> None:
     assert "gateway run" not in text
     assert "/var/run/hermes-rescue" not in text
     assert "--runtime-dir /run/hermes-rescue-reporter" in text
+    assert "--continuity-dir /var/lib/hermes-rescue" in text
     assert "key=/run/hermes-rescue-secrets/hmac-current" in text
     assert "chmod 0755 /etc/s6-overlay/s6-rc.d/rescue-quiescence-reporter/run" in dockerfile
     assert "requested Hermes GID collides with hermes-rescue" in stage2
     assert '[ -L /run/hermes-rescue-reporter ]' in stage2
+    assert "telemetry-required-v1.json" in stage2
+    assert "hermes-rescue-telemetry-required-v1" in stage2
+    assert "install -d -o hermes-rescue -g hermes -m 0750" in stage2
     assert "/var/run/hermes-rescue" not in stage2
 
 
@@ -1097,3 +1204,45 @@ def test_telemetry_is_dormant_without_linux_socket(monkeypatch: pytest.MonkeyPat
 
     monkeypatch.setattr(core, "RESCUE_EVENT_SOCKET_PATH", tmp_path / "missing.sock")
     assert core.get_rescue_telemetry_client() is None
+
+
+@linux_only
+def test_required_telemetry_outage_blocks_provider_and_tool_entry(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent.rescue_plane_core as core
+    from agent.chat_completion_helpers import _rescue_account_provider_call
+    from model_tools import _rescue_account_tool_call
+
+    continuity = tmp_path / "continuity"
+    continuity.mkdir(mode=0o750)
+    continuity.chmod(0o750)
+    marker = continuity / "telemetry-required-v1.json"
+    marker.write_text(
+        '{"required":true,"schema_version":'
+        '"hermes-rescue-telemetry-required-v1"}',
+        encoding="ascii",
+    )
+    marker.chmod(0o440)
+    monkeypatch.setattr(core, "RESCUE_TELEMETRY_REQUIRED_PATH", marker, raising=False)
+    monkeypatch.setattr(core, "RESCUE_REPORTER_UID", os.getuid(), raising=False)
+    monkeypatch.setattr(core, "RESCUE_EVENT_SOCKET_PATH", tmp_path / "missing.sock")
+    calls: list[str] = []
+
+    class Agent:
+        _current_turn_id = "turn-outage"
+
+    @_rescue_account_provider_call
+    def provider(_agent, _kwargs):
+        calls.append("provider")
+
+    @_rescue_account_tool_call
+    def tool(*_args, **_kwargs):
+        calls.append("tool")
+
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        provider(Agent(), {})
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        tool("terminal", {}, turn_id="turn-outage")
+    assert calls == []
