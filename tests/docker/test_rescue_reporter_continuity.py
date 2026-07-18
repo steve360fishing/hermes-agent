@@ -88,10 +88,14 @@ def rescue_container(
 
 
 def _snapshot(container: str) -> dict[str, object]:
+    # The signed rescue snapshot is deliberately 0600 and reporter-owned.
+    # This test inspects supervisor evidence, so read it through the root-only
+    # test boundary instead of weakening the production file permissions.
     result = docker_exec(
         container,
         "cat",
         "/run/hermes-rescue-reporter/quiescence-v1.json",
+        user="root",
     )
     assert result.returncode == 0, result.stderr
     return json.loads(result.stdout)
