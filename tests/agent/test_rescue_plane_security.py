@@ -1119,6 +1119,8 @@ def test_s6_service_is_executable_drops_uid_and_has_no_failure_mask() -> None:
 
     assert index_mode == "100755"
     assert "s6-setuidgid hermes-rescue" in text
+    assert "useradd -u 10002" in dockerfile
+    assert "useradd -u 10001" not in dockerfile
     assert "--expected-reporter-uid" in text
     assert "|| true" not in text
     assert "gateway run" not in text
