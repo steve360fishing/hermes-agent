@@ -2387,7 +2387,7 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                if proc_session.completion_reason == "launch_unknown":
+                if getattr(proc_session, "completion_reason", "exited") == "launch_unknown":
                     result_data = {
                         "output": proc_session.output_buffer,
                         "session_id": proc_session.id,

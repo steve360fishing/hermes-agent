@@ -16,6 +16,8 @@ import threading
 import time
 from typing import Any, Callable, Mapping
 
+import psutil
+
 from agent.rescue_plane_core import (
     EVENT_SCHEMA_VERSION,
     KeyRing,
@@ -34,6 +36,17 @@ _EVENT_WORK = _EVENT_BASE | {"work_id"}
 _EVENT_TURN_START = _EVENT_BASE | {"lane", "artifact_requested"}
 _POLICY_RETENTION_SECONDS = 120.0
 _CONTINUITY_INITIALIZED = b"hermes-rescue-continuity-initialized-v1"
+
+
+def _posix_uid() -> int:
+    """Return the current POSIX uid or reject an unsupported identity API."""
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise PermissionError("rescue reporter requires POSIX uid support")
+    uid = getuid()
+    if type(uid) is not int or uid < 0:
+        raise PermissionError("invalid POSIX uid")
+    return uid
 
 
 class ReporterCapacityExhausted(ValueError):
@@ -416,13 +429,7 @@ def discover_gateway_state(
 
 
 def _pid_alive(pid: int) -> bool:
-    try:
-        os.kill(pid, 0)
-    except ProcessLookupError:
-        return False
-    except PermissionError:
-        return True
-    return True
+    return type(pid) is int and pid > 0 and psutil.pid_exists(pid)
 
 
 def acquire_reporter_lock(runtime_dir: Path) -> int:
@@ -442,7 +449,7 @@ def acquire_reporter_lock(runtime_dir: Path) -> int:
         if (
             not stat.S_ISREG(info.st_mode)
             or info.st_nlink != 1
-            or info.st_uid != os.getuid()
+            or info.st_uid != _posix_uid()
             or stat.S_IMODE(info.st_mode) != 0o600
         ):
             raise PermissionError("insecure reporter lock")
@@ -457,7 +464,7 @@ def acquire_reporter_lock(runtime_dir: Path) -> int:
 
 
 def require_effective_uid(expected_uid: int, *, actual_uid: int | None = None) -> None:
-    actual = os.getuid() if actual_uid is None else actual_uid
+    actual = _posix_uid() if actual_uid is None else actual_uid
     if type(expected_uid) is not int or expected_uid <= 0 or actual != expected_uid:
         raise PermissionError("unexpected rescue reporter effective uid")
 
@@ -494,7 +501,7 @@ class QuiescenceReporter:
         if (
             runtime_dir.is_symlink()
             or not stat.S_ISDIR(runtime_info.st_mode)
-            or runtime_info.st_uid != os.getuid()
+            or runtime_info.st_uid != _posix_uid()
             or stat.S_IMODE(runtime_info.st_mode) != 0o750
         ):
             raise PermissionError("insecure reporter runtime directory")
@@ -503,7 +510,7 @@ class QuiescenceReporter:
         if (
             continuity_dir.is_symlink()
             or not stat.S_ISDIR(continuity_info.st_mode)
-            or continuity_info.st_uid != os.getuid()
+            or continuity_info.st_uid != _posix_uid()
             or continuity_info.st_gid != self.runtime_gid
             or stat.S_IMODE(continuity_info.st_mode) != 0o750
         ):
@@ -525,7 +532,7 @@ class QuiescenceReporter:
         try:
             raw = _secure_read(
                 self.continuity_state_path,
-                expected_uid=os.getuid(),
+                expected_uid=_posix_uid(),
                 expected_gid=self.continuity_gid,
                 file_mode=0o600,
                 parent_mode=0o750,
@@ -578,7 +585,7 @@ class QuiescenceReporter:
         try:
             raw = _secure_read(
                 self.output_path,
-                expected_uid=os.getuid(),
+                expected_uid=_posix_uid(),
                 expected_gid=self.runtime_gid,
                 file_mode=0o600,
                 parent_mode=0o750,
@@ -596,7 +603,7 @@ class QuiescenceReporter:
         sequence = recover_snapshot_sequence(
             self.output_path,
             keyring=self.keyring,
-            expected_uid=os.getuid(),
+            expected_uid=_posix_uid(),
             expected_gid=self.runtime_gid,
         )
         self.producer_epoch = str(snapshot["producer_epoch"])
@@ -618,7 +625,7 @@ class QuiescenceReporter:
         try:
             raw = _secure_read(
                 self.continuity_initialized_path,
-                expected_uid=os.getuid(),
+                expected_uid=_posix_uid(),
                 expected_gid=self.continuity_gid,
                 file_mode=0o400,
                 parent_mode=0o750,
@@ -637,7 +644,7 @@ class QuiescenceReporter:
             self.continuity_initialized_path,
             _CONTINUITY_INITIALIZED,
             mode=0o400,
-            expected_parent_uid=os.getuid(),
+            expected_parent_uid=_posix_uid(),
             expected_parent_gid=self.continuity_gid,
         )
 
@@ -685,7 +692,7 @@ class QuiescenceReporter:
                 allow_nan=False,
             ).encode("ascii"),
             mode=0o600,
-            expected_parent_uid=os.getuid(),
+            expected_parent_uid=_posix_uid(),
             expected_parent_gid=self.continuity_gid,
         )
 
@@ -714,7 +721,7 @@ class QuiescenceReporter:
                 if (
                     not stat.S_ISREG(info.st_mode)
                     or info.st_nlink != 1
-                    or info.st_uid != os.getuid()
+                    or info.st_uid != _posix_uid()
                     or info.st_gid != self.runtime_gid
                 ):
                     raise PermissionError("unsafe snapshot invalidation target")
@@ -826,7 +833,7 @@ class QuiescenceReporter:
                     allow_nan=False,
                 ).encode("ascii"),
                 mode=0o600,
-                expected_parent_uid=os.getuid(),
+                expected_parent_uid=_posix_uid(),
                 expected_parent_gid=self.runtime_gid,
             )
             return snapshot
@@ -961,7 +968,7 @@ def main() -> int:
     parser.add_argument("--expected-reporter-uid", type=int, required=True)
     args = parser.parse_args()
 
-    reporter_uid = os.getuid()
+    reporter_uid = _posix_uid()
     require_effective_uid(args.expected_reporter_uid, actual_uid=reporter_uid)
     runtime_info = args.runtime_dir.lstat()
     if (

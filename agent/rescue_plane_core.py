@@ -79,6 +79,28 @@ class SafeModeOverlay:
         return not self.valid or "artifact_only" in self.disables
 
 
+def _posix_uid() -> int:
+    """Return the current POSIX uid or reject an unsupported identity API."""
+    getuid = getattr(os, "getuid", None)
+    if not callable(getuid):
+        raise OSError("rescue plane requires POSIX uid support")
+    uid = getuid()
+    if type(uid) is not int or uid < 0:
+        raise OSError("invalid POSIX uid")
+    return uid
+
+
+def _posix_gid() -> int:
+    """Return the current POSIX gid or reject an unsupported identity API."""
+    getgid = getattr(os, "getgid", None)
+    if not callable(getgid):
+        raise OSError("rescue plane requires POSIX gid support")
+    gid = getgid()
+    if type(gid) is not int or gid < 0:
+        raise OSError("invalid POSIX gid")
+    return gid
+
+
 @dataclass(frozen=True)
 class KeySlot:
     key_id: str
@@ -587,10 +609,10 @@ class DurableReplayState:
     ) -> None:
         self.path = path
         self.expected_uid = (
-            os.getuid() if expected_uid is None and os.name == "posix" else expected_uid
+            _posix_uid() if expected_uid is None and os.name == "posix" else expected_uid
         )
         self.expected_gid = (
-            os.getgid() if expected_gid is None and os.name == "posix" else expected_gid
+            _posix_gid() if expected_gid is None and os.name == "posix" else expected_gid
         )
 
     def _load(self) -> dict[str, Any]:
@@ -1097,7 +1119,7 @@ def get_rescue_telemetry_client() -> RescueTelemetryClient | None:
     if (
         not stat.S_ISSOCK(info.st_mode)
         or stat.S_IMODE(info.st_mode) != 0o620
-        or info.st_uid == os.getuid()
+        or info.st_uid == _posix_uid()
         or info.st_gid not in os.getgroups()
     ):
         if required:

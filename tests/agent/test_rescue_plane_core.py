@@ -53,13 +53,18 @@ def _overlay(path: Path, **overrides: object) -> None:
     path.chmod(0o640)
 
 
+def _test_uid() -> int:
+    getuid = getattr(os, "getuid", None)
+    return getuid() if callable(getuid) else 0
+
+
 def test_valid_overlay_disables_only_artifact_only(tmp_path: Path) -> None:
     from agent.rescue_plane_core import read_safe_mode_overlay
 
     overlay = tmp_path / "safe-mode-v1.json"
     _overlay(overlay)
 
-    decision = read_safe_mode_overlay(overlay)
+    decision = read_safe_mode_overlay(overlay, expected_uid=_test_uid())
 
     assert decision.valid is True
     assert decision.disables == frozenset({"artifact_only"})
@@ -81,7 +86,7 @@ def test_unknown_or_malformed_overlay_fails_closed(tmp_path: Path, overrides: di
     overlay = tmp_path / "safe-mode-v1.json"
     _overlay(overlay, **overrides)
 
-    decision = read_safe_mode_overlay(overlay)
+    decision = read_safe_mode_overlay(overlay, expected_uid=_test_uid())
 
     assert decision.valid is False
     assert decision.disables_artifact_only is True
@@ -92,7 +97,9 @@ def test_missing_overlay_preserves_normal_policy(tmp_path: Path) -> None:
     from agent.rescue_plane_core import read_safe_mode_overlay
 
     tmp_path.chmod(0o750)
-    decision = read_safe_mode_overlay(tmp_path / "absent.json")
+    decision = read_safe_mode_overlay(
+        tmp_path / "absent.json", expected_uid=_test_uid()
+    )
 
     assert decision.valid is True
     assert decision.disables_artifact_only is False
@@ -110,11 +117,17 @@ def test_overlay_symlink_and_insecure_mode_fail_closed(tmp_path: Path) -> None:
     except OSError as exc:
         pytest.skip(f"symlinks unavailable: {exc}")
 
-    assert read_safe_mode_overlay(linked).reason == "invalid_symlink"
+    assert (
+        read_safe_mode_overlay(linked, expected_uid=_test_uid()).reason
+        == "invalid_symlink"
+    )
     linked.unlink()
     _overlay(linked)
     linked.chmod(0o644)
-    assert read_safe_mode_overlay(linked).reason == "invalid_mode"
+    assert (
+        read_safe_mode_overlay(linked, expected_uid=_test_uid()).reason
+        == "invalid_mode"
+    )
 
 
 def test_overlay_is_applied_per_turn_without_sticky_state(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
@@ -124,6 +137,13 @@ def test_overlay_is_applied_per_turn_without_sticky_state(tmp_path: Path, monkey
     tmp_path.chmod(0o750)
     overlay = tmp_path / "safe-mode-v1.json"
     monkeypatch.setattr(rescue_core, "SAFE_MODE_OVERLAY_PATH", overlay)
+    monkeypatch.setattr(
+        rescue_core,
+        "rescue_overlay_disables_artifact_only",
+        lambda: rescue_core.read_safe_mode_overlay(
+            overlay, expected_uid=_test_uid()
+        ).disables_artifact_only,
+    )
     first = build_task_execution_contract(
         "Return only one paste-ready GPT Image prompt.", task_id="first", platform="telegram"
     )

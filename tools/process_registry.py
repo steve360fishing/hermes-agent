@@ -226,7 +226,7 @@ class ProcessRegistry:
                 return "complete"
             return "unknown"
         try:
-            os.killpg(session.process_group_id, 0)
+            os.killpg(session.process_group_id, 0)  # windows-footgun: ok
         except ProcessLookupError:
             return "complete"
         except (PermissionError, OSError):
