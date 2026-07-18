@@ -1,0 +1,61 @@
+name: Rescue Plane Docker Proof
+
+on:
+  pull_request:
+    paths:
+      - ".github/workflows/rescue-plane-docker-proof.yml"
+      - "Dockerfile"
+      - "agent/rescue_plane_core.py"
+      - "agent/rescue_quiescence_reporter.py"
+      - "docker/**"
+      - "tests/docker/**"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: rescue-plane-docker-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  docker-proof:
+    name: AMD64 s6 and non-root runtime proof
+    runs-on: ubuntu-latest
+    timeout-minutes: 45
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@8d2750c68a42422c14e847fe6c8ac0403b4cbd6f # v3
+
+      - name: Build verification image
+        uses: docker/build-push-action@bcafcacb16a39f128d818304e6c9c0c18556b85f # v7.1.0
+        with:
+          context: .
+          file: Dockerfile
+          load: true
+          platforms: linux/amd64
+          tags: hermes-agent:rescue-plane-proof
+          build-args: |
+            HERMES_GIT_SHA=${{ github.sha }}
+          cache-from: type=gha,scope=rescue-plane-docker-amd64
+          cache-to: type=gha,mode=max,scope=rescue-plane-docker-amd64
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install Docker test dependencies
+        run: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run Docker integration tests
+        env:
+          HERMES_TEST_IMAGE: hermes-agent:rescue-plane-proof
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""
+        run: scripts/run_tests.sh tests/docker/ --file-timeout 600
