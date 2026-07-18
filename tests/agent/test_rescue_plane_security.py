@@ -1104,6 +1104,8 @@ def test_reporter_checks_actual_effective_uid() -> None:
 
 
 def test_s6_service_is_executable_drops_uid_and_has_no_failure_mask() -> None:
+    from agent import rescue_plane_core
+
     root = Path(__file__).parents[2]
     run = root / "docker" / "s6-rc.d" / "rescue-quiescence-reporter" / "run"
     text = run.read_text(encoding="utf-8")
@@ -1119,6 +1121,7 @@ def test_s6_service_is_executable_drops_uid_and_has_no_failure_mask() -> None:
 
     assert index_mode == "100755"
     assert "s6-setuidgid hermes-rescue" in text
+    assert rescue_plane_core.RESCUE_REPORTER_UID == 10002
     assert "useradd -u 10002" in dockerfile
     assert "useradd -u 10001" not in dockerfile
     assert "--expected-reporter-uid" in text

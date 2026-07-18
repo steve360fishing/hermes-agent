@@ -28,7 +28,7 @@ RESCUE_EVENT_SOCKET_PATH = Path("/run/hermes-rescue-reporter/events.sock")
 RESCUE_TELEMETRY_REQUIRED_PATH = Path(
     "/var/lib/hermes-rescue/telemetry-required-v1.json"
 )
-RESCUE_REPORTER_UID = 10001
+RESCUE_REPORTER_UID = 10002
 TELEMETRY_REQUIRED_MARKER = (
     b'{"required":true,"schema_version":'
     b'"hermes-rescue-telemetry-required-v1"}'
