@@ -2225,6 +2225,46 @@ class TestPluginDispatchTool:
 
         assert '"error"' in result
 
+    def test_dispatch_tool_required_telemetry_outage_blocks_handler(
+        self, monkeypatch
+    ):
+        import agent.rescue_plane_core as core
+        from tools.registry import registry
+
+        mgr = PluginManager()
+        ctx = PluginContext(
+            PluginManifest(name="test-plugin", source="user"),
+            mgr,
+        )
+        entered = []
+        registry.register(
+            name="_test_required_dispatch_probe",
+            toolset="debugging",
+            schema={
+                "name": "_test_required_dispatch_probe",
+                "description": "probe",
+                "parameters": {"type": "object", "properties": {}},
+            },
+            handler=lambda _args, **_kwargs: entered.append(True) or "{}",
+        )
+        monkeypatch.setattr(
+            core,
+            "get_rescue_telemetry_client",
+            lambda: (_ for _ in ()).throw(
+                core.RescueTelemetryUnavailable("required reporter outage")
+            ),
+        )
+        try:
+            with pytest.raises(core.RescueTelemetryUnavailable):
+                ctx.dispatch_tool(
+                    "_test_required_dispatch_probe",
+                    {},
+                    turn_id="turn-plugin-outage",
+                )
+            assert entered == []
+        finally:
+            registry.deregister("_test_required_dispatch_probe")
+
 
 class TestPluginDebugLogging:
     """HERMES_PLUGINS_DEBUG opt-in stderr handler for plugin developers."""

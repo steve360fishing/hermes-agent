@@ -6,6 +6,7 @@ import json
 import math
 import os
 from pathlib import Path
+import shlex
 import stat
 import subprocess
 import sys
@@ -1421,6 +1422,118 @@ def test_background_work_survives_turn_end_and_gateway_death_until_completion() 
     assert state.active_counts() == (0, 0, 0)
 
 
+def test_background_unknown_degrades_without_removing_active_work() -> None:
+    from agent.rescue_quiescence_reporter import ReporterState
+
+    state = ReporterState(max_turns=4)
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "background_start",
+            "event_id": "background-start-unknown",
+            "turn_id": "turn-background-unknown",
+            "work_id": "terminal:proc-unknown",
+        },
+        peer_pid=502,
+        peer_uid=10000,
+        now=1.0,
+    )
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "background_unknown",
+            "event_id": "background-status-unknown",
+            "turn_id": "turn-background-unknown",
+            "work_id": "terminal:proc-unknown",
+        },
+        peer_pid=502,
+        peer_uid=10000,
+        now=2.0,
+    )
+
+    assert state.telemetry_health == "degraded"
+    assert state.active_counts() == (0, 1, 0)
+
+
+def test_registry_dispatch_enforces_required_telemetry_before_handler(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_plane_core as core
+    from tools.registry import ToolRegistry
+
+    entered: list[bool] = []
+    registry = ToolRegistry()
+    registry.register(
+        name="required_probe",
+        toolset="debugging",
+        schema={
+            "name": "required_probe",
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: entered.append(True) or "{}",
+    )
+    monkeypatch.setattr(
+        core,
+        "get_rescue_telemetry_client",
+        lambda: (_ for _ in ()).throw(
+            core.RescueTelemetryUnavailable("required reporter outage")
+        ),
+    )
+
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        registry.dispatch("required_probe", {}, turn_id="turn-registry-outage")
+    assert entered == []
+
+
+def test_registry_dispatch_deduplicates_existing_tool_middleware_scope(
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_plane_core as core
+    from hermes_cli.middleware import run_tool_execution_middleware
+    from tools.registry import ToolRegistry
+
+    events: list[tuple[str, str]] = []
+
+    class FakeClient:
+        @contextmanager
+        def active_work(self, kind: str, *, turn_id: str):
+            events.append((f"{kind}_start", turn_id))
+            try:
+                yield
+            finally:
+                events.append((f"{kind}_end", turn_id))
+
+    registry = ToolRegistry()
+    registry.register(
+        name="dedupe_probe",
+        toolset="debugging",
+        schema={
+            "name": "dedupe_probe",
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: "{}",
+    )
+    monkeypatch.setattr(core, "get_rescue_telemetry_client", lambda: FakeClient())
+
+    assert (
+        run_tool_execution_middleware(
+            "dedupe_probe",
+            {},
+            lambda args: registry.dispatch(
+                "dedupe_probe", args, turn_id="turn-deduplicated"
+            ),
+            turn_id="turn-deduplicated",
+        )
+        == "{}"
+    )
+    assert events == [
+        ("tool_start", "turn-deduplicated"),
+        ("tool_end", "turn-deduplicated"),
+    ]
+
+
 @linux_only
 def test_terminal_background_registry_accounts_until_process_completion(
     monkeypatch: pytest.MonkeyPatch,
@@ -1462,6 +1575,71 @@ def test_terminal_background_registry_accounts_until_process_completion(
 
 
 @linux_only
+def test_terminal_background_descendant_keeps_work_active_until_group_empty(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent.rescue_plane_core import rescue_tool_execution_scope
+    import tools.process_registry as process_module
+
+    events: list[dict[str, object]] = []
+
+    class FakeClient:
+        @contextmanager
+        def active_work(self, kind: str, *, turn_id: str):
+            assert kind == "tool"
+            yield
+
+        def emit(self, event):
+            events.append(dict(event))
+
+    monkeypatch.setattr(process_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = process_module.ProcessRegistry()
+    descendant_pid_path = tmp_path / "descendant.pid"
+    launcher = tmp_path / "spawn_descendant.py"
+    launcher.write_text(
+        "import pathlib, subprocess\n"
+        "child = subprocess.Popen(\n"
+        "    ['sleep', '1.5'],\n"
+        "    stdout=subprocess.DEVNULL,\n"
+        "    stderr=subprocess.DEVNULL,\n"
+        ")\n"
+        f"pathlib.Path({str(descendant_pid_path)!r}).write_text(str(child.pid))\n",
+        encoding="utf-8",
+    )
+    command = f"{shlex.quote(sys.executable)} {shlex.quote(str(launcher))}"
+    with rescue_tool_execution_scope("turn-descendant", client=FakeClient()):
+        session = registry.spawn_local(command, cwd=str(tmp_path))
+
+    deadline = time.time() + 5
+    while (
+        (session.process.poll() is None or not descendant_pid_path.exists())
+        and time.time() < deadline
+    ):
+        time.sleep(0.01)
+    assert session.process.poll() == 0
+    descendant_pid = int(descendant_pid_path.read_text(encoding="utf-8"))
+    os.kill(descendant_pid, 0)
+
+    registry.poll(session.id)
+    time.sleep(0.1)
+    os.kill(descendant_pid, 0)
+    assert [event["event"] for event in events] == [
+        "background_start",
+        "background_unknown",
+    ]
+
+    deadline = time.time() + 5
+    while len(events) < 3 and time.time() < deadline:
+        time.sleep(0.02)
+    assert [event["event"] for event in events] == [
+        "background_start",
+        "background_unknown",
+        "background_end",
+    ]
+
+
+@linux_only
 def test_uncertain_environment_launch_never_publishes_false_background_end(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
@@ -1497,7 +1675,10 @@ def test_uncertain_environment_launch_never_publishes_false_background_end(
         )
 
     assert session.completion_reason == "launch_unknown"
-    assert [event["event"] for event in events] == ["background_start"]
+    assert [event["event"] for event in events] == [
+        "background_start",
+        "background_unknown",
+    ]
 
 
 @linux_only

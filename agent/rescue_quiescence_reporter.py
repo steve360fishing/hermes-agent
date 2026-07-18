@@ -92,6 +92,7 @@ class ReporterState:
             "provider_end",
             "background_start",
             "background_end",
+            "background_unknown",
         }:
             expected = _EVENT_WORK
         else:
@@ -177,11 +178,20 @@ class ReporterState:
                     "peer_uid": peer_uid,
                     "started_at": float(now),
                 }
-            else:
+            elif kind.endswith("_end"):
                 active = collection.get(work_id)
                 if not active or active["peer_pid"] != peer_pid or active["turn_id"] != turn_id:
                     raise ValueError("work end does not match active owner")
                 del collection[work_id]
+            else:
+                active = collection.get(work_id)
+                if (
+                    not active
+                    or active["peer_pid"] != peer_pid
+                    or active["turn_id"] != turn_id
+                ):
+                    raise ValueError("work uncertainty does not match active owner")
+                self.telemetry_health = "degraded"
         self.seen_events[event_id] = None
         while len(self.seen_events) > max(1024, self.max_work * 2):
             self.seen_events.popitem(last=False)

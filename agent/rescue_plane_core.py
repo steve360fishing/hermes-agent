@@ -952,7 +952,23 @@ class RescueBackgroundWork:
         self.turn_id = turn_id
         self.work_id = work_id
         self._finished = False
+        self._unknown_reported = False
         self._lock = threading.Lock()
+
+    def mark_unknown(self) -> None:
+        """Degrade telemetry without removing this active reporter record."""
+        with self._lock:
+            if self._finished or self._unknown_reported:
+                return
+            self.client.emit(
+                {
+                    "event": "background_unknown",
+                    "event_id": secrets.token_hex(16),
+                    "turn_id": self.turn_id,
+                    "work_id": self.work_id,
+                }
+            )
+            self._unknown_reported = True
 
     def finish(self) -> None:
         with self._lock:
@@ -970,7 +986,7 @@ class RescueBackgroundWork:
 
 
 _RESCUE_TOOL_CONTEXT: contextvars.ContextVar[
-    tuple[RescueTelemetryClient, str] | None
+    tuple[RescueTelemetryClient | None, str] | None
 ] = contextvars.ContextVar("rescue_tool_context", default=None)
 _CLIENT_UNSET = object()
 
@@ -982,11 +998,16 @@ def rescue_tool_execution_scope(
     client: RescueTelemetryClient | None | object = _CLIENT_UNSET,
 ) -> Iterator[None]:
     """Single accounting and required-telemetry boundary for every tool path."""
+    existing = _RESCUE_TOOL_CONTEXT.get()
+    if existing is not None:
+        # Tool middleware and the registry boundary can legitimately nest.
+        # The outermost scope owns both the required-telemetry check and the
+        # active-work record; nested paths must not double count.
+        yield
+        return
     resolved = get_rescue_telemetry_client() if client is _CLIENT_UNSET else client
     normalized_turn_id = str(turn_id or "unscoped")
-    token = _RESCUE_TOOL_CONTEXT.set(
-        (resolved, normalized_turn_id) if resolved is not None else None
-    )
+    token = _RESCUE_TOOL_CONTEXT.set((resolved, normalized_turn_id))
     scope = (
         resolved.active_work("tool", turn_id=normalized_turn_id)
         if resolved is not None
