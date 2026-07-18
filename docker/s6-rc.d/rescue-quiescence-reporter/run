@@ -1,7 +1,17 @@
 #!/command/with-contenv sh
 # shellcheck shell=sh
-# Independent of the gateway process; deployment bind-mounts identity files.
-while :; do
-    /opt/hermes/.venv/bin/python -m agent.rescue_quiescence_reporter || true
-    sleep 10
-done
+set -eu
+
+key=/run/hermes-rescue-secrets/hmac-current
+[ -f "$key" ] || exit 0
+[ "$(id -u)" -eq 0 ] || {
+    echo "[rescue-reporter] supervision must start as root before setuid" >&2
+    exit 111
+}
+
+exec s6-setuidgid hermes-rescue \
+    /opt/hermes/.venv/bin/python -m agent.rescue_quiescence_reporter serve \
+    --runtime-dir /run/hermes-rescue-reporter \
+    --current-key "$key" \
+    --expected-reporter-uid "$(id -u hermes-rescue)" \
+    --expected-hermes-uid "$(id -u hermes)"

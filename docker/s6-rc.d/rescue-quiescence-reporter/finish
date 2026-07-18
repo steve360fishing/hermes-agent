@@ -1,0 +1,6 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+
+# Unconfigured rescue telemetry is intentionally dormant, not restart-looped.
+[ -f /run/hermes-rescue-secrets/hmac-current ] || exit 125
+exit 0

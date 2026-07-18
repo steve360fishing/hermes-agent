@@ -21,6 +21,7 @@ import os
 import re
 import threading
 import time
+from functools import wraps
 import uuid
 from types import SimpleNamespace
 from typing import Any, Dict, Optional
@@ -254,17 +255,20 @@ def _check_stale_giveup(agent) -> None:
 
 def _rescue_account_provider_call(func):
     """Common provider request wrapper used by every interruptible API call."""
+    @wraps(func)
     def wrapper(agent, api_kwargs: dict):
-        from agent.rescue_plane_core import GLOBAL_RESCUE_TELEMETRY
+        from contextlib import nullcontext
+        from agent.rescue_plane_core import get_rescue_telemetry_client
 
-        with GLOBAL_RESCUE_TELEMETRY.active_provider_action():
-            try:
-                return func(agent, api_kwargs)
-            finally:
-                try:
-                    GLOBAL_RESCUE_TELEMETRY.write()
-                except OSError:
-                    logger.warning("rescue provider telemetry unavailable", exc_info=True)
+        client = get_rescue_telemetry_client()
+        turn_id = str(getattr(agent, "_current_turn_id", None) or "unscoped")
+        scope = (
+            client.active_work("provider", turn_id=turn_id)
+            if client is not None
+            else nullcontext()
+        )
+        with scope:
+            return func(agent, api_kwargs)
     return wrapper
 
 

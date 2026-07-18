@@ -104,16 +104,36 @@ validate_uid_gid() {
 HERMES_UID="${HERMES_UID:-${PUID:-}}"
 HERMES_GID="${HERMES_GID:-${PGID:-}}"
 
+if [ -n "${HERMES_UID:-}" ] && [ "$HERMES_UID" = "$(id -u hermes-rescue)" ]; then
+    echo "[stage2] Fatal: requested Hermes UID collides with hermes-rescue reporter UID" >&2
+    exit 1
+fi
+if [ -n "${HERMES_GID:-}" ] && validate_uid_gid "$HERMES_GID" && \
+        [ "$HERMES_GID" = "$(id -g hermes-rescue)" ]; then
+    echo "[stage2] Fatal: requested Hermes GID collides with hermes-rescue reporter GID" >&2
+    exit 1
+fi
+
 if [ -n "${HERMES_UID:-}" ] && validate_uid_gid "$HERMES_UID" && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
     echo "[stage2] Changing hermes UID to $HERMES_UID"
     usermod -u "$HERMES_UID" hermes
 fi
+
 if [ -n "${HERMES_GID:-}" ] && validate_uid_gid "$HERMES_GID" && [ "$HERMES_GID" != "$(id -g hermes)" ]; then
     echo "[stage2] Changing hermes GID to $HERMES_GID"
     # -o allows non-unique GID (e.g. macOS GID 20 "staff" may already
     # exist as "dialout" in the Debian-based container image).
     groupmod -o -g "$HERMES_GID" hermes 2>/dev/null || true
 fi
+
+# Reporter-owned writable runtime. Hermes gets socket-connect access through
+# its group only; it cannot write aggregate state or signed snapshots.
+if [ -L /run/hermes-rescue-reporter ] || \
+        { [ -e /run/hermes-rescue-reporter ] && [ ! -d /run/hermes-rescue-reporter ]; }; then
+    echo "[stage2] Fatal: rescue runtime path is not a real directory" >&2
+    exit 1
+fi
+install -d -o hermes-rescue -g hermes -m 0750 /run/hermes-rescue-reporter
 
 # --- Docker socket group membership (docker-in-docker / DooD) ---
 # When the user bind-mounts the host Docker daemon socket

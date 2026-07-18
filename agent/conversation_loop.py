@@ -533,13 +533,21 @@ def _clear_request_contract_after_turn(func):
             return func(agent, *args, **kwargs)
         finally:
             try:
-                from agent.rescue_plane_core import GLOBAL_RESCUE_TELEMETRY
-
+                rescue_client = getattr(agent, "_rescue_telemetry_client", None)
                 turn_id = getattr(agent, "_current_turn_id", None)
-                if turn_id:
-                    GLOBAL_RESCUE_TELEMETRY.finish_turn(turn_id)
-                    GLOBAL_RESCUE_TELEMETRY.write()
-            except OSError:
+                if rescue_client is not None and turn_id:
+                    import uuid
+
+                    rescue_client.emit(
+                        {
+                            "event": "turn_end",
+                            "event_id": uuid.uuid4().hex,
+                            "turn_id": turn_id,
+                        }
+                    )
+            except Exception:
+                # A missing end event leaves the reporter-owned turn active,
+                # which blocks restart. Do not discard the user's response.
                 logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
             from agent.task_execution_contract import clear_task_execution_contract
 

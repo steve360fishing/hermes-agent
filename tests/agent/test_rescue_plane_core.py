@@ -139,92 +139,6 @@ def test_overlay_is_applied_per_turn_without_sticky_state(tmp_path: Path, monkey
     assert third.lane == ARTIFACT_ONLY
 
 
-def test_execution_accounting_tracks_turn_tool_and_provider_lifetimes() -> None:
-    from agent.rescue_plane_core import RescueExecutionTelemetry
-
-    telemetry = RescueExecutionTelemetry()
-    telemetry.start_turn("turn-1", lane="normal", artifact_requested=False, now=10.0)
-    with telemetry.active_tool():
-        with telemetry.active_provider_action():
-            assert telemetry.active_counts() == (1, 1, 1)
-    telemetry.finish_turn("turn-1", now=11.0)
-
-    assert telemetry.active_counts() == (0, 0, 0)
-    assert telemetry.turn_record("turn-1") == {
-        "artifact_requested": False,
-        "completed_at": 11.0,
-        "lane": "normal",
-        "started_at": 10.0,
-        "turn_id": "turn-1",
-    }
-
-
-def test_signed_quiescence_snapshots_reject_stale_replay_and_wrong_key() -> None:
-    from agent.rescue_plane_core import RescueExecutionTelemetry, validate_quiescence_snapshot
-
-    telemetry = RescueExecutionTelemetry()
-    key = b"a" * 32
-    snapshot = telemetry.quiescence_snapshot(
-        key=key,
-        key_id="current-v1",
-        gateway_pid=123,
-        gateway_state="dead",
-        source_sha="a" * 40,
-        image_id="sha256:" + "b" * 64,
-        now=100.0,
-    )
-    seen: dict[str, int] = {}
-
-    assert validate_quiescence_snapshot(snapshot, keys={"current-v1": key}, now=114.9, seen_sequences=seen).valid
-    assert validate_quiescence_snapshot(snapshot, keys={"current-v1": key}, now=115.0, seen_sequences={}).reason == "stale"
-    assert validate_quiescence_snapshot(snapshot, keys={"current-v1": key}, now=101.0, seen_sequences=seen).reason == "replayed"
-    assert validate_quiescence_snapshot(snapshot, keys={"other": key}, now=101.0, seen_sequences={}).reason == "unknown_key"
-    tampered = dict(snapshot)
-    tampered["active_tool_count"] = 1
-    assert validate_quiescence_snapshot(tampered, keys={"current-v1": key}, now=101.0, seen_sequences={}).reason == "invalid_signature"
-
-
-def test_reporter_source_is_independent_of_gateway_and_preserves_active_counts(tmp_path: Path) -> None:
-    from agent.rescue_plane_core import RescueExecutionTelemetry
-    from agent.rescue_quiescence_reporter import QuiescenceReporter
-
-    telemetry_path = tmp_path / "turn-telemetry-v1.json"
-    output_path = tmp_path / "quiescence-v1.json"
-    key_path = tmp_path / "quiescence.key"
-    key_path.write_bytes(b"q" * 32)
-    key_path.chmod(0o400)
-    telemetry = RescueExecutionTelemetry()
-    telemetry.start_turn("turn-1", lane="normal", artifact_requested=False, now=10.0)
-    with telemetry.active_tool():
-        telemetry.write(telemetry_path)
-        reporter = QuiescenceReporter(
-            telemetry_path=telemetry_path,
-            output_path=output_path,
-            key_path=key_path,
-            key_id="current-v1",
-            source_sha="a" * 40,
-            image_id="sha256:" + "b" * 64,
-            gateway_state=lambda: (None, "dead"),
-        )
-        snapshot = reporter.emit_once(now=20.0)
-
-    assert snapshot["gateway_state"] == "dead"
-    assert snapshot["active_turn_count"] == 1
-    assert snapshot["active_tool_count"] == 1
-    assert snapshot["active_provider_action_count"] == 0
-    assert json.loads(output_path.read_text(encoding="utf-8"))["signature"] == snapshot["signature"]
-    next_snapshot = QuiescenceReporter(
-        telemetry_path=telemetry_path,
-        output_path=output_path,
-        key_path=key_path,
-        key_id="current-v1",
-        source_sha="a" * 40,
-        image_id="sha256:" + "b" * 64,
-        gateway_state=lambda: (None, "dead"),
-    ).emit_once(now=21.0)
-    assert next_snapshot["sequence"] == snapshot["sequence"] + 1
-
-
 def test_s6_reporter_service_is_separate_from_gateway() -> None:
     root = Path(__file__).parents[2]
     run = (root / "docker" / "s6-rc.d" / "rescue-quiescence-reporter" / "run").read_text(encoding="utf-8")
@@ -233,5 +147,6 @@ def test_s6_reporter_service_is_separate_from_gateway() -> None:
     assert "agent.rescue_quiescence_reporter" in run
     assert "gateway run" not in run
     assert "HERMES_RESCUE" not in run
-    assert "sleep 10" in run
+    assert "s6-setuidgid hermes-rescue" in run
+    assert "|| true" not in run
     assert bundle_entry.is_file()
