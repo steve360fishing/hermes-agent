@@ -40,6 +40,7 @@ def test_sticky_artifact_fixture_is_frozen_and_identifiable() -> None:
 
 
 def _overlay(path: Path, **overrides: object) -> None:
+    path.parent.chmod(0o750)
     payload = {
         "schema_version": "hermes-safe-mode-v1",
         "enabled": True,
@@ -90,6 +91,7 @@ def test_unknown_or_malformed_overlay_fails_closed(tmp_path: Path, overrides: di
 def test_missing_overlay_preserves_normal_policy(tmp_path: Path) -> None:
     from agent.rescue_plane_core import read_safe_mode_overlay
 
+    tmp_path.chmod(0o750)
     decision = read_safe_mode_overlay(tmp_path / "absent.json")
 
     assert decision.valid is True
@@ -119,6 +121,7 @@ def test_overlay_is_applied_per_turn_without_sticky_state(tmp_path: Path, monkey
     import agent.rescue_plane_core as rescue_core
     from agent.task_execution_contract import ARTIFACT_ONLY, NORMAL, build_task_execution_contract
 
+    tmp_path.chmod(0o750)
     overlay = tmp_path / "safe-mode-v1.json"
     monkeypatch.setattr(rescue_core, "SAFE_MODE_OVERLAY_PATH", overlay)
     first = build_task_execution_contract(

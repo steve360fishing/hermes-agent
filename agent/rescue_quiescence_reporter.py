@@ -8,6 +8,7 @@ import json
 import math
 import os
 from pathlib import Path
+import secrets
 import socket
 import stat
 import struct
@@ -23,7 +24,6 @@ from agent.rescue_plane_core import (
     atomic_write_secure,
     _secure_read,
     read_hmac_key,
-    recover_snapshot_sequence,
     sign_quiescence_snapshot,
 )
 
@@ -31,6 +31,11 @@ from agent.rescue_plane_core import (
 _EVENT_BASE = frozenset({"schema_version", "event", "event_id", "turn_id"})
 _EVENT_WORK = _EVENT_BASE | {"work_id"}
 _EVENT_TURN_START = _EVENT_BASE | {"lane", "artifact_requested"}
+_POLICY_RETENTION_SECONDS = 120.0
+
+
+class ReporterCapacityExhausted(ValueError):
+    """Reporter cannot retain another turn without violating policy history."""
 
 
 def _bounded_text(value: Any, *, limit: int = 256) -> bool:
@@ -56,7 +61,7 @@ class ReporterState:
     """Reporter-owned aggregate built from authenticated process events."""
 
     def __init__(self, *, max_turns: int = 256, max_work: int = 4096) -> None:
-        if type(max_turns) is not int or not 1 <= max_turns <= 4096:
+        if type(max_turns) is not int or not 1 <= max_turns <= 256:
             raise ValueError("invalid turn bound")
         if type(max_work) is not int or not 1 <= max_work <= 100_000:
             raise ValueError("invalid work bound")
@@ -107,21 +112,23 @@ class ReporterState:
         kind = self._validate_event(event)
         if type(peer_pid) is not int or peer_pid <= 0 or type(peer_uid) is not int or peer_uid < 0:
             raise ValueError("invalid peer credentials")
+        if type(now) not in {int, float} or not math.isfinite(float(now)):
+            raise ValueError("invalid event time")
         event_id = str(event["event_id"])
         if event_id in self.seen_events:
             return False
-        self.seen_events[event_id] = None
-        while len(self.seen_events) > max(1024, self.max_work * 2):
-            self.seen_events.popitem(last=False)
 
         turn_id = str(event["turn_id"])
         if kind == "turn_start":
+            self._prune(float(now))
             existing = self.turns.get(turn_id)
             if existing and existing["completed_at"] is None:
                 raise ValueError("duplicate active turn")
-            if len([turn for turn in self.turns.values() if turn["completed_at"] is None]) >= self.max_turns:
+            if existing:
+                raise ValueError("retained turn id cannot be reused")
+            if len(self.turns) >= self.max_turns:
                 self.telemetry_health = "degraded"
-                raise ValueError("active turn bound exceeded")
+                raise ReporterCapacityExhausted("policy evidence capacity exhausted")
             self.turns[turn_id] = {
                 "turn_id": turn_id,
                 "lane": event["lane"],
@@ -157,17 +164,21 @@ class ReporterState:
                 if not active or active["peer_pid"] != peer_pid or active["turn_id"] != turn_id:
                     raise ValueError("work end does not match active owner")
                 del collection[work_id]
-        self._prune()
+        self.seen_events[event_id] = None
+        while len(self.seen_events) > max(1024, self.max_work * 2):
+            self.seen_events.popitem(last=False)
+        self._prune(float(now))
         return True
 
-    def _prune(self) -> None:
-        completed = [
+    def _prune(self, now: float) -> None:
+        expired = [
             turn_id
             for turn_id, turn in self.turns.items()
             if turn["completed_at"] is not None
+            and now - float(turn["completed_at"]) >= _POLICY_RETENTION_SECONDS
         ]
-        while len(self.turns) > self.max_turns and completed:
-            self.turns.pop(completed.pop(0), None)
+        for turn_id in expired:
+            self.turns.pop(turn_id, None)
 
     def reconcile(self, is_pid_alive: Callable[[int], bool], *, now: float) -> None:
         active_pids = {
@@ -318,9 +329,13 @@ def _read_proc_uid(status: Path) -> int | None:
             if line.startswith("Uid:"):
                 values = line.split()
                 return int(values[1])
-    except (OSError, ValueError, IndexError):
+    except FileNotFoundError:
         return None
-    return None
+    except OSError:
+        raise
+    except (ValueError, IndexError) as exc:
+        raise ValueError("malformed proc status") from exc
+    raise ValueError("missing proc uid")
 
 
 def discover_gateway_state(
@@ -332,20 +347,28 @@ def discover_gateway_state(
     try:
         children = list(proc_root.iterdir())
     except OSError:
-        return [], "dead"
+        return [], "unknown"
     for child in children:
         if not child.name.isdigit():
             continue
         try:
             raw = (child / "cmdline").read_bytes()
-        except OSError:
+        except FileNotFoundError:
             continue
+        except OSError:
+            return [], "unknown"
         args = [part.decode("utf-8", "replace") for part in raw.split(b"\0") if part]
         if "gateway" not in args or "run" not in args:
             continue
         if not any("hermes" in arg for arg in args):
             continue
-        if _read_proc_uid(child / "status") != expected_uid:
+        try:
+            process_uid = _read_proc_uid(child / "status")
+        except (OSError, ValueError):
+            return [], "unknown"
+        if process_uid is None:
+            continue
+        if process_uid != expected_uid:
             continue
         pids.append(int(child.name))
     pids.sort()
@@ -410,18 +433,17 @@ class QuiescenceReporter:
         source_sha: str,
         image_id: str,
         expected_hermes_uid: int,
-        sequence: int = 0,
         max_turns: int = 256,
     ) -> None:
         self.runtime_dir = runtime_dir
         self.socket_path = runtime_dir / "events.sock"
         self.state_path = runtime_dir / "reporter-state-v1.json"
         self.output_path = runtime_dir / "quiescence-v1.json"
+        self.producer_state_path = runtime_dir / "producer-state-v1.json"
         self.keyring = keyring
         self.source_sha = source_sha
         self.image_id = image_id
         self.expected_hermes_uid = expected_hermes_uid
-        self.sequence = sequence
         runtime_info = runtime_dir.lstat()
         if (
             runtime_dir.is_symlink()
@@ -431,6 +453,7 @@ class QuiescenceReporter:
         ):
             raise PermissionError("insecure reporter runtime directory")
         self.runtime_gid = runtime_info.st_gid
+        self.producer_epoch, self.sequence = self._load_or_create_producer_state()
         try:
             persisted = _secure_read(
                 self.state_path,
@@ -445,6 +468,89 @@ class QuiescenceReporter:
         else:
             self.state = ReporterState.from_payload(_strict_json_object(persisted))
         self._lock = threading.RLock()
+
+    def _load_or_create_producer_state(self) -> tuple[str, int]:
+        try:
+            raw = _secure_read(
+                self.producer_state_path,
+                expected_uid=os.getuid(),
+                expected_gid=self.runtime_gid,
+                file_mode=0o600,
+                parent_mode=0o750,
+                max_bytes=1024,
+            )
+        except FileNotFoundError:
+            if self.output_path.exists():
+                raise ValueError("producer state missing beside existing snapshot")
+            epoch = secrets.token_hex(16)
+            self.producer_epoch = epoch
+            self.sequence = 0
+            self._persist_producer_state()
+            return epoch, 0
+        payload = _strict_json_object(raw)
+        if (
+            set(payload) != {"schema_version", "producer_epoch", "sequence"}
+            or payload["schema_version"] != "hermes-rescue-producer-state-v1"
+            or type(payload["producer_epoch"]) is not str
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{32}", payload["producer_epoch"]
+            )
+            or type(payload["sequence"]) is not int
+            or not 0 <= payload["sequence"] <= (2**63 - 1)
+        ):
+            raise ValueError("corrupt producer state")
+        return str(payload["producer_epoch"]), int(payload["sequence"])
+
+    def _persist_producer_state(self) -> None:
+        atomic_write_secure(
+            self.producer_state_path,
+            json.dumps(
+                {
+                    "schema_version": "hermes-rescue-producer-state-v1",
+                    "producer_epoch": self.producer_epoch,
+                    "sequence": self.sequence,
+                },
+                sort_keys=True,
+                separators=(",", ":"),
+                allow_nan=False,
+            ).encode("ascii"),
+            mode=0o600,
+            expected_parent_uid=os.getuid(),
+            expected_parent_gid=self.runtime_gid,
+        )
+
+    def _invalidate_snapshot(self) -> None:
+        if os.name != "posix":
+            self.output_path.unlink(missing_ok=True)
+            return
+        parent_fd = os.open(
+            self.runtime_dir,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            try:
+                output_fd = os.open(
+                    self.output_path.name,
+                    os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0),
+                    dir_fd=parent_fd,
+                )
+            except FileNotFoundError:
+                return
+            try:
+                info = os.fstat(output_fd)
+                if (
+                    not stat.S_ISREG(info.st_mode)
+                    or info.st_nlink != 1
+                    or info.st_uid != os.getuid()
+                    or info.st_gid != self.runtime_gid
+                ):
+                    raise PermissionError("unsafe snapshot invalidation target")
+            finally:
+                os.close(output_fd)
+            os.unlink(self.output_path.name, dir_fd=parent_fd)
+            os.fsync(parent_fd)
+        finally:
+            os.close(parent_fd)
 
     def _persist_state(self) -> None:
         atomic_write_secure(
@@ -473,19 +579,35 @@ class QuiescenceReporter:
         if len(payload) > 8192:
             raise ValueError("event too large")
         event = _strict_json_object(payload)
+        event_now = time.time() if now is None else now
+        is_start = str(event.get("event", "")).endswith("_start")
         with self._lock:
             prior = ReporterState.from_payload(self.state.to_payload())
+            durably_persisted = False
             try:
                 changed = self.state.apply_event(
                     event,
                     peer_pid=peer_pid,
                     peer_uid=peer_uid,
-                    now=time.time() if now is None else now,
+                    now=event_now,
                 )
                 if changed:
+                    if is_start:
+                        self._invalidate_snapshot()
                     self._persist_state()
-            except Exception:
+                    durably_persisted = True
+                    if is_start:
+                        self.emit_snapshot(now=float(event_now))
+            except ReporterCapacityExhausted:
                 self.state = prior
+                self.state.telemetry_health = "degraded"
+                self._invalidate_snapshot()
+                self._persist_state()
+                self.emit_snapshot(now=float(event_now))
+                raise
+            except Exception:
+                if not durably_persisted:
+                    self.state = prior
                 raise
 
     def emit_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
@@ -496,10 +618,20 @@ class QuiescenceReporter:
             gateway_pids, gateway_state = discover_gateway_state(
                 expected_uid=self.expected_hermes_uid
             )
+            if gateway_state == "unknown":
+                self.state.telemetry_health = "degraded"
+                self._persist_state()
+            if self.sequence >= (2**63 - 1):
+                self.state.telemetry_health = "degraded"
+                self._persist_state()
+                self._invalidate_snapshot()
+                raise OverflowError("producer sequence exhausted")
             self.sequence += 1
+            self._persist_producer_state()
             active_turns, active_tools, active_providers = self.state.active_counts()
             unsigned = {
                 "schema_version": QUIESCENCE_SCHEMA_VERSION,
+                "producer_epoch": self.producer_epoch,
                 "sequence": self.sequence,
                 "timestamp": current,
                 "gateway_pids": gateway_pids,
@@ -709,19 +841,12 @@ def main() -> int:
         expected_uid=reporter_uid,
         expected_gid=runtime_gid,
     )
-    sequence = recover_snapshot_sequence(
-        args.runtime_dir / "quiescence-v1.json",
-        keyring=keyring,
-        expected_uid=reporter_uid,
-        expected_gid=runtime_gid,
-    )
     QuiescenceReporter(
         runtime_dir=args.runtime_dir,
         keyring=keyring,
         source_sha=source_sha,
         image_id=image_id,
         expected_hermes_uid=args.expected_hermes_uid,
-        sequence=sequence,
     ).serve()
     return 0
 

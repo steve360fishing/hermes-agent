@@ -256,11 +256,13 @@ def _check_stale_giveup(agent) -> None:
 def _rescue_account_provider_call(func):
     """Common provider request wrapper used by every interruptible API call."""
     @wraps(func)
-    def wrapper(agent, api_kwargs: dict):
+    def wrapper(agent, api_kwargs: dict, *args, **kwargs):
         from contextlib import nullcontext
         from agent.rescue_plane_core import get_rescue_telemetry_client
 
-        client = get_rescue_telemetry_client()
+        client = getattr(agent, "_rescue_telemetry_client", None)
+        if client is None:
+            client = get_rescue_telemetry_client()
         turn_id = str(getattr(agent, "_current_turn_id", None) or "unscoped")
         scope = (
             client.active_work("provider", turn_id=turn_id)
@@ -268,7 +270,28 @@ def _rescue_account_provider_call(func):
             else nullcontext()
         )
         with scope:
-            return func(agent, api_kwargs)
+            return func(agent, api_kwargs, *args, **kwargs)
+    return wrapper
+
+
+def _rescue_account_provider_worker(agent, func):
+    """Keep provider work active until the real daemon worker has exited."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        from contextlib import nullcontext
+        from agent.rescue_plane_core import get_rescue_telemetry_client
+
+        client = getattr(agent, "_rescue_telemetry_client", None)
+        if client is None:
+            client = get_rescue_telemetry_client()
+        turn_id = str(getattr(agent, "_current_turn_id", None) or "unscoped")
+        scope = (
+            client.active_work("provider", turn_id=turn_id)
+            if client is not None
+            else nullcontext()
+        )
+        with scope:
+            return func(*args, **kwargs)
     return wrapper
 
 
@@ -533,7 +556,10 @@ def interruptible_api_call(agent, api_kwargs: dict):
     _call_start = time.monotonic()
     agent._touch_activity("waiting for non-streaming API response")
 
-    t = threading.Thread(target=_call, daemon=True)
+    t = threading.Thread(
+        target=_rescue_account_provider_worker(agent, _call),
+        daemon=True,
+    )
     t.start()
     _poll_count = 0
     while t.is_alive():
@@ -1959,6 +1985,7 @@ def cleanup_task_resources(agent, task_id: str) -> None:
 
 
 
+@_rescue_account_provider_call
 def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=None):
     """Streaming variant of _interruptible_api_call for real-time token delivery.
 
@@ -2072,7 +2099,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
             except Exception as e:
                 result["error"] = e
 
-        t = threading.Thread(target=_bedrock_call, daemon=True)
+        t = threading.Thread(
+            target=_rescue_account_provider_worker(agent, _bedrock_call),
+            daemon=True,
+        )
         t.start()
         while t.is_alive():
             t.join(timeout=0.3)
@@ -3031,7 +3061,10 @@ def interruptible_streaming_api_call(agent, api_kwargs: dict, *, on_first_delta=
         if _reasoning_floor is not None:
             _stream_stale_timeout = max(_stream_stale_timeout, _reasoning_floor)
 
-    t = threading.Thread(target=_call, daemon=True)
+    t = threading.Thread(
+        target=_rescue_account_provider_worker(agent, _call),
+        daemon=True,
+    )
     t.start()
     _last_heartbeat = time.time()
     _HEARTBEAT_INTERVAL = 30.0  # seconds between gateway activity touches

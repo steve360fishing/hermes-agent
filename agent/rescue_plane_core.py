@@ -35,6 +35,7 @@ _OVERLAY_KEYS = frozenset(
 _SNAPSHOT_KEYS = frozenset(
     {
         "schema_version",
+        "producer_epoch",
         "key_id",
         "sequence",
         "timestamp",
@@ -290,6 +291,13 @@ def atomic_write_secure(
         fd = os.open(temporary_name, flags, mode, dir_fd=parent_fd)
         try:
             os.fchmod(fd, mode)
+            os.fchown(fd, -1, parent_stat.st_gid)
+            temporary_stat = os.fstat(fd)
+            if (
+                temporary_stat.st_uid != parent_stat.st_uid
+                or temporary_stat.st_gid != parent_stat.st_gid
+            ):
+                raise PermissionError("temporary output ownership")
             offset = 0
             while offset < len(data):
                 offset += os.write(fd, data[offset:])
@@ -317,7 +325,7 @@ def path_is_on_readonly_mount(
     mountinfo_path: Path = Path("/proc/self/mountinfo"),
 ) -> bool:
     """Require a non-root mountpoint whose effective mount options include ro."""
-    target = os.path.abspath(path)
+    target = os.path.realpath(os.path.abspath(path))
     best_mount = ""
     best_readonly = False
     try:
@@ -333,7 +341,7 @@ def path_is_on_readonly_mount(
         if len(fields) < 6 or len(right_fields) < 3:
             return False
         mountpoint = fields[4].replace("\\040", " ")
-        normalized = os.path.abspath(mountpoint)
+        normalized = os.path.realpath(os.path.abspath(mountpoint))
         if target != normalized and not target.startswith(normalized.rstrip(os.sep) + os.sep):
             continue
         if len(normalized) < len(best_mount):
@@ -452,6 +460,10 @@ def _strict_snapshot(snapshot: Any) -> tuple[bool, str]:
         return False, "malformed"
     if snapshot["schema_version"] != QUIESCENCE_SCHEMA_VERSION:
         return False, "malformed"
+    if type(snapshot["producer_epoch"]) is not str or not re.fullmatch(
+        r"[0-9a-f]{32}", snapshot["producer_epoch"]
+    ):
+        return False, "malformed"
     if type(snapshot["key_id"]) is not str or not re.fullmatch(
         r"[A-Za-z0-9_.-]{1,64}", snapshot["key_id"]
     ):
@@ -468,7 +480,7 @@ def _strict_snapshot(snapshot: Any) -> tuple[bool, str]:
         return False, "malformed"
     if any(type(pid) is not int or pid <= 0 for pid in pids) or len(set(pids)) != len(pids):
         return False, "malformed"
-    if snapshot["gateway_state"] not in {"active", "dead"}:
+    if snapshot["gateway_state"] not in {"active", "dead", "unknown"}:
         return False, "malformed"
     for name in (
         "active_turn_count",
@@ -550,6 +562,10 @@ def _verify_snapshot_signature(snapshot: Mapping[str, Any], keyring: KeyRing) ->
     return hmac.compare_digest(str(snapshot.get("signature", "")), expected)
 
 
+class ProducerEpochChanged(ValueError):
+    """The verifier is pinned to a different durable producer identity."""
+
+
 class DurableReplayState:
     """Mandatory durable monotonic sequence state for host-side verification."""
 
@@ -569,31 +585,38 @@ class DurableReplayState:
         )
 
     def _load(self) -> dict[str, Any]:
-        try:
-            if os.name == "posix":
-                assert self.expected_uid is not None
-                raw = _secure_read(
-                    self.path,
-                    expected_uid=self.expected_uid,
-                    expected_gid=self.expected_gid,
-                    file_mode=0o600,
-                    parent_mode=None,
-                    max_bytes=65_536,
-                )
-            else:
-                raw = self.path.read_bytes()
-        except FileNotFoundError:
-            return {
-                "schema_version": "hermes-rescue-replay-state-v1",
-                "last_sequence": 0,
-                "last_key_id": None,
-            }
+        if os.name == "posix":
+            assert self.expected_uid is not None
+            raw = _secure_read(
+                self.path,
+                expected_uid=self.expected_uid,
+                expected_gid=self.expected_gid,
+                file_mode=0o600,
+                parent_mode=None,
+                max_bytes=65_536,
+            )
+        else:
+            raw = self.path.read_bytes()
         payload = json.loads(raw)
         if (
             type(payload) is not dict
             or set(payload)
-            != {"schema_version", "last_sequence", "last_key_id"}
+            != {
+                "schema_version",
+                "producer_epoch",
+                "last_sequence",
+                "last_key_id",
+            }
             or payload["schema_version"] != "hermes-rescue-replay-state-v1"
+            or (
+                payload["producer_epoch"] is not None
+                and (
+                    type(payload["producer_epoch"]) is not str
+                    or not re.fullmatch(
+                        r"[0-9a-f]{32}", payload["producer_epoch"]
+                    )
+                )
+            )
             or type(payload["last_sequence"]) is not int
             or not 0 <= payload["last_sequence"] <= (2**63 - 1)
             or (
@@ -609,9 +632,73 @@ class DurableReplayState:
             raise ValueError("corrupt replay state")
         return payload
 
-    def accept(self, key_id: str, sequence: int) -> bool:
+    def initialize(self) -> None:
+        """Explicitly provision replay state once; never recreate missing state."""
+        initial = _canonical_json(
+            {
+                "schema_version": "hermes-rescue-replay-state-v1",
+                "producer_epoch": None,
+                "last_sequence": 0,
+                "last_key_id": None,
+            }
+        )
+        try:
+            self._load()
+            return
+        except FileNotFoundError:
+            pass
+        flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL
+        parent_fd = None
+        if os.name == "posix":
+            parent_fd = os.open(
+                self.path.parent,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            parent_info = os.fstat(parent_fd)
+            if (
+                not stat.S_ISDIR(parent_info.st_mode)
+                or stat.S_IMODE(parent_info.st_mode) & 0o022
+                or (
+                    self.expected_uid is not None
+                    and parent_info.st_uid != self.expected_uid
+                )
+                or (
+                    self.expected_gid is not None
+                    and parent_info.st_gid != self.expected_gid
+                )
+            ):
+                os.close(parent_fd)
+                raise PermissionError("insecure replay parent")
+            flags |= getattr(os, "O_NOFOLLOW", 0)
+            try:
+                fd = os.open(self.path.name, flags, 0o600, dir_fd=parent_fd)
+            except Exception:
+                os.close(parent_fd)
+                raise
+        else:
+            fd = os.open(self.path, flags, 0o600)
+        try:
+            if os.name == "posix":
+                os.fchmod(fd, 0o600)
+                if self.expected_gid is not None:
+                    os.fchown(fd, -1, self.expected_gid)
+            offset = 0
+            while offset < len(initial):
+                offset += os.write(fd, initial[offset:])
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+            if parent_fd is not None:
+                try:
+                    os.fsync(parent_fd)
+                finally:
+                    os.close(parent_fd)
+
+    def accept(self, producer_epoch: str, key_id: str, sequence: int) -> bool:
         if (
-            type(key_id) is not str
+            type(producer_epoch) is not str
+            or not re.fullmatch(r"[0-9a-f]{32}", producer_epoch)
+            or type(key_id) is not str
             or not re.fullmatch(r"[A-Za-z0-9_.-]{1,64}", key_id)
             or type(sequence) is not int
             or not 1 <= sequence <= (2**63 - 1)
@@ -673,8 +760,14 @@ class DurableReplayState:
                     raise
             try:
                 state = self._load()
+                if (
+                    state["producer_epoch"] is not None
+                    and state["producer_epoch"] != producer_epoch
+                ):
+                    raise ProducerEpochChanged
                 if sequence <= state["last_sequence"]:
                     return False
+                state["producer_epoch"] = producer_epoch
                 state["last_sequence"] = sequence
                 state["last_key_id"] = key_id
                 atomic_write_secure(
@@ -701,6 +794,8 @@ def validate_quiescence_snapshot(
     now: float,
     replay_state: DurableReplayState,
 ) -> QuiescenceValidation:
+    if not _finite_number(now):
+        return QuiescenceValidation(False, "invalid_verifier_time")
     valid, reason = _strict_snapshot(snapshot)
     if not valid:
         return QuiescenceValidation(False, reason)
@@ -713,8 +808,18 @@ def validate_quiescence_snapshot(
         return QuiescenceValidation(False, reason)
     if timestamp > now + 1 or now - timestamp >= 15:
         return QuiescenceValidation(False, "stale")
+    if snapshot["gateway_state"] == "unknown":
+        return QuiescenceValidation(False, "gateway_unknown")
+    if snapshot["telemetry_health"] != "healthy":
+        return QuiescenceValidation(False, "telemetry_degraded")
     try:
-        accepted = replay_state.accept(str(snapshot["key_id"]), int(snapshot["sequence"]))
+        accepted = replay_state.accept(
+            str(snapshot["producer_epoch"]),
+            str(snapshot["key_id"]),
+            int(snapshot["sequence"]),
+        )
+    except ProducerEpochChanged:
+        return QuiescenceValidation(False, "producer_epoch_changed")
     except (OSError, ValueError, json.JSONDecodeError):
         return QuiescenceValidation(False, "replay_state_unavailable")
     if not accepted:
