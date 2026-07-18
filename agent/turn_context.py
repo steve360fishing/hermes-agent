@@ -237,6 +237,20 @@ def build_turn_context(
         platform=getattr(agent, "platform", None),
     )
     agent._task_execution_contract = task_execution_contract
+    # Rescue telemetry is request-local and best-effort to persist. A failed
+    # telemetry write must never affect the user turn; a missing/stale report
+    # consequently blocks rescue mutation on the host side.
+    try:
+        from agent.rescue_plane_core import GLOBAL_RESCUE_TELEMETRY
+
+        GLOBAL_RESCUE_TELEMETRY.start_turn(
+            turn_id,
+            lane=task_execution_contract.lane,
+            artifact_requested=task_execution_contract.artifact_file_requested,
+        )
+        GLOBAL_RESCUE_TELEMETRY.write()
+    except OSError:
+        logger.warning("rescue turn telemetry unavailable", exc_info=True)
     set_contract = getattr(agent._tool_guardrails, "set_execution_contract", None)
     if callable(set_contract):
         set_contract(task_execution_contract)

@@ -252,6 +252,23 @@ def _check_stale_giveup(agent) -> None:
         )
 
 
+def _rescue_account_provider_call(func):
+    """Common provider request wrapper used by every interruptible API call."""
+    def wrapper(agent, api_kwargs: dict):
+        from agent.rescue_plane_core import GLOBAL_RESCUE_TELEMETRY
+
+        with GLOBAL_RESCUE_TELEMETRY.active_provider_action():
+            try:
+                return func(agent, api_kwargs)
+            finally:
+                try:
+                    GLOBAL_RESCUE_TELEMETRY.write()
+                except OSError:
+                    logger.warning("rescue provider telemetry unavailable", exc_info=True)
+    return wrapper
+
+
+@_rescue_account_provider_call
 def interruptible_api_call(agent, api_kwargs: dict):
     """
     Run the API call in a background thread so the main conversation loop

@@ -27,6 +27,7 @@ import asyncio
 import logging
 import threading
 import time
+from functools import wraps
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
@@ -1026,6 +1027,24 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
+def _rescue_account_tool_call(func):
+    """Single dispatcher boundary for all registry-backed tool work."""
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        from agent.rescue_plane_core import GLOBAL_RESCUE_TELEMETRY
+
+        with GLOBAL_RESCUE_TELEMETRY.active_tool():
+            try:
+                return func(*args, **kwargs)
+            finally:
+                try:
+                    GLOBAL_RESCUE_TELEMETRY.write()
+                except OSError:
+                    logger.warning("rescue tool telemetry unavailable", exc_info=True)
+    return wrapper
+
+
+@_rescue_account_tool_call
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],

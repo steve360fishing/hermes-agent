@@ -1,0 +1,7 @@
+#!/command/with-contenv sh
+# shellcheck shell=sh
+# Independent of the gateway process; deployment bind-mounts identity files.
+while :; do
+    /opt/hermes/.venv/bin/python -m agent.rescue_quiescence_reporter || true
+    sleep 10
+done
