@@ -59,6 +59,7 @@ MAX_OUTPUT_CHARS = 200_000      # 200KB rolling output buffer
 FINISHED_TTL_SECONDS = 1800     # Keep finished processes for 30 minutes
 MAX_PROCESSES = 64              # Max concurrent tracked processes (LRU pruning)
 MAX_ACTIVE_PROCESS_AGE = 86400  # 24h default — see session_reset.bg_process_max_age_hours (#29177)
+RESCUE_COMPLETION_PROOF_TIMEOUT_SECONDS = 30.0
 
 # Watch pattern rate limiting — PER SESSION.
 # Hard rule: at most ONE watch-match notification every WATCH_MIN_INTERVAL_SECONDS.
@@ -100,10 +101,11 @@ class ProcessSession:
     cwd: Optional[str] = None                   # Working directory
     started_at: float = 0.0                     # time.time() of spawn (wall clock)
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
+    process_group_id: Optional[int] = None      # POSIX group created for local background work
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
-    completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
-    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    completion_reason: str = "exited"           # exited|killed|lost|failed_start|launch_unknown|already_exited
+    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start|launch_unknown
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
@@ -137,6 +139,12 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _rescue_background_work: Any = field(default=None, repr=False)
+    _rescue_reconcile_started: bool = field(default=False, repr=False)
+    _pending_exit_code: Optional[int] = field(default=None, repr=False)
+    _pending_completion_reason: str = field(default="", repr=False)
+    _pending_termination_source: str = field(default="", repr=False)
+    _background_completion_proven: bool = field(default=False, repr=False)
 
 
 class ProcessRegistry:
@@ -205,6 +213,111 @@ class ProcessRegistry:
         # terminal tab. Distinct from kill — the process keeps running; only the
         # UI view is dropped (the user can reopen it from the status stack).
         self.on_close = None
+
+    @staticmethod
+    def _local_process_group_state(session: ProcessSession) -> str:
+        """Return ``active``, ``complete``, or ``unknown`` for local work.
+
+        ``complete`` is emitted only from the kernel's positive ESRCH proof.
+        Permission failures and unsupported platforms are unknown, never idle.
+        """
+        if _IS_WINDOWS or not session.process_group_id:
+            if session._rescue_background_work is None:
+                return "complete"
+            return "unknown"
+        try:
+            os.killpg(session.process_group_id, 0)  # windows-footgun: ok
+        except ProcessLookupError:
+            return "complete"
+        except (PermissionError, OSError):
+            return "unknown"
+        return "active"
+
+    @staticmethod
+    def _mark_rescue_background_unknown(session: ProcessSession) -> None:
+        token = session._rescue_background_work
+        if token is None:
+            return
+        try:
+            token.mark_unknown()
+        except Exception:
+            logger.exception(
+                "Failed to mark rescue background work unknown for %s",
+                session.id,
+            )
+
+    def _start_local_completion_reconciler(self, session: ProcessSession) -> None:
+        with session._lock:
+            if session._rescue_reconcile_started or session.exited:
+                return
+            session._rescue_reconcile_started = True
+        threading.Thread(
+            target=self._local_completion_reconciler,
+            args=(session,),
+            daemon=True,
+            name=f"proc-rescue-reconcile-{session.id}",
+        ).start()
+
+    def _local_completion_reconciler(self, session: ProcessSession) -> None:
+        """Retain active accounting until the entire POSIX group is absent."""
+        deadline = time.monotonic() + RESCUE_COMPLETION_PROOF_TIMEOUT_SECONDS
+        while True:
+            with session._lock:
+                if session.exited:
+                    return
+            state = self._local_process_group_state(session)
+            if state == "complete":
+                with session._lock:
+                    if session.exited:
+                        return
+                    session.exited = True
+                    session.exit_code = session._pending_exit_code
+                    session.completion_reason = (
+                        session._pending_completion_reason or "exited"
+                    )
+                    session.termination_source = session._pending_termination_source
+                self._move_to_finished_after_proof(session)
+                return
+            if state == "unknown" or time.monotonic() >= deadline:
+                # A proof timeout degrades telemetry but cannot authorize a
+                # false zero. Continue reconciling at a bounded low frequency.
+                self._mark_rescue_background_unknown(session)
+                delay = 1.0
+            else:
+                delay = 0.05
+            time.sleep(delay)
+
+    def _record_local_completion_candidate(
+        self,
+        session: ProcessSession,
+        *,
+        exit_code: Optional[int],
+        completion_reason: str,
+        termination_source: str = "",
+    ) -> None:
+        """Record direct-child completion, then require whole-group proof."""
+        with session._lock:
+            if session.exited:
+                return
+            session._pending_exit_code = exit_code
+            session._pending_completion_reason = completion_reason
+            session._pending_termination_source = termination_source
+        state = self._local_process_group_state(session)
+        if state == "complete":
+            with session._lock:
+                if session.exited:
+                    return
+                session.exited = True
+                session.exit_code = exit_code
+                session.completion_reason = completion_reason
+                session.termination_source = termination_source
+            self._move_to_finished_after_proof(session)
+            return
+        # The direct worker ended without whole-group completion proof. Even
+        # when descendants are positively alive, the original worker lifetime
+        # has become non-authoritative, so retain active and degrade.
+        self._mark_rescue_background_unknown(session)
+        self._start_local_completion_reconciler(session)
 
     @staticmethod
     def _clean_shell_noise(text: str) -> str:
@@ -706,9 +819,15 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        from agent.rescue_plane_core import begin_rescue_background_work
+
+        session._rescue_background_work = begin_rescue_background_work(
+            "terminal", session.id
+        )
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
+            pty_proc = None
             try:
                 if _IS_WINDOWS:
                     from winpty import PtyProcess as _PtyProcessCls
@@ -724,6 +843,7 @@ class ProcessRegistry:
                     dimensions=(30, 120),
                 )
                 session.pid = pty_proc.pid
+                session.process_group_id = pty_proc.pid if not _IS_WINDOWS else None
                 session.host_start_time = self._safe_host_start_time(session.pid)
                 # Store the pty handle on the session for read/write
                 session._pty = pty_proc
@@ -748,6 +868,21 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if pty_proc is not None:
+                    try:
+                        pty_proc.terminate(force=True)
+                        pty_proc.wait()
+                    except Exception:
+                        logger.exception(
+                            "PTY setup failed and process termination is unknown"
+                        )
+                    if self._local_process_group_state(session) == "complete":
+                        self._finish_rescue_background_work(session)
+                    else:
+                        self._mark_rescue_background_unknown(session)
+                    # Once a PTY child may have launched, never start a second
+                    # fallback worker unless whole-group completion is proven.
+                    raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -761,22 +896,27 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                [user_shell, "-lic", f"set +m; {command}"],
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except Exception:
+            self._finish_rescue_background_work(session)
+            raise
 
         session.process = proc
         session.pid = proc.pid
+        session.process_group_id = proc.pid if not _IS_WINDOWS else None
         session.host_start_time = self._safe_host_start_time(session.pid)
 
         try:
@@ -810,10 +950,19 @@ class ProcessRegistry:
                     proc.kill()
             except Exception:
                 pass
+            wait_succeeded = False
             try:
                 proc.wait(timeout=5)
+                wait_succeeded = True
             except Exception:
                 pass
+            if (
+                wait_succeeded
+                and self._local_process_group_state(session) == "complete"
+            ):
+                self._finish_rescue_background_work(session)
+            else:
+                self._mark_rescue_background_unknown(session)
             raise
 
         return session
@@ -848,6 +997,11 @@ class ProcessRegistry:
             env_ref=env,
             pid_scope="sandbox",
         )
+        from agent.rescue_plane_core import begin_rescue_background_work
+
+        session._rescue_background_work = begin_rescue_background_work(
+            "terminal", session.id
+        )
 
         # Run the command in the sandbox with output capture
         temp_dir = self._env_temp_dir(env)
@@ -859,11 +1013,17 @@ class ProcessRegistry:
         quoted_log_path = shlex.quote(log_path)
         quoted_pid_path = shlex.quote(pid_path)
         quoted_exit_path = shlex.quote(exit_path)
+        runner_command = (
+            f"bash -lc {quoted_command}; "
+            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path}; exit \"$rc\""
+        )
+        quoted_runner_command = shlex.quote(runner_command)
         bg_command = (
             f"mkdir -p {quoted_temp_dir} && "
-            f"( nohup bash -lc {quoted_command} > {quoted_log_path} 2>&1; "
-            f"rc=$?; printf '%s\\n' \"$rc\" > {quoted_exit_path} ) & "
-            f"echo $! > {quoted_pid_path} && cat {quoted_pid_path}"
+            f"{{ nohup setsid bash -lc {quoted_runner_command} "
+            f"> {quoted_log_path} 2>&1 < /dev/null & "
+            f"bg_pid=$!; printf '%s\\n' \"$bg_pid\" > {quoted_pid_path}; "
+            f"cat {quoted_pid_path}; }}"
         )
 
         try:
@@ -885,17 +1045,20 @@ class ProcessRegistry:
             if session.pid is None:
                 session.exited = True
                 session.exit_code = int(result.get("returncode", -1))
-                if session.exit_code == 0:
+                if session.exit_code != 0:
+                    session.completion_reason = "failed_start"
+                    session.termination_source = "failed_start"
+                else:
                     session.exit_code = -1
-                session.completion_reason = "failed_start"
-                session.termination_source = "failed_start"
+                    session.completion_reason = "launch_unknown"
+                    session.termination_source = "launch_unknown"
                 session.output_buffer = result.get("output", "").strip()
         except Exception as e:
             session.exited = True
             session.exit_code = -1
-            session.completion_reason = "failed_start"
-            session.termination_source = "failed_start"
-            session.output_buffer = f"Failed to start: {e}"
+            session.completion_reason = "launch_unknown"
+            session.termination_source = "launch_unknown"
+            session.output_buffer = f"Launch status unknown: {e}"
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
@@ -915,7 +1078,10 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
-
+        elif session.completion_reason == "failed_start":
+            self._finish_rescue_background_work(session)
+        else:
+            self._mark_rescue_background_unknown(session)
         return session
 
     # ----- Reader / Poller Threads -----
@@ -965,11 +1131,22 @@ class ProcessRegistry:
                 session.process.wait(timeout=5)
             except Exception as e:
                 logger.debug("Process wait timed out or failed: %s", e)
-            session.exited = True
-            if session.completion_reason != "killed":
-                session.exit_code = session.process.returncode
-                session.completion_reason = "exited"
-            self._move_to_finished(session)
+            return_code = session.process.returncode
+            if return_code is None:
+                self._mark_rescue_background_unknown(session)
+                self._start_local_completion_reconciler(session)
+                return
+            reason = (
+                session.completion_reason
+                if session.completion_reason == "killed"
+                else "exited"
+            )
+            self._record_local_completion_candidate(
+                session,
+                exit_code=return_code,
+                completion_reason=reason,
+                termination_source=session.termination_source,
+            )
 
     def _env_poller_loop(
         self, session: ProcessSession, env: Any, log_path: str, pid_path: str, exit_path: str
@@ -999,7 +1176,8 @@ class ProcessRegistry:
 
                 # Check if process is still running
                 check = env.execute(
-                    f"kill -0 \"$(cat {quoted_pid_path} 2>/dev/null)\" 2>/dev/null; echo $?",
+                    f"pgid=\"$(cat {quoted_pid_path} 2>/dev/null)\"; "
+                    f"kill -0 -- \"-$pgid\" 2>/dev/null; echo $?",
                     timeout=5,
                 )
                 check_output = check.get("output", "").strip()
@@ -1011,23 +1189,25 @@ class ProcessRegistry:
                     )
                     exit_str = exit_result.get("output", "").strip()
                     try:
-                        session.exit_code = int(exit_str.splitlines()[-1].strip())
+                        exit_code = int(exit_str.splitlines()[-1].strip())
                     except (ValueError, IndexError):
-                        session.exit_code = -1
+                        session.completion_reason = "backend_status_unknown"
+                        session.termination_source = "backend_status_unknown"
+                        self._mark_rescue_background_unknown(session)
+                        continue
+                    session.exit_code = exit_code
                     session.exited = True
                     if session.completion_reason != "killed":
                         session.completion_reason = "exited"
-                    self._move_to_finished(session)
+                    self._move_to_finished_after_proof(session)
                     return
 
             except Exception:
-                # Environment might be gone (sandbox reaped, etc.)
-                session.exited = True
-                session.exit_code = -1
-                session.completion_reason = "lost"
-                session.termination_source = "backend_lost"
-                self._move_to_finished(session)
-                return
+                # Backend loss is not proof that the job stopped. Retain the
+                # active reporter record and keep attempting reconciliation.
+                session.completion_reason = "backend_status_unknown"
+                session.termination_source = "backend_status_unknown"
+                self._mark_rescue_background_unknown(session)
 
     def _pty_reader_loop(self, session: ProcessSession):
         """Background thread: read output from a PTY process."""
@@ -1052,15 +1232,30 @@ class ProcessRegistry:
         except Exception as e:
             logger.debug("PTY stdout reader ended: %s", e)
 
-        # Process exited
+        # Direct PTY child exited; descendants may still share its process group.
         try:
             pty.wait()
         except Exception as e:
             logger.debug("PTY wait timed out or failed: %s", e)
-        session.exited = True
-        if session.completion_reason != "killed":
-            session.exit_code = pty.exitstatus if hasattr(pty, 'exitstatus') else -1
-            session.completion_reason = "exited"
+        exit_code = getattr(pty, "exitstatus", None)
+        if exit_code is None:
+            self._mark_rescue_background_unknown(session)
+            self._start_local_completion_reconciler(session)
+            return
+        reason = (
+            session.completion_reason
+            if session.completion_reason == "killed"
+            else "exited"
+        )
+        self._record_local_completion_candidate(
+            session,
+            exit_code=exit_code,
+            completion_reason=reason,
+            termination_source=session.termination_source,
+        )
+
+    def _move_to_finished_after_proof(self, session: ProcessSession) -> None:
+        session._background_completion_proven = True
         self._move_to_finished(session)
 
     def _move_to_finished(self, session: ProcessSession):
@@ -1075,6 +1270,8 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+        if session._background_completion_proven:
+            self._finish_rescue_background_work(session)
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1092,6 +1289,20 @@ class ProcessRegistry:
                 "termination_source": session.termination_source,
                 "output": output_tail,
             })
+
+    @staticmethod
+    def _finish_rescue_background_work(session: ProcessSession) -> None:
+        token = session._rescue_background_work
+        if token is None:
+            return
+        try:
+            token.finish()
+        except Exception:
+            # A missing ACK must retain the reporter's active record. Process
+            # cleanup still completes locally, while rescue remains degraded.
+            logger.exception(
+                "Failed to close rescue background work for %s", session.id
+            )
 
     # ----- Query Methods -----
 
@@ -1276,16 +1487,21 @@ class ProcessRegistry:
                 session.output_buffer += drained
                 if len(session.output_buffer) > session.max_output_chars:
                     session.output_buffer = session.output_buffer[-session.max_output_chars:]
-            session.exited = True
-            if session.completion_reason != "killed":
-                session.exit_code = rc
-                session.completion_reason = "exited"
         logger.info(
             "Reconciled session %s: direct child exited with code %s but reader "
-            "was still blocked (orphaned pipe). Flipped to exited.",
+            "was still blocked (orphaned pipe). Verifying its process group.",
             session.id, rc,
         )
-        self._move_to_finished(session)
+        self._record_local_completion_candidate(
+            session,
+            exit_code=rc,
+            completion_reason=(
+                session.completion_reason
+                if session.completion_reason == "killed"
+                else "exited"
+            ),
+            termination_source=session.termination_source,
+        )
 
     def poll(self, session_id: str) -> dict:
         """Check status and get new output for a background process."""
@@ -1470,14 +1686,42 @@ class ProcessRegistry:
                 except Exception:
                     if session.pid:
                         os.kill(session.pid, signal.SIGTERM)
+                session.completion_reason = "killed"
+                session.termination_source = source
+                self._record_local_completion_candidate(
+                    session,
+                    exit_code=-15,
+                    completion_reason="killed",
+                    termination_source=source,
+                )
             elif session.process:
                 # Local process -- kill the process tree. On Windows this
                 # must be taskkill /T /F; Popen.terminate() only kills the
                 # shell wrapper and leaves Git Bash descendants behind.
                 self._terminate_host_pid(session.process.pid, session.host_start_time)
+                session.completion_reason = "killed"
+                session.termination_source = source
+                self._record_local_completion_candidate(
+                    session,
+                    exit_code=-15,
+                    completion_reason="killed",
+                    termination_source=source,
+                )
             elif session.env_ref and session.pid:
                 # Non-local -- kill inside sandbox
-                session.env_ref.execute(f"kill {session.pid} 2>/dev/null", timeout=5)
+                session.env_ref.execute(
+                    f"kill -- -{session.pid} 2>/dev/null",
+                    timeout=5,
+                )
+                session.completion_reason = "termination_unknown"
+                session.termination_source = source
+                self._mark_rescue_background_unknown(session)
+                return {
+                    "status": "termination_pending",
+                    "session_id": session.id,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                }
             elif session.detached and session.pid_scope == "host" and session.pid:
                 # Identity check, not bare liveness: if the PID is gone OR was
                 # recycled onto an unrelated process, treat our process as
@@ -1486,12 +1730,17 @@ class ProcessRegistry:
                     with session._lock:
                         session.exited = True
                         session.exit_code = None
-                    self._move_to_finished(session)
+                    self._move_to_finished_after_proof(session)
                     return {
                         "status": "already_exited",
                         "exit_code": session.exit_code,
                     }
                 self._terminate_host_pid(session.pid, session.host_start_time)
+                session.exited = True
+                session.exit_code = -15
+                session.completion_reason = "killed"
+                session.termination_source = source
+                self._move_to_finished_after_proof(session)
             else:
                 return {
                     "status": "error",
@@ -1500,12 +1749,15 @@ class ProcessRegistry:
                         "its original runtime handle is no longer available"
                     ),
                 }
-            session.exited = True
-            session.exit_code = -15  # SIGTERM
-            session.completion_reason = "killed"
-            session.termination_source = source
-            self._move_to_finished(session)
             self._write_checkpoint()
+            if not session.exited:
+                self._mark_rescue_background_unknown(session)
+                return {
+                    "status": "termination_pending",
+                    "session_id": session.id,
+                    "completion_reason": session.completion_reason,
+                    "termination_source": session.termination_source,
+                }
             return {
                 "status": "killed",
                 "session_id": session.id,
@@ -2121,6 +2373,8 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "marked lost because the process backend disappeared"
     elif _reason == "failed_start":
         _status = "failed to start"
+    elif _reason == "launch_unknown":
+        _status = "has unknown launch state"
     elif _exit == 0:
         _status = "completed normally"
     else:

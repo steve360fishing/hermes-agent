@@ -723,6 +723,8 @@ class TestSpawnEnvSanitization:
         assert "/data/data/com.termux/files/usr/tmp/hermes_bg_" in bg_command
         assert ".exit" in bg_command
         assert "rc=$?;" in bg_command
+        assert "nohup setsid bash -lc" in bg_command
+        assert "bg_pid=$!" in bg_command
         assert " > /tmp/hermes_bg_" not in bg_command
         assert "cat /tmp/hermes_bg_" not in bg_command
         fake_thread.start.assert_called_once()
@@ -803,7 +805,10 @@ class TestSpawnEnvSanitization:
             )
 
         assert env.commands[0][0] == "cat '/path with spaces/hermes_bg.log' 2>/dev/null"
-        assert env.commands[1][0] == "kill -0 \"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\" 2>/dev/null; echo $?"
+        assert env.commands[1][0] == (
+            "pgid=\"$(cat '/path with spaces/hermes_bg.pid' 2>/dev/null)\"; "
+            "kill -0 -- \"-$pgid\" 2>/dev/null; echo $?"
+        )
         assert env.commands[2][0] == "cat '/path with spaces/hermes_bg.exit' 2>/dev/null"
 
 

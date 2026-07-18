@@ -1,0 +1,18 @@
+{
+  "fixture_id": "HERMES-ARTIFACT-STICKY-20260717-v1",
+  "schema_version": "hermes-rescue-artifact-replay-v1",
+  "turns": [
+    {
+      "artifact_requested": false,
+      "filesystem_artifact_observed": true,
+      "lane": "normal",
+      "turn_id": "sanitized-turn-001"
+    },
+    {
+      "artifact_requested": false,
+      "delivery_receipt_artifact_observed": true,
+      "lane": "normal",
+      "turn_id": "sanitized-turn-002"
+    }
+  ]
+}

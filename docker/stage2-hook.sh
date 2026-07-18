@@ -104,15 +104,60 @@ validate_uid_gid() {
 HERMES_UID="${HERMES_UID:-${PUID:-}}"
 HERMES_GID="${HERMES_GID:-${PGID:-}}"
 
+if [ -n "${HERMES_UID:-}" ] && [ "$HERMES_UID" = "$(id -u hermes-rescue)" ]; then
+    echo "[stage2] Fatal: requested Hermes UID collides with hermes-rescue reporter UID" >&2
+    exit 1
+fi
+if [ -n "${HERMES_GID:-}" ] && validate_uid_gid "$HERMES_GID" && \
+        [ "$HERMES_GID" = "$(id -g hermes-rescue)" ]; then
+    echo "[stage2] Fatal: requested Hermes GID collides with hermes-rescue reporter GID" >&2
+    exit 1
+fi
+
 if [ -n "${HERMES_UID:-}" ] && validate_uid_gid "$HERMES_UID" && [ "$HERMES_UID" != "$(id -u hermes)" ]; then
     echo "[stage2] Changing hermes UID to $HERMES_UID"
     usermod -u "$HERMES_UID" hermes
 fi
+
 if [ -n "${HERMES_GID:-}" ] && validate_uid_gid "$HERMES_GID" && [ "$HERMES_GID" != "$(id -g hermes)" ]; then
     echo "[stage2] Changing hermes GID to $HERMES_GID"
     # -o allows non-unique GID (e.g. macOS GID 20 "staff" may already
     # exist as "dialout" in the Debian-based container image).
     groupmod -o -g "$HERMES_GID" hermes 2>/dev/null || true
+fi
+
+# Reporter-owned writable runtime. Hermes gets socket-connect access through
+# its group only; it cannot write aggregate state or signed snapshots.
+if [ -L /run/hermes-rescue-reporter ] || \
+        { [ -e /run/hermes-rescue-reporter ] && [ ! -d /run/hermes-rescue-reporter ]; }; then
+    echo "[stage2] Fatal: rescue runtime path is not a real directory" >&2
+    exit 1
+fi
+install -d -o hermes-rescue -g hermes -m 0750 /run/hermes-rescue-reporter
+
+# Durable reporter identity, aggregate continuity, and opt-in marker. Once a
+# rescue key has configured telemetry, the marker remains across reporter and
+# /run restarts so Hermes cannot silently fall back to unaccounted execution.
+RESCUE_CONTINUITY_DIR=/var/lib/hermes-rescue
+RESCUE_REQUIRED_MARKER="$RESCUE_CONTINUITY_DIR/telemetry-required-v1.json"
+install -d -o hermes-rescue -g hermes -m 0750 "$RESCUE_CONTINUITY_DIR"
+if [ -L "$RESCUE_REQUIRED_MARKER" ] || \
+        { [ -e "$RESCUE_REQUIRED_MARKER" ] && [ ! -f "$RESCUE_REQUIRED_MARKER" ]; }; then
+    echo "[stage2] Fatal: rescue telemetry marker is not a regular file" >&2
+    exit 1
+fi
+if [ -f /run/hermes-rescue-secrets/hmac-current ] && \
+        [ ! -e "$RESCUE_REQUIRED_MARKER" ]; then
+    marker_tmp="$(mktemp "$RESCUE_CONTINUITY_DIR/.telemetry-required.XXXXXX")"
+    printf '%s' '{"required":true,"schema_version":"hermes-rescue-telemetry-required-v1"}' \
+        > "$marker_tmp"
+    chown hermes-rescue:hermes "$marker_tmp"
+    chmod 0440 "$marker_tmp"
+    mv "$marker_tmp" "$RESCUE_REQUIRED_MARKER"
+fi
+if [ -e "$RESCUE_REQUIRED_MARKER" ]; then
+    chown hermes-rescue:hermes "$RESCUE_REQUIRED_MARKER"
+    chmod 0440 "$RESCUE_REQUIRED_MARKER"
 fi
 
 # --- Docker socket group membership (docker-in-docker / DooD) ---

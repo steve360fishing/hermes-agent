@@ -2387,13 +2387,25 @@ def terminal_tool(
                         session_key=session_key,
                     )
 
-                result_data = {
-                    "output": "Background process started",
-                    "session_id": proc_session.id,
-                    "pid": proc_session.pid,
-                    "exit_code": 0,
-                    "error": None,
-                }
+                if getattr(proc_session, "completion_reason", "exited") == "launch_unknown":
+                    result_data = {
+                        "output": proc_session.output_buffer,
+                        "session_id": proc_session.id,
+                        "pid": None,
+                        "exit_code": -1,
+                        "error": (
+                            "Background launch status is unknown; rescue "
+                            "accounting remains active and quiescence is blocked."
+                        ),
+                    }
+                else:
+                    result_data = {
+                        "output": "Background process started",
+                        "session_id": proc_session.id,
+                        "pid": proc_session.pid,
+                        "exit_code": 0,
+                        "error": None,
+                    }
                 # Background spawns detached and returns exit_code 0 immediately;
                 # it never inline-polls is_interrupted(), so the stale-bit kill
                 # cannot occur here and this note never co-occurs with rc=130.

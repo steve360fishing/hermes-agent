@@ -395,3 +395,68 @@ async def test_command_hook_rewrite_routes_to_plugin(monkeypatch):
     # First emit_collect fires on the original command; after rewrite the
     # dispatcher does NOT re-fire for the new command (one decision per turn).
     assert call_log == ["command:status"]
+
+
+@pytest.mark.asyncio
+async def test_gateway_plugin_slash_tool_dispatch_fails_before_handler_on_outage(
+    monkeypatch,
+):
+    import agent.rescue_plane_core as core
+    import gateway.run as gateway_run
+    from hermes_cli import plugins as plugins_mod
+    from hermes_cli.plugins import PluginContext, PluginManager, PluginManifest
+    from tools.registry import registry
+
+    runner = _make_runner()
+    runner._run_agent = AsyncMock(
+        side_effect=AssertionError("failed plugin command leaked to the agent")
+    )
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "***"}
+    )
+    entered = []
+    registry.register(
+        name="_test_gateway_required_probe",
+        toolset="debugging",
+        schema={
+            "name": "_test_gateway_required_probe",
+            "description": "probe",
+            "parameters": {"type": "object", "properties": {}},
+        },
+        handler=lambda _args, **_kwargs: entered.append(True) or "{}",
+    )
+    ctx = PluginContext(
+        PluginManifest(name="gateway-test-plugin", source="user"),
+        PluginManager(),
+    )
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_commands",
+        lambda: {"telemetry-probe": {"description": "probe"}},
+    )
+    monkeypatch.setattr(
+        plugins_mod,
+        "get_plugin_command_handler",
+        lambda name: (
+            lambda _args: ctx.dispatch_tool(
+                "_test_gateway_required_probe",
+                {},
+                turn_id="turn-gateway-plugin-outage",
+            )
+        )
+        if name == "telemetry-probe"
+        else None,
+    )
+    monkeypatch.setattr(
+        core,
+        "get_rescue_telemetry_client",
+        lambda: (_ for _ in ()).throw(
+            core.RescueTelemetryUnavailable("required reporter outage")
+        ),
+    )
+    try:
+        result = await runner._handle_message(_make_event("/telemetry-probe"))
+        assert entered == []
+        assert "unknown command" in result.lower()
+    finally:
+        registry.deregister("_test_gateway_required_probe")

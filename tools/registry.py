@@ -608,31 +608,38 @@ class ToolRegistry:
         * Async handlers are bridged automatically via ``_run_async()``.
         * Handler results are normalized to a string or supported multimodal
           envelope before leaving the registry.
-        * All exceptions are caught and returned as ``{"error": "..."}``
-          for consistent error format.
+        * Handler exceptions are caught and returned as ``{"error": "..."}``.
+          Required rescue-telemetry failures propagate before handler entry.
         """
-        entry = self.get_entry(name)
-        if not entry:
-            return json.dumps({"error": f"Unknown tool: {name}"})
-        try:
-            if entry.is_async:
-                from model_tools import _run_async
-                result = _run_async(entry.handler(args, **kwargs))
-            else:
-                result = entry.handler(args, **kwargs)
-            return self._normalize_handler_result(name, result)
-        except Exception as e:
-            logger.exception("Tool %s dispatch error: %s", name, e)
-            # Route through the sanitizer so framing tokens / CDATA / fences
-            # in exception strings don't reach the model as structural noise.
-            # See model_tools._sanitize_tool_error for rationale.
-            raw = f"Tool execution failed: {type(e).__name__}: {e}"
+        from agent.rescue_plane_core import rescue_tool_execution_scope
+
+        # This is the lowest common entry point for registry tools, including
+        # PluginContext and gateway slash commands. Keep the rescue boundary
+        # outside the handler exception sanitizer so a required-reporter outage
+        # fails closed rather than becoming a model-visible tool error.
+        with rescue_tool_execution_scope(str(kwargs.get("turn_id") or "unscoped")):
+            entry = self.get_entry(name)
+            if not entry:
+                return json.dumps({"error": f"Unknown tool: {name}"})
             try:
-                from model_tools import _sanitize_tool_error
-                sanitized = _sanitize_tool_error(raw)
-            except Exception:
-                sanitized = raw  # defensive: never let the sanitizer block error propagation
-            return json.dumps({"error": sanitized})
+                if entry.is_async:
+                    from model_tools import _run_async
+                    result = _run_async(entry.handler(args, **kwargs))
+                else:
+                    result = entry.handler(args, **kwargs)
+                return self._normalize_handler_result(name, result)
+            except Exception as e:
+                logger.exception("Tool %s dispatch error: %s", name, e)
+                # Route through the sanitizer so framing tokens / CDATA / fences
+                # in exception strings don't reach the model as structural noise.
+                # See model_tools._sanitize_tool_error for rationale.
+                raw = f"Tool execution failed: {type(e).__name__}: {e}"
+                try:
+                    from model_tools import _sanitize_tool_error
+                    sanitized = _sanitize_tool_error(raw)
+                except Exception:
+                    sanitized = raw  # defensive: never let the sanitizer block error propagation
+                return json.dumps({"error": sanitized})
 
     # ------------------------------------------------------------------
     # Query helpers  (replace redundant dicts in model_tools.py)

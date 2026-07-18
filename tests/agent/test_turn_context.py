@@ -9,6 +9,7 @@ confirm the prologue produces the right ``TurnContext`` and applies the
 from __future__ import annotations
 
 import logging
+import os
 import types
 from unittest.mock import MagicMock, patch
 
@@ -179,6 +180,33 @@ def test_returns_turn_context_with_user_message_appended():
     assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
+
+
+@pytest.mark.skipif(os.name == "nt", reason="Linux rescue telemetry boundary")
+def test_required_telemetry_restart_gap_blocks_new_turn(
+    monkeypatch,
+    tmp_path,
+):
+    import agent.rescue_plane_core as core
+
+    continuity = tmp_path / "continuity"
+    continuity.mkdir(mode=0o750)
+    continuity.chmod(0o750)
+    marker = continuity / "telemetry-required-v1.json"
+    marker.write_text(
+        '{"required":true,"schema_version":'
+        '"hermes-rescue-telemetry-required-v1"}',
+        encoding="ascii",
+    )
+    marker.chmod(0o440)
+    monkeypatch.setattr(core, "RESCUE_TELEMETRY_REQUIRED_PATH", marker, raising=False)
+    monkeypatch.setattr(core, "RESCUE_REPORTER_UID", os.getuid(), raising=False)
+    monkeypatch.setattr(core, "RESCUE_EVENT_SOCKET_PATH", tmp_path / "restart-gap.sock")
+    agent = _FakeAgent()
+
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        _build(agent)
+    assert agent._tool_guardrails.reset_called is False
 
 
 def test_subsequent_normal_turn_expires_stale_artifact_contract():

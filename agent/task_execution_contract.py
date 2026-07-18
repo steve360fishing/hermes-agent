@@ -519,9 +519,18 @@ def build_task_execution_contract(
         affirmative_text
     )
     lane, reason = _classify(trusted_text, file_requested=file_requested)
-    if lane == ARTIFACT_ONLY and _artifact_only_disabled():
-        lane = NORMAL
-        reason = "artifact_only_disabled"
+    if lane == ARTIFACT_ONLY:
+        if _artifact_only_disabled():
+            lane = NORMAL
+            reason = "artifact_only_disabled"
+        else:
+            # The rescue overlay is read afresh for every request. It never
+            # mutates config and therefore cannot persist into a later turn.
+            from agent.rescue_plane_core import rescue_overlay_disables_artifact_only
+
+            if rescue_overlay_disables_artifact_only():
+                lane = NORMAL
+                reason = "artifact_only_disabled_by_rescue_overlay"
     output_path = ""
     artifact_root = ""
     artifact_route = "none"

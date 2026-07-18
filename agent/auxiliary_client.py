@@ -43,6 +43,7 @@ Payment / credit exhaustion fallback:
 import contextlib
 from copy import deepcopy
 from dataclasses import dataclass, field
+from functools import wraps
 import json
 import logging
 import os
@@ -6871,6 +6872,41 @@ def _obj_get(obj: Any, key: str, default: Any = None) -> Any:
     return value
 
 
+def _rescue_account_auxiliary_provider(func):
+    @wraps(func)
+    def wrapper(*args, **kwargs):
+        from contextlib import nullcontext
+        from agent.rescue_plane_core import get_rescue_telemetry_client
+
+        client = get_rescue_telemetry_client()
+        scope = (
+            client.active_work("provider", turn_id="auxiliary")
+            if client is not None
+            else nullcontext()
+        )
+        with scope:
+            return func(*args, **kwargs)
+    return wrapper
+
+
+def _rescue_account_async_auxiliary_provider(func):
+    @wraps(func)
+    async def wrapper(*args, **kwargs):
+        from contextlib import nullcontext
+        from agent.rescue_plane_core import get_rescue_telemetry_client
+
+        client = get_rescue_telemetry_client()
+        scope = (
+            client.active_work("provider", turn_id="auxiliary")
+            if client is not None
+            else nullcontext()
+        )
+        with scope:
+            return await func(*args, **kwargs)
+    return wrapper
+
+
+@_rescue_account_auxiliary_provider
 def call_llm(
     task: str = None,
     *,
@@ -7649,6 +7685,7 @@ def extract_content_or_reasoning(response) -> str:
     return ""
 
 
+@_rescue_account_async_auxiliary_provider
 async def async_call_llm(
     task: str = None,
     *,

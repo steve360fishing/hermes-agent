@@ -268,6 +268,17 @@ def dispatch_async_delegation(
             }
         _records[delegation_id] = record
 
+    try:
+        from agent.rescue_plane_core import begin_rescue_background_work
+
+        record["_rescue_background_work"] = begin_rescue_background_work(
+            "delegation", delegation_id
+        )
+    except Exception:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        raise
+
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -296,6 +307,7 @@ def dispatch_async_delegation(
     except Exception as exc:  # pragma: no cover — pool submit failure is rare
         with _records_lock:
             _records.pop(delegation_id, None)
+        _finish_rescue_background_work(record)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation: {exc}",
@@ -321,7 +333,23 @@ def _finalize(delegation_id: str, result: Dict[str, Any], status: str) -> None:
         event_record = dict(record)
         _prune_completed_locked()
 
+    _finish_rescue_background_work(event_record)
     _push_completion_event(event_record, result, status)
+
+
+def _finish_rescue_background_work(record: Dict[str, Any]) -> None:
+    token = record.get("_rescue_background_work")
+    if token is None:
+        return
+    try:
+        token.finish()
+    except Exception:
+        # Reporter retains the active record when an end event cannot be
+        # acknowledged; local completion processing must still finish.
+        logger.exception(
+            "Failed to close rescue background work for %s",
+            record.get("delegation_id"),
+        )
 
 
 def _push_completion_event(
@@ -463,6 +491,17 @@ def dispatch_async_delegation_batch(
             }
         _records[delegation_id] = record
 
+    try:
+        from agent.rescue_plane_core import begin_rescue_background_work
+
+        record["_rescue_background_work"] = begin_rescue_background_work(
+            "delegation", delegation_id
+        )
+    except Exception:
+        with _records_lock:
+            _records.pop(delegation_id, None)
+        raise
+
     executor = _get_executor(max_async_children)
 
     def _worker() -> None:
@@ -496,6 +535,7 @@ def dispatch_async_delegation_batch(
     except Exception as exc:  # pragma: no cover
         with _records_lock:
             _records.pop(delegation_id, None)
+        _finish_rescue_background_work(record)
         return {
             "status": "rejected",
             "error": f"Failed to schedule async delegation batch: {exc}",
@@ -522,6 +562,7 @@ def _finalize_batch(
         event_record = dict(record)
         _prune_completed_locked()
 
+    _finish_rescue_background_work(event_record)
     try:
         from tools.process_registry import process_registry
     except Exception as exc:  # pragma: no cover
@@ -569,11 +610,15 @@ def _finalize_batch(
 def list_async_delegations() -> List[Dict[str, Any]]:
     """Snapshot of async delegations (running + recently completed).
 
-    Safe to call from any thread. Excludes the non-serialisable interrupt_fn.
+    Safe to call from any thread. Excludes non-serialisable internal handles.
     """
     with _records_lock:
         return [
-            {k: v for k, v in r.items() if k != "interrupt_fn"}
+            {
+                k: v
+                for k, v in r.items()
+                if k not in {"interrupt_fn", "_rescue_background_work"}
+            }
             for r in _records.values()
         ]
 

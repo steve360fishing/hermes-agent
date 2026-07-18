@@ -237,6 +237,22 @@ def build_turn_context(
         platform=getattr(agent, "platform", None),
     )
     agent._task_execution_contract = task_execution_contract
+    from agent.rescue_plane_core import get_rescue_telemetry_client
+
+    rescue_client = get_rescue_telemetry_client()
+    agent._rescue_telemetry_client = rescue_client
+    if rescue_client is not None:
+        # Once the independent reporter is opted in, the authenticated start
+        # event must be durably acknowledged before provider or tool work.
+        rescue_client.emit(
+            {
+                "event": "turn_start",
+                "event_id": uuid.uuid4().hex,
+                "turn_id": turn_id,
+                "lane": task_execution_contract.lane,
+                "artifact_requested": task_execution_contract.artifact_file_requested,
+            }
+        )
     set_contract = getattr(agent._tool_guardrails, "set_execution_contract", None)
     if callable(set_contract):
         set_contract(task_execution_contract)

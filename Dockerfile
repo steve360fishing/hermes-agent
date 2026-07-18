@@ -88,8 +88,11 @@ RUN set -eu; \
     # ENTRYPOINT. Safe to drop once the affected catalogs are updated.\
     ln -sf /init /usr/bin/tini
 
-# Non-root user for runtime; UID can be overridden via HERMES_UID at runtime
-RUN useradd -u 10000 -m -d /opt/data hermes
+# Non-root users for runtime and the independent rescue reporter. Hermes may
+# be UID-remapped at boot; the reporter remains fixed and owns only /run state.
+RUN useradd -u 10000 -m -d /opt/data hermes && \
+    useradd -u 10001 -M -d /nonexistent -s /usr/sbin/nologin hermes-rescue && \
+    usermod -aG hermes hermes-rescue
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
 
@@ -260,6 +263,8 @@ LABEL org.opencontainers.image.revision="${HERMES_GIT_SHA}"
 # /run/service/ (tmpfs) and are reconciled on container restart by
 # /etc/cont-init.d/02-reconcile-profiles (Phase 4 Task 4.0).
 COPY docker/s6-rc.d/ /etc/s6-overlay/s6-rc.d/
+RUN chmod 0755 /etc/s6-overlay/s6-rc.d/rescue-quiescence-reporter/run \
+    /etc/s6-overlay/s6-rc.d/rescue-quiescence-reporter/finish
 
 # stage2-hook handles UID/GID remap, volume chown, config seeding,
 # skills sync — all the work the old entrypoint.sh did before

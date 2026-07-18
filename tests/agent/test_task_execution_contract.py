@@ -132,6 +132,35 @@ def test_common_direct_artifact_requests_remain_supported(message):
     assert _contract(message).lane == ARTIFACT_ONLY
 
 
+def test_normal_txt_normal_sequence_has_no_sticky_lane(
+    monkeypatch,
+    tmp_path,
+):
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"agent": {"artifact_only_enabled": True}},
+    )
+
+    before = _contract(
+        "Inspect the runtime status and investigate any failures.",
+        task_id="normal-before",
+    )
+    txt = _contract(
+        "Create and deliver recovery.txt containing safe text.",
+        task_id="txt-middle",
+    )
+    after = _contract("Continue with normal analysis.", task_id="normal-after")
+
+    assert [before.lane, txt.lane, after.lane] == [
+        NORMAL,
+        ARTIFACT_ONLY,
+        NORMAL,
+    ]
+    assert after.artifact_output_path == ""
+    assert after.artifact_file_requested is False
+
+
 @pytest.mark.parametrize(
     "separator",
     [

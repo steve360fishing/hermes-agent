@@ -2661,6 +2661,48 @@
     },
     {
       "id": "gateway/status.py:safe_mode_transport_readiness", "contract": "safe_mode", "role": "enforcement", "path": "gateway/status.py", "symbol": "safe_mode_transport_readiness", "disposition": "covered", "rationale": "This readiness boundary reports safe mode ready only after the bundled Telegram recovery transport is connected and has current receive-path evidence."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:SafeModeOverlay", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_plane_core.py", "symbol": "SafeModeOverlay", "disposition": "reviewed_exclusion", "rationale": "Class container inherits artifact-only request-token discovery from its concrete fail-closed property and parser helpers."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:SafeModeOverlay.disables_artifact_only", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_plane_core.py", "symbol": "SafeModeOverlay.disables_artifact_only", "disposition": "covered", "rationale": "Invalid overlays and artifact-only directives resolve to a restrictive artifact request boundary."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:__module__", "contract": "safe_mode", "role": "lifecycle", "path": "agent/rescue_plane_core.py", "symbol": "__module__", "disposition": "reviewed_exclusion", "rationale": "Module constants define the rescue overlay schema and path but do not start or retain a session lifecycle."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:_invalid_overlay", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_plane_core.py", "symbol": "_invalid_overlay", "disposition": "covered", "rationale": "Malformed overlay input is converted to an artifact-only request restriction rather than permitting execution."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:_validate_policy_evidence", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_plane_core.py", "symbol": "_validate_policy_evidence", "disposition": "reviewed_exclusion", "rationale": "Validates recorded artifact-only request evidence but does not make or apply a live request decision."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:read_safe_mode_overlay", "contract": "safe_mode", "role": "decision", "path": "agent/rescue_plane_core.py", "symbol": "read_safe_mode_overlay", "disposition": "covered", "rationale": "Reads and validates the rescue overlay, rejecting absent or malformed state into the restrictive decision path."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:rescue_overlay_disables_artifact_only", "contract": "safe_mode", "role": "enforcement", "path": "agent/rescue_plane_core.py", "symbol": "rescue_overlay_disables_artifact_only", "disposition": "covered", "rationale": "Exposes the overlay restriction for callers that must deny artifact-only execution."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:read_safe_mode_overlay", "contract": "artifact_request", "role": "decision", "path": "agent/rescue_plane_core.py", "symbol": "read_safe_mode_overlay", "disposition": "covered", "rationale": "The parsed rescue overlay decides whether artifact-only requests remain permitted."
+    },
+    {
+      "id": "agent/rescue_plane_core.py:rescue_overlay_disables_artifact_only", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_plane_core.py", "symbol": "rescue_overlay_disables_artifact_only", "disposition": "covered", "rationale": "Applies the parsed rescue overlay restriction before callers allow artifact-only execution."
+    },
+    {
+      "id": "agent/rescue_quiescence_reporter.py:QuiescenceReporter", "contract": "artifact_request", "role": "recovery", "path": "agent/rescue_quiescence_reporter.py", "symbol": "QuiescenceReporter", "disposition": "reviewed_exclusion", "rationale": "Class container restores artifact-only request evidence through concrete telemetry methods but does not own request authority."
+    },
+    {
+      "id": "agent/rescue_quiescence_reporter.py:QuiescenceReporter._validate_policy_evidence_floor", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_quiescence_reporter.py", "symbol": "QuiescenceReporter._validate_policy_evidence_floor", "disposition": "reviewed_exclusion", "rationale": "Checks persisted artifact-only request evidence for corruption without making or enforcing the active request decision."
+    },
+    {
+      "id": "agent/rescue_quiescence_reporter.py:ReporterState", "contract": "artifact_request", "role": "recovery", "path": "agent/rescue_quiescence_reporter.py", "symbol": "ReporterState", "disposition": "reviewed_exclusion", "rationale": "Aggregate class container retains artifact-only request evidence and has no request authority."
+    },
+    {
+      "id": "agent/rescue_quiescence_reporter.py:ReporterState._validate_event", "contract": "artifact_request", "role": "enforcement", "path": "agent/rescue_quiescence_reporter.py", "symbol": "ReporterState._validate_event", "disposition": "reviewed_exclusion", "rationale": "Validates telemetry event payload fields, including historical artifact-only request labels, without applying request authority."
+    },
+    {
+      "id": "agent/rescue_quiescence_reporter.py:ReporterState.from_payload", "contract": "artifact_request", "role": "recovery", "path": "agent/rescue_quiescence_reporter.py", "symbol": "ReporterState.from_payload", "disposition": "reviewed_exclusion", "rationale": "Restores validated telemetry state containing artifact-only request evidence but does not decide or enforce current request authority."
     }
   ]
 }
