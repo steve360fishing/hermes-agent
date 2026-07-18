@@ -196,18 +196,21 @@ def run_tool_execution_middleware(
     **context: Any,
 ) -> Any:
     """Run tool execution through registered tool execution middleware."""
-    callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
-    if not callbacks:
-        return next_call(args)
-    return _run_execution_chain(
-        TOOL_EXECUTION_MIDDLEWARE,
-        callbacks,
-        next_call,
-        tool_name=tool_name,
-        args=args,
-        original_args=context.pop("original_args", args),
-        **context,
-    )
+    from agent.rescue_plane_core import rescue_tool_execution_scope
+
+    with rescue_tool_execution_scope(str(context.get("turn_id") or "unscoped")):
+        callbacks = _get_middleware_callbacks(TOOL_EXECUTION_MIDDLEWARE)
+        if not callbacks:
+            return next_call(args)
+        return _run_execution_chain(
+            TOOL_EXECUTION_MIDDLEWARE,
+            callbacks,
+            next_call,
+            tool_name=tool_name,
+            args=args,
+            original_args=context.pop("original_args", args),
+            **context,
+        )
 
 
 def run_api_execution_middleware(

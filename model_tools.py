@@ -27,7 +27,6 @@ import asyncio
 import logging
 import threading
 import time
-from functools import wraps
 from typing import Dict, Any, List, Optional, Tuple
 
 from tools.registry import discover_builtin_tools, registry
@@ -1027,26 +1026,6 @@ def _emit_post_tool_call_hook(
         logger.debug("post_tool_call hook error: %s", _hook_err)
 
 
-def _rescue_account_tool_call(func):
-    """Single dispatcher boundary for all registry-backed tool work."""
-    @wraps(func)
-    def wrapper(*args, **kwargs):
-        from contextlib import nullcontext
-        from agent.rescue_plane_core import get_rescue_telemetry_client
-
-        client = get_rescue_telemetry_client()
-        turn_id = str(kwargs.get("turn_id") or "unscoped")
-        scope = (
-            client.active_work("tool", turn_id=turn_id)
-            if client is not None
-            else nullcontext()
-        )
-        with scope:
-            return func(*args, **kwargs)
-    return wrapper
-
-
-@_rescue_account_tool_call
 def handle_function_call(
     function_name: str,
     function_args: Dict[str, Any],
@@ -1062,6 +1041,7 @@ def handle_function_call(
     tool_request_middleware_trace: Optional[List[Dict[str, Any]]] = None,
     enabled_toolsets: Optional[List[str]] = None,
     disabled_toolsets: Optional[List[str]] = None,
+    _rescue_boundary_applied: bool = False,
 ) -> str:
     """
     Main function call dispatcher that routes calls to the tool registry.
@@ -1104,6 +1084,36 @@ def handle_function_call(
     except Exception:
         _ts_mod = None
 
+    if (
+        _ts_mod is not None
+        and _ts_mod.is_bridge_tool(function_name)
+        and not _rescue_boundary_applied
+    ):
+        from hermes_cli.middleware import run_tool_execution_middleware
+
+        return run_tool_execution_middleware(
+            function_name,
+            function_args,
+            lambda effective_args: handle_function_call(
+                function_name=function_name,
+                function_args=effective_args,
+                task_id=task_id,
+                tool_call_id=tool_call_id,
+                session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                user_task=user_task,
+                enabled_tools=enabled_tools,
+                skip_pre_tool_call_hook=skip_pre_tool_call_hook,
+                skip_tool_request_middleware=skip_tool_request_middleware,
+                tool_request_middleware_trace=list(_tool_middleware_trace),
+                enabled_toolsets=enabled_toolsets,
+                disabled_toolsets=disabled_toolsets,
+                _rescue_boundary_applied=True,
+            ),
+            turn_id=turn_id,
+        )
+
     if _ts_mod is not None and _ts_mod.is_bridge_tool(function_name):
         try:
             # Use skip_tool_search_assembly=True so we see the real catalog,
@@ -1127,11 +1137,13 @@ def handle_function_call(
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
-            return _ts_mod.dispatch_tool_search(function_args or {},
-                                                current_tool_defs=current_defs)
+            return _ts_mod.dispatch_tool_search(
+                function_args, current_tool_defs=current_defs
+            )
         if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
-            return _ts_mod.dispatch_tool_describe(function_args or {},
-                                                  current_tool_defs=current_defs)
+            return _ts_mod.dispatch_tool_describe(
+                function_args, current_tool_defs=current_defs
+            )
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:

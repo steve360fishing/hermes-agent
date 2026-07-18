@@ -11,6 +11,7 @@ import subprocess
 import sys
 import time
 import threading
+from types import SimpleNamespace
 
 import pytest
 
@@ -1146,7 +1147,6 @@ def test_wrappers_preserve_introspection_contract() -> None:
         inspect.unwrap(interruptible_streaming_api_call)
         is not interruptible_streaming_api_call
     )
-    assert inspect.unwrap(handle_function_call) is not handle_function_call
     assert inspect.unwrap(call_llm) is not call_llm
     assert inspect.unwrap(async_call_llm) is not async_call_llm
     assert "api_kwargs" in inspect.signature(interruptible_api_call).parameters
@@ -1207,13 +1207,12 @@ def test_telemetry_is_dormant_without_linux_socket(monkeypatch: pytest.MonkeyPat
 
 
 @linux_only
-def test_required_telemetry_outage_blocks_provider_and_tool_entry(
+def test_required_telemetry_outage_blocks_provider_entry(
     monkeypatch: pytest.MonkeyPatch,
     tmp_path: Path,
 ) -> None:
     import agent.rescue_plane_core as core
     from agent.chat_completion_helpers import _rescue_account_provider_call
-    from model_tools import _rescue_account_tool_call
 
     continuity = tmp_path / "continuity"
     continuity.mkdir(mode=0o750)
@@ -1237,12 +1236,320 @@ def test_required_telemetry_outage_blocks_provider_and_tool_entry(
     def provider(_agent, _kwargs):
         calls.append("provider")
 
-    @_rescue_account_tool_call
-    def tool(*_args, **_kwargs):
-        calls.append("tool")
-
     with pytest.raises(core.RescueTelemetryUnavailable):
         provider(Agent(), {})
-    with pytest.raises(core.RescueTelemetryUnavailable):
-        tool("terminal", {}, turn_id="turn-outage")
     assert calls == []
+
+
+@linux_only
+@pytest.mark.parametrize(
+    "tool_name",
+    [
+        "todo",
+        "session_search",
+        "memory",
+        "hindsight_retain",
+        "clarify",
+        "read_terminal",
+        "delegate_task",
+        "lcm_grep",
+        "terminal",
+        "write_file",
+    ],
+)
+def test_common_tool_boundary_blocks_every_path_during_required_outage(
+    tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent.rescue_plane_core as core
+    from agent.agent_runtime_helpers import invoke_tool
+
+    continuity = tmp_path / "continuity"
+    continuity.mkdir(mode=0o750)
+    continuity.chmod(0o750)
+    marker = continuity / "telemetry-required-v1.json"
+    marker.write_bytes(core.TELEMETRY_REQUIRED_MARKER)
+    marker.chmod(0o440)
+    monkeypatch.setattr(core, "RESCUE_TELEMETRY_REQUIRED_PATH", marker)
+    monkeypatch.setattr(core, "RESCUE_REPORTER_UID", os.getuid())
+    monkeypatch.setattr(core, "RESCUE_EVENT_SOCKET_PATH", tmp_path / "outage.sock")
+    agent = SimpleNamespace(
+        session_id="session-outage",
+        _current_turn_id="turn-outage",
+        _current_api_request_id="request-outage",
+        _memory_manager=None,
+        valid_tool_names=[],
+        enabled_toolsets=None,
+        disabled_toolsets=None,
+    )
+
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        invoke_tool(
+            agent,
+            tool_name,
+            {},
+            "task-outage",
+        )
+
+
+@linux_only
+def test_sequential_tool_dispatch_uses_common_required_telemetry_boundary(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent.rescue_plane_core as core
+    from agent.tool_executor import _run_agent_tool_execution_middleware
+
+    continuity = tmp_path / "continuity"
+    continuity.mkdir(mode=0o750)
+    continuity.chmod(0o750)
+    marker = continuity / "telemetry-required-v1.json"
+    marker.write_bytes(core.TELEMETRY_REQUIRED_MARKER)
+    marker.chmod(0o440)
+    monkeypatch.setattr(core, "RESCUE_TELEMETRY_REQUIRED_PATH", marker)
+    monkeypatch.setattr(core, "RESCUE_REPORTER_UID", os.getuid())
+    monkeypatch.setattr(core, "RESCUE_EVENT_SOCKET_PATH", tmp_path / "outage.sock")
+    executed: list[str] = []
+
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        _run_agent_tool_execution_middleware(
+            SimpleNamespace(
+                session_id="session-outage",
+                _current_turn_id="turn-outage",
+                _current_api_request_id="request-outage",
+            ),
+            function_name="clarify",
+            function_args={},
+            effective_task_id="task-outage",
+            tool_call_id="call-outage",
+            execute=lambda _args: executed.append("clarify"),
+        )
+    assert executed == []
+
+
+@linux_only
+@pytest.mark.parametrize("tool_name", ["tool_search", "tool_describe", "tool_call"])
+def test_direct_catalog_paths_use_common_required_telemetry_boundary(
+    tool_name: str,
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    import agent.rescue_plane_core as core
+    import model_tools
+    from model_tools import handle_function_call
+
+    continuity = tmp_path / "continuity"
+    continuity.mkdir(mode=0o750)
+    continuity.chmod(0o750)
+    marker = continuity / "telemetry-required-v1.json"
+    marker.write_bytes(core.TELEMETRY_REQUIRED_MARKER)
+    marker.chmod(0o440)
+    monkeypatch.setattr(core, "RESCUE_TELEMETRY_REQUIRED_PATH", marker)
+    monkeypatch.setattr(core, "RESCUE_REPORTER_UID", os.getuid())
+    monkeypatch.setattr(core, "RESCUE_EVENT_SOCKET_PATH", tmp_path / "outage.sock")
+    catalog_reads: list[str] = []
+    monkeypatch.setattr(
+        model_tools,
+        "get_tool_definitions",
+        lambda **_kwargs: catalog_reads.append(tool_name),
+    )
+
+    with pytest.raises(core.RescueTelemetryUnavailable):
+        handle_function_call(tool_name, {}, turn_id="turn-catalog-outage")
+    assert catalog_reads == []
+
+
+def test_background_work_survives_turn_end_and_gateway_death_until_completion() -> None:
+    from agent.rescue_quiescence_reporter import ReporterState
+
+    state = ReporterState(max_turns=4)
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "turn_start",
+            "event_id": "turn-start",
+            "turn_id": "turn-background",
+            "lane": "normal",
+            "artifact_requested": False,
+        },
+        peer_pid=501,
+        peer_uid=10000,
+        now=1.0,
+    )
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "background_start",
+            "event_id": "background-start",
+            "turn_id": "turn-background",
+            "work_id": "terminal:proc-1",
+        },
+        peer_pid=501,
+        peer_uid=10000,
+        now=2.0,
+    )
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "turn_end",
+            "event_id": "turn-end",
+            "turn_id": "turn-background",
+        },
+        peer_pid=501,
+        peer_uid=10000,
+        now=3.0,
+    )
+
+    assert state.active_counts() == (0, 1, 0)
+    state.reconcile(lambda _pid: False, now=4.0)
+    assert state.active_counts() == (0, 1, 0)
+    assert state.telemetry_health == "degraded"
+
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "background_end",
+            "event_id": "background-end",
+            "turn_id": "turn-background",
+            "work_id": "terminal:proc-1",
+        },
+        peer_pid=501,
+        peer_uid=10000,
+        now=5.0,
+    )
+    assert state.active_counts() == (0, 0, 0)
+
+
+@linux_only
+def test_terminal_background_registry_accounts_until_process_completion(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent.rescue_plane_core import rescue_tool_execution_scope
+    import tools.process_registry as process_module
+
+    events: list[dict[str, object]] = []
+
+    class FakeClient:
+        @contextmanager
+        def active_work(self, kind: str, *, turn_id: str):
+            assert kind == "tool"
+            yield
+
+        def emit(self, event):
+            events.append(dict(event))
+
+    monkeypatch.setattr(process_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = process_module.ProcessRegistry()
+    with rescue_tool_execution_scope("turn-terminal", client=FakeClient()):
+        session = registry.spawn_local(
+            "sleep 0.3",
+            cwd=str(tmp_path),
+            task_id="task-terminal",
+        )
+
+    assert [event["event"] for event in events] == ["background_start"]
+    registry.wait(session.id, timeout=5)
+    deadline = time.time() + 5
+    while len(events) < 2 and time.time() < deadline:
+        time.sleep(0.01)
+    assert [event["event"] for event in events] == [
+        "background_start",
+        "background_end",
+    ]
+    assert events[0]["work_id"] == events[1]["work_id"]
+
+
+@linux_only
+def test_uncertain_environment_launch_never_publishes_false_background_end(
+    monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path,
+) -> None:
+    from agent.rescue_plane_core import rescue_tool_execution_scope
+    import tools.process_registry as process_module
+
+    events: list[dict[str, object]] = []
+
+    class FakeClient:
+        @contextmanager
+        def active_work(self, kind: str, *, turn_id: str):
+            assert kind == "tool"
+            yield
+
+        def emit(self, event):
+            events.append(dict(event))
+
+    class UncertainEnvironment:
+        def get_temp_dir(self):
+            return "/tmp"
+
+        def execute(self, *_args, **_kwargs):
+            raise TimeoutError("backend response lost after possible launch")
+
+    monkeypatch.setattr(process_module, "CHECKPOINT_PATH", tmp_path / "processes.json")
+    registry = process_module.ProcessRegistry()
+    with rescue_tool_execution_scope("turn-uncertain", client=FakeClient()):
+        session = registry.spawn_via_env(
+            UncertainEnvironment(),
+            "sleep 30",
+            task_id="task-uncertain",
+        )
+
+    assert session.completion_reason == "launch_unknown"
+    assert [event["event"] for event in events] == ["background_start"]
+
+
+@linux_only
+def test_async_delegation_accounts_worker_lifetime_and_completion_cleanup() -> None:
+    from agent.rescue_plane_core import rescue_tool_execution_scope
+    from tools.async_delegation import (
+        dispatch_async_delegation,
+        list_async_delegations,
+    )
+
+    events: list[dict[str, object]] = []
+    release = threading.Event()
+
+    class FakeClient:
+        @contextmanager
+        def active_work(self, kind: str, *, turn_id: str):
+            assert kind == "tool"
+            yield
+
+        def emit(self, event):
+            events.append(dict(event))
+
+    def runner() -> dict[str, object]:
+        release.wait(timeout=5)
+        return {"status": "completed", "summary": "done"}
+
+    with rescue_tool_execution_scope("turn-delegate", client=FakeClient()):
+        result = dispatch_async_delegation(
+            goal="wait for cleanup proof",
+            context=None,
+            toolsets=None,
+            role="worker",
+            model=None,
+            session_key="session",
+            runner=runner,
+            max_async_children=32,
+        )
+    delegation_id = result["delegation_id"]
+    assert [event["event"] for event in events] == ["background_start"]
+    release.set()
+    deadline = time.time() + 5
+    while time.time() < deadline:
+        record = next(
+            item
+            for item in list_async_delegations()
+            if item["delegation_id"] == delegation_id
+        )
+        if record["status"] != "running":
+            break
+        time.sleep(0.01)
+    assert [event["event"] for event in events] == [
+        "background_start",
+        "background_end",
+    ]
+    assert events[0]["work_id"] == events[1]["work_id"]

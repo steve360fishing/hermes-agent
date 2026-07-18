@@ -72,6 +72,7 @@ class ReporterState:
         self.turns: OrderedDict[str, dict[str, Any]] = OrderedDict()
         self.tools: dict[str, dict[str, Any]] = {}
         self.providers: dict[str, dict[str, Any]] = {}
+        self.backgrounds: dict[str, dict[str, Any]] = {}
         self.seen_events: OrderedDict[str, None] = OrderedDict()
         self.telemetry_health = "healthy"
         self.reconciled_crashes = 0
@@ -84,7 +85,14 @@ class ReporterState:
             expected = _EVENT_TURN_START
         elif kind in {"turn_end"}:
             expected = _EVENT_BASE
-        elif kind in {"tool_start", "tool_end", "provider_start", "provider_end"}:
+        elif kind in {
+            "tool_start",
+            "tool_end",
+            "provider_start",
+            "provider_end",
+            "background_start",
+            "background_end",
+        }:
             expected = _EVENT_WORK
         else:
             raise ValueError("unknown event")
@@ -148,11 +156,19 @@ class ReporterState:
             turn["completed_at"] = float(now)
         else:
             work_id = str(event["work_id"])
-            collection = self.tools if kind.startswith("tool_") else self.providers
+            if kind.startswith("tool_"):
+                collection = self.tools
+            elif kind.startswith("provider_"):
+                collection = self.providers
+            else:
+                collection = self.backgrounds
             if kind.endswith("_start"):
                 if work_id in collection:
                     raise ValueError("duplicate active work")
-                if len(self.tools) + len(self.providers) >= self.max_work:
+                if (
+                    len(self.tools) + len(self.providers) + len(self.backgrounds)
+                    >= self.max_work
+                ):
                     self.telemetry_health = "degraded"
                     raise ValueError("active work bound exceeded")
                 collection[work_id] = {
@@ -190,6 +206,7 @@ class ReporterState:
         }
         active_pids.update(int(item["peer_pid"]) for item in self.tools.values())
         active_pids.update(int(item["peer_pid"]) for item in self.providers.values())
+        active_pids.update(int(item["peer_pid"]) for item in self.backgrounds.values())
         dead = {pid for pid in active_pids if not is_pid_alive(pid)}
         if dead:
             newly_degraded = self.telemetry_health != "degraded"
@@ -204,7 +221,7 @@ class ReporterState:
     def active_counts(self) -> tuple[int, int, int]:
         return (
             sum(turn["completed_at"] is None for turn in self.turns.values()),
-            len(self.tools),
+            len(self.tools) + len(self.backgrounds),
             len(self.providers),
         )
 
@@ -228,6 +245,7 @@ class ReporterState:
             "turns": list(self.turns.values()),
             "tools": self.tools,
             "providers": self.providers,
+            "backgrounds": self.backgrounds,
             "seen_events": list(self.seen_events),
             "telemetry_health": self.telemetry_health,
             "reconciled_crashes": self.reconciled_crashes,
@@ -246,7 +264,10 @@ class ReporterState:
             "telemetry_health",
             "reconciled_crashes",
         }
-        if type(payload) is not dict or set(payload) != expected:
+        if type(payload) is not dict or frozenset(payload) not in {
+            frozenset(expected),
+            frozenset(expected | {"backgrounds"}),
+        }:
             raise ValueError("corrupt reporter state")
         state = cls(max_turns=payload["max_turns"], max_work=payload["max_work"])
         if payload["schema_version"] != "hermes-rescue-reporter-state-v1":
@@ -292,8 +313,12 @@ class ReporterState:
             ):
                 raise ValueError("corrupt turn state")
             state.turns[turn["turn_id"]] = dict(turn)
-        for name, destination in (("tools", state.tools), ("providers", state.providers)):
-            values = payload[name]
+        for name, destination in (
+            ("tools", state.tools),
+            ("providers", state.providers),
+            ("backgrounds", state.backgrounds),
+        ):
+            values = payload.get(name, {})
             if type(values) is not dict or len(values) > state.max_work:
                 raise ValueError("corrupt work state")
             for work_id, item in values.items():
@@ -311,7 +336,10 @@ class ReporterState:
                 ):
                     raise ValueError("corrupt work state")
                 destination[work_id] = dict(item)
-        if len(state.tools) + len(state.providers) > state.max_work:
+        if (
+            len(state.tools) + len(state.providers) + len(state.backgrounds)
+            > state.max_work
+        ):
             raise ValueError("corrupt aggregate work state")
         seen = payload["seen_events"]
         if type(seen) is not list or len(seen) > max(1024, state.max_work * 2):

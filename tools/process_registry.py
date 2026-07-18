@@ -102,8 +102,8 @@ class ProcessSession:
     host_start_time: Optional[int] = None       # kernel start ticks (/proc/<pid>/stat f22) — PID-reuse guard
     exited: bool = False                        # Whether the process has finished
     exit_code: Optional[int] = None             # Exit code (None if still running)
-    completion_reason: str = "exited"           # exited|killed|lost|failed_start|already_exited
-    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start
+    completion_reason: str = "exited"           # exited|killed|lost|failed_start|launch_unknown|already_exited
+    termination_source: str = ""                # process.kill|kill_all|backend_lost|failed_start|launch_unknown
     output_buffer: str = ""                     # Rolling output (last MAX_OUTPUT_CHARS)
     max_output_chars: int = MAX_OUTPUT_CHARS
     detached: bool = False                      # True if recovered from crash (no pipe)
@@ -137,6 +137,7 @@ class ProcessSession:
     _lock: threading.Lock = field(default_factory=threading.Lock)
     _reader_thread: Optional[threading.Thread] = field(default=None, repr=False)
     _pty: Any = field(default=None, repr=False)  # ptyprocess handle (when use_pty=True)
+    _rescue_background_work: Any = field(default=None, repr=False)
 
 
 class ProcessRegistry:
@@ -706,9 +707,15 @@ class ProcessRegistry:
             cwd=_resolve_safe_cwd(cwd or os.getcwd()),
             started_at=time.time(),
         )
+        from agent.rescue_plane_core import begin_rescue_background_work
+
+        session._rescue_background_work = begin_rescue_background_work(
+            "terminal", session.id
+        )
 
         if use_pty:
             # Try PTY mode for interactive CLI tools
+            pty_proc = None
             try:
                 if _IS_WINDOWS:
                     from winpty import PtyProcess as _PtyProcessCls
@@ -748,6 +755,17 @@ class ProcessRegistry:
             except ImportError:
                 logger.warning("ptyprocess not installed, falling back to pipe mode")
             except Exception as e:
+                if pty_proc is not None:
+                    try:
+                        pty_proc.terminate(force=True)
+                        pty_proc.wait()
+                    except Exception:
+                        # The PTY may still be running. Preserve the active
+                        # telemetry record and refuse to launch a second worker.
+                        logger.exception(
+                            "PTY setup failed and process termination is unknown"
+                        )
+                        raise
                 logger.warning("PTY spawn failed (%s), falling back to pipe mode", e)
 
         # Standard Popen path (non-PTY or PTY fallback)
@@ -761,19 +779,23 @@ class ProcessRegistry:
         bg_env["PYTHONUNBUFFERED"] = "1"
         _popen_kwargs = {"creationflags": windows_hide_flags()} if _IS_WINDOWS else {}
 
-        proc = subprocess.Popen(
-            [user_shell, "-lic", f"set +m; {command}"],
-            text=True,
-            cwd=session.cwd,
-            env=bg_env,
-            encoding="utf-8",
-            errors="replace",
-            stdout=subprocess.PIPE,
-            stderr=subprocess.STDOUT,
-            stdin=subprocess.DEVNULL,
-            start_new_session=True,
-            **_popen_kwargs,
-        )
+        try:
+            proc = subprocess.Popen(
+                [user_shell, "-lic", f"set +m; {command}"],
+                text=True,
+                cwd=session.cwd,
+                env=bg_env,
+                encoding="utf-8",
+                errors="replace",
+                stdout=subprocess.PIPE,
+                stderr=subprocess.STDOUT,
+                stdin=subprocess.DEVNULL,
+                start_new_session=True,
+                **_popen_kwargs,
+            )
+        except Exception:
+            self._finish_rescue_background_work(session)
+            raise
 
         session.process = proc
         session.pid = proc.pid
@@ -814,6 +836,7 @@ class ProcessRegistry:
                 proc.wait(timeout=5)
             except Exception:
                 pass
+            self._finish_rescue_background_work(session)
             raise
 
         return session
@@ -847,6 +870,11 @@ class ProcessRegistry:
             started_at=time.time(),
             env_ref=env,
             pid_scope="sandbox",
+        )
+        from agent.rescue_plane_core import begin_rescue_background_work
+
+        session._rescue_background_work = begin_rescue_background_work(
+            "terminal", session.id
         )
 
         # Run the command in the sandbox with output capture
@@ -885,17 +913,20 @@ class ProcessRegistry:
             if session.pid is None:
                 session.exited = True
                 session.exit_code = int(result.get("returncode", -1))
-                if session.exit_code == 0:
+                if session.exit_code != 0:
+                    session.completion_reason = "failed_start"
+                    session.termination_source = "failed_start"
+                else:
                     session.exit_code = -1
-                session.completion_reason = "failed_start"
-                session.termination_source = "failed_start"
+                    session.completion_reason = "launch_unknown"
+                    session.termination_source = "launch_unknown"
                 session.output_buffer = result.get("output", "").strip()
         except Exception as e:
             session.exited = True
             session.exit_code = -1
-            session.completion_reason = "failed_start"
-            session.termination_source = "failed_start"
-            session.output_buffer = f"Failed to start: {e}"
+            session.completion_reason = "launch_unknown"
+            session.termination_source = "launch_unknown"
+            session.output_buffer = f"Launch status unknown: {e}"
 
         if not session.exited:
             # Start a poller thread that periodically reads the log file
@@ -915,7 +946,8 @@ class ProcessRegistry:
 
         if not session.exited:
             self._write_checkpoint()
-
+        elif session.completion_reason == "failed_start":
+            self._finish_rescue_background_work(session)
         return session
 
     # ----- Reader / Poller Threads -----
@@ -1075,6 +1107,7 @@ class ProcessRegistry:
             self._finished[session.id] = session
         session._completion_event.set()
         self._write_checkpoint()
+        self._finish_rescue_background_work(session)
 
         # Only enqueue completion notification on the FIRST move.  Without
         # this guard, kill_process() and the reader thread can both call
@@ -1092,6 +1125,20 @@ class ProcessRegistry:
                 "termination_source": session.termination_source,
                 "output": output_tail,
             })
+
+    @staticmethod
+    def _finish_rescue_background_work(session: ProcessSession) -> None:
+        token = session._rescue_background_work
+        if token is None:
+            return
+        try:
+            token.finish()
+        except Exception:
+            # A missing ACK must retain the reporter's active record. Process
+            # cleanup still completes locally, while rescue remains degraded.
+            logger.exception(
+                "Failed to close rescue background work for %s", session.id
+            )
 
     # ----- Query Methods -----
 
@@ -2121,6 +2168,8 @@ def format_process_notification(evt: dict) -> "str | None":
         _status = "marked lost because the process backend disappeared"
     elif _reason == "failed_start":
         _status = "failed to start"
+    elif _reason == "launch_unknown":
+        _status = "has unknown launch state"
     elif _exit == 0:
         _status = "completed normally"
     else:

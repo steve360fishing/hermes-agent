@@ -2,7 +2,8 @@
 
 from __future__ import annotations
 
-from contextlib import contextmanager
+import contextvars
+from contextlib import contextmanager, nullcontext
 from dataclasses import dataclass
 from datetime import datetime
 import hashlib
@@ -935,6 +936,96 @@ class RescueTelemetryClient:
                     "work_id": work_id,
                 }
             )
+
+
+class RescueBackgroundWork:
+    """One reporter-owned active record that outlives its launching tool call."""
+
+    def __init__(
+        self,
+        client: RescueTelemetryClient,
+        *,
+        turn_id: str,
+        work_id: str,
+    ) -> None:
+        self.client = client
+        self.turn_id = turn_id
+        self.work_id = work_id
+        self._finished = False
+        self._lock = threading.Lock()
+
+    def finish(self) -> None:
+        with self._lock:
+            if self._finished:
+                return
+            self.client.emit(
+                {
+                    "event": "background_end",
+                    "event_id": secrets.token_hex(16),
+                    "turn_id": self.turn_id,
+                    "work_id": self.work_id,
+                }
+            )
+            self._finished = True
+
+
+_RESCUE_TOOL_CONTEXT: contextvars.ContextVar[
+    tuple[RescueTelemetryClient, str] | None
+] = contextvars.ContextVar("rescue_tool_context", default=None)
+_CLIENT_UNSET = object()
+
+
+@contextmanager
+def rescue_tool_execution_scope(
+    turn_id: str,
+    *,
+    client: RescueTelemetryClient | None | object = _CLIENT_UNSET,
+) -> Iterator[None]:
+    """Single accounting and required-telemetry boundary for every tool path."""
+    resolved = get_rescue_telemetry_client() if client is _CLIENT_UNSET else client
+    normalized_turn_id = str(turn_id or "unscoped")
+    token = _RESCUE_TOOL_CONTEXT.set(
+        (resolved, normalized_turn_id) if resolved is not None else None
+    )
+    scope = (
+        resolved.active_work("tool", turn_id=normalized_turn_id)
+        if resolved is not None
+        else nullcontext()
+    )
+    try:
+        with scope:
+            yield
+    finally:
+        _RESCUE_TOOL_CONTEXT.reset(token)
+
+
+def begin_rescue_background_work(
+    kind: str,
+    work_id: str,
+) -> RescueBackgroundWork | None:
+    """Persist background work before a registry launches its worker/process."""
+    if kind not in {"terminal", "delegation"}:
+        raise ValueError("invalid rescue background kind")
+    normalized = f"{kind}:{work_id}"
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", normalized):
+        raise ValueError("invalid rescue background work id")
+    context = _RESCUE_TOOL_CONTEXT.get()
+    if context is None:
+        client = get_rescue_telemetry_client()
+        turn_id = "unscoped"
+    else:
+        client, turn_id = context
+    if client is None:
+        return None
+    client.emit(
+        {
+            "event": "background_start",
+            "event_id": secrets.token_hex(16),
+            "turn_id": turn_id,
+            "work_id": normalized,
+        }
+    )
+    return RescueBackgroundWork(client, turn_id=turn_id, work_id=normalized)
 
 
 def _rescue_telemetry_is_required() -> bool:
