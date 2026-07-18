@@ -40,12 +40,12 @@ def rescue_container(
 
     provision = (
         "set -eu; "
-        "chown 10001:10000 /secrets; chmod 0750 /secrets; "
+        "chown 10002:10000 /secrets; chmod 0750 /secrets; "
         f"printf '{'q' * 32}' > /secrets/hmac-current; "
         "printf 'current-v1' > /secrets/key-id-current; "
         f"printf '{'a' * 40}' > /secrets/source-sha; "
         f"printf 'sha256:{'b' * 64}' > /secrets/image-id; "
-        "chown 10001:10000 /secrets/*; chmod 0400 /secrets/*"
+        "chown 10002:10000 /secrets/*; chmod 0400 /secrets/*"
     )
     _docker(
         "run",
@@ -142,7 +142,7 @@ def test_s6_reporter_retains_background_across_death_restart_and_runtime_loss(
         f"awk '/^Uid:/ {{print $2}}' /proc/{reporter_pid}/status",
         user="root",
     )
-    assert uid.stdout.strip() == "10001"
+    assert uid.stdout.strip() == "10002"
 
     worker_code = (
         "import os,time;"

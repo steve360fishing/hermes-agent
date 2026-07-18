@@ -91,7 +91,7 @@ RUN set -eu; \
 # Non-root users for runtime and the independent rescue reporter. Hermes may
 # be UID-remapped at boot; the reporter remains fixed and owns only /run state.
 RUN useradd -u 10000 -m -d /opt/data hermes && \
-    useradd -u 10001 -M -d /nonexistent -s /usr/sbin/nologin hermes-rescue && \
+    useradd -u 10002 -M -d /nonexistent -s /usr/sbin/nologin hermes-rescue && \
     usermod -aG hermes hermes-rescue
 
 COPY --chmod=0755 --from=uv_source /usr/local/bin/uv /usr/local/bin/uvx /usr/local/bin/
