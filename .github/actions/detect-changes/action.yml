@@ -1,9 +1,9 @@
 name: Detect affected areas
 description: >-
-  Classify a PR's changed files into CI work lanes (python, frontend, site,
-  scan, deps, mcp_catalog) so the orchestrator can conditionally call only
-  the sub-workflows a PR can affect. Outputs are always "true" on push/dispatch
-  events and fail open (everything "true") when the diff cannot be computed.
+  Classify a PR's or main-push's changed files into CI work lanes (python,
+  frontend, site, scan, deps, mcp_catalog) so the orchestrator can
+  conditionally call only the sub-workflows a change can affect. Outputs fail
+  open (everything "true") whenever a trustworthy diff cannot be computed.
 
 outputs:
   python:
@@ -38,23 +38,42 @@ runs:
         GH_TOKEN: ${{ github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
-        BASE_SHA: ${{ github.event.pull_request.base.sha }}
-        HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
+        PR_HEAD_SHA: ${{ github.event.pull_request.head.sha }}
+        PUSH_BEFORE_SHA: ${{ github.event.before }}
+        PUSH_AFTER_SHA: ${{ github.event.after }}
       run: |
         set -euo pipefail
 
-        # Only pull_request events are gated. Other events (push, release,
-        # dispatch) leave CHANGED empty, so the classifier fails open and every
-        # lane runs. Post-merge / on-demand validation is never weakened.
-        if [ "$EVENT_NAME" = "pull_request" ]; then
-          # Use the compare endpoint with the pinned base/head SHAs from the
-          # event payload instead of the "current PR files" endpoint. The SHAs
-          # are frozen at trigger time, so the file list is deterministic even
-          # if the PR receives a new push between trigger and detect.
-          CHANGED="$(gh api \
+        # Use event-pinned SHAs instead of a mutable ref. PRs and main pushes
+        # can therefore avoid unrelated runners, while a missing/invalid diff
+        # still deliberately falls through to the classifier's fail-open path.
+        BASE_SHA=""
+        HEAD_SHA=""
+        case "$EVENT_NAME" in
+          pull_request)
+            BASE_SHA="$PR_BASE_SHA"
+            HEAD_SHA="$PR_HEAD_SHA"
+            ;;
+          push)
+            BASE_SHA="$PUSH_BEFORE_SHA"
+            HEAD_SHA="$PUSH_AFTER_SHA"
+            ;;
+        esac
+
+        CHANGED=""
+        ZERO_SHA="0000000000000000000000000000000000000000"
+        if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] \
+          && [ "$BASE_SHA" != "$ZERO_SHA" ] && [ "$HEAD_SHA" != "$ZERO_SHA" ]; then
+          if ! CHANGED="$(gh api \
             --paginate \
             "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-            --jq '.files[].filename' || true)"
+            --jq '.files[].filename')"; then
+            echo "Could not compute changed files; running all lanes." >&2
+            CHANGED=""
+          fi
+        else
+          echo "No trustworthy diff anchors; running all lanes." >&2
         fi
 
         echo "Changed files:"
