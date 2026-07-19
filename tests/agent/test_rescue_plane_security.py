@@ -1122,7 +1122,9 @@ def test_s6_service_is_executable_drops_uid_and_has_no_failure_mask() -> None:
     assert index_mode == "100755"
     assert "s6-setuidgid hermes-rescue" in text
     assert rescue_plane_core.RESCUE_REPORTER_UID == 10002
-    assert "useradd -u 10002" in dockerfile
+    assert "groupadd -g 10002 hermes-rescue" in dockerfile
+    assert "useradd -u 10002 -g hermes-rescue" in dockerfile
+    assert "usermod -aG hermes-rescue hermes" in dockerfile
     assert "useradd -u 10001" not in dockerfile
     assert "--expected-reporter-uid" in text
     assert "|| true" not in text
@@ -1136,7 +1138,7 @@ def test_s6_service_is_executable_drops_uid_and_has_no_failure_mask() -> None:
     assert '[ -L /run/hermes-rescue-reporter ]' in stage2
     assert "telemetry-required-v1.json" in stage2
     assert "hermes-rescue-telemetry-required-v1" in stage2
-    assert "install -d -o hermes-rescue -g hermes -m 0750" in stage2
+    assert "install -d -o hermes-rescue -g hermes-rescue -m 0750" in stage2
     assert "/var/run/hermes-rescue" not in stage2
 
 

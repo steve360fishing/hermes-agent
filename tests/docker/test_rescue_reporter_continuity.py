@@ -40,12 +40,12 @@ def rescue_container(
 
     provision = (
         "set -eu; "
-        "chown 10002:10000 /secrets; chmod 0750 /secrets; "
+        "chown 10002:10002 /secrets; chmod 0750 /secrets; "
         f"printf '{'q' * 32}' > /secrets/hmac-current; "
         "printf 'current-v1' > /secrets/key-id-current; "
         f"printf '{'a' * 40}' > /secrets/source-sha; "
         f"printf 'sha256:{'b' * 64}' > /secrets/image-id; "
-        "chown 10002:10000 /secrets/*; chmod 0400 /secrets/*"
+        "chown 10002:10002 /secrets/*; chmod 0400 /secrets/*"
     )
     _docker(
         "run",
@@ -230,7 +230,7 @@ def test_s6_reporter_retains_background_across_death_restart_and_runtime_loss(
     reset = docker_exec_sh(
         container,
         "rm -rf /run/hermes-rescue-reporter && "
-        "install -d -o hermes-rescue -g hermes -m 0750 "
+            "install -d -o hermes-rescue -g hermes-rescue -m 0750 "
         "/run/hermes-rescue-reporter",
         user="root",
     )
