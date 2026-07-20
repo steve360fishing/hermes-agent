@@ -40,7 +40,9 @@ _CONTINUITY_INITIALIZED = b"hermes-rescue-continuity-initialized-v1"
 _RECOVERY_STABLE_EMISSIONS = 3
 _RECOVERY_MAX_TTL_SECONDS = 300.0
 _RECOVERY_ID_CAPACITY = 256
-_RECOVERABLE_DEGRADATION_REASONS = frozenset({"continuity_gap", "legacy_unattributed"})
+_RECOVERABLE_DEGRADATION_REASONS = frozenset(
+    {"continuity_gap", "gateway_unknown", "legacy_unattributed"}
+)
 _DEGRADATION_REASONS = frozenset({
     "active_work_bound",
     "background_unknown",
@@ -750,7 +752,8 @@ class QuiescenceReporter:
                 r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
                 str(payload["authorization_id"]),
             )
-            or payload["expected_reason"] != "legacy_unattributed"
+            or type(payload["expected_reason"]) is not str
+            or payload["expected_reason"] not in {"gateway_unknown", "legacy_unattributed"}
             or not __import__("re").fullmatch(
                 r"[0-9a-f]{32}", str(payload["expected_producer_epoch"])
             )
@@ -1050,10 +1053,11 @@ class QuiescenceReporter:
         reasons = self.state.degradation_reasons
         if reasons == {"continuity_gap"}:
             authorization_id: str | None = None
-        elif reasons == {"legacy_unattributed"}:
+        elif reasons in ({"gateway_unknown"}, {"legacy_unattributed"}):
             authorization = self.recovery_authorization
             if (
                 authorization is None
+                or authorization["expected_reason"] not in reasons
                 or current < float(authorization["issued_at"])
                 or current > float(authorization["expires_at"])
                 or authorization["authorization_id"] in self.state.consumed_recovery_ids

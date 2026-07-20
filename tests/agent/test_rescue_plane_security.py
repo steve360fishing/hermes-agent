@@ -90,6 +90,7 @@ def _write_recovery_authorization(
     *,
     reporter,
     authorization_id: str = "4faeb31c-15fe-4f14-a1e2-11892cbcb5b6",
+    expected_reason: str = "legacy_unattributed",
     expected_state_hash: str | None = None,
     prior_source_sha: str = "a" * 40,
     prior_image_id: str = "sha256:" + "b" * 64,
@@ -106,7 +107,7 @@ def _write_recovery_authorization(
             {
                 "schema_version": "hermes-rescue-recovery-authorization-v1",
                 "authorization_id": authorization_id,
-                "expected_reason": "legacy_unattributed",
+                "expected_reason": expected_reason,
                 "expected_producer_epoch": reporter.producer_epoch,
                 "expected_state_hash": (
                     expected_state_hash or reporter._recovery_subject_hash()
@@ -548,7 +549,6 @@ def test_authenticated_activity_invalidates_state_bound_recovery(
     [
         "background_unknown",
         "capacity_exhausted",
-        "gateway_unknown",
         "sequence_exhausted",
         "worker_crash",
     ],
@@ -580,6 +580,63 @@ def test_authorization_never_clears_nonrecoverable_degradation(
     )
     for now in range(20, 40):
         assert restarted.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_gateway_unknown_requires_reason_bound_authorization_and_cannot_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.state.degrade("gateway_unknown")
+    reporter._persist_state()
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+
+    unauthorized = _durable_reporter(runtime, continuity)
+    for now in range(10, 15):
+        assert unauthorized.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=unauthorized)
+    wrong_reason = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(20, 25):
+        assert wrong_reason.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+    _write_recovery_authorization(
+        authorization,
+        reporter=wrong_reason,
+        expected_reason="gateway_unknown",
+    )
+    authorized = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(30, 34):
+        snapshot = authorized.emit_snapshot(now=float(now))
+    assert snapshot["telemetry_health"] == "healthy"
+
+    authorized.state.degrade("gateway_unknown")
+    authorized._persist_state()
+    replayed = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(40, 45):
+        assert replayed.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
 
 
 @linux_only
