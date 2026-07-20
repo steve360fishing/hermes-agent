@@ -1643,6 +1643,57 @@ def test_gateway_discovery_reports_actual_alive_and_dead_state(tmp_path: Path) -
     assert discover_gateway_state(proc_root=proc, expected_uid=os.getuid()) == ([], "dead")
 
 
+def test_gateway_discovery_skips_unreadable_foreign_uid_cmdline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.rescue_quiescence_reporter import discover_gateway_state
+
+    proc = tmp_path / "proc"
+    process = proc / "321"
+    process.mkdir(parents=True)
+    expected_uid = 10000
+    foreign_uid = 10001
+    (process / "status").write_text(
+        f"Uid:\t{foreign_uid}\t{foreign_uid}\t{foreign_uid}\t{foreign_uid}\n",
+        encoding="ascii",
+    )
+    original_read_bytes = Path.read_bytes
+
+    def unreadable_cmdline(path: Path) -> bytes:
+        if path == process / "cmdline":
+            raise PermissionError("foreign process")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable_cmdline)
+    assert discover_gateway_state(proc_root=proc, expected_uid=expected_uid) == ([], "dead")
+
+
+def test_gateway_discovery_fails_closed_for_unreadable_expected_uid_cmdline(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.rescue_quiescence_reporter import discover_gateway_state
+
+    proc = tmp_path / "proc"
+    process = proc / "321"
+    process.mkdir(parents=True)
+    expected_uid = 10000
+    (process / "status").write_text(
+        f"Uid:\t{expected_uid}\t{expected_uid}\t{expected_uid}\t{expected_uid}\n",
+        encoding="ascii",
+    )
+    original_read_bytes = Path.read_bytes
+
+    def unreadable_cmdline(path: Path) -> bytes:
+        if path == process / "cmdline":
+            raise PermissionError("expected uid process")
+        return original_read_bytes(path)
+
+    monkeypatch.setattr(Path, "read_bytes", unreadable_cmdline)
+    assert discover_gateway_state(proc_root=proc, expected_uid=expected_uid) == ([], "unknown")
+
+
 @linux_only
 def test_unreadable_proc_is_unknown_and_degraded_restart_ineligible(
     tmp_path: Path,

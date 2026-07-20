@@ -581,6 +581,14 @@ def discover_gateway_state(
         if not child.name.isdigit():
             continue
         try:
+            process_uid = _read_proc_uid(child / "status")
+        except (OSError, ValueError):
+            return [], "unknown"
+        if process_uid is None:
+            continue
+        if process_uid != expected_uid:
+            continue
+        try:
             raw = (child / "cmdline").read_bytes()
         except FileNotFoundError:
             continue
@@ -590,14 +598,6 @@ def discover_gateway_state(
         if "gateway" not in args or "run" not in args:
             continue
         if not any("hermes" in arg for arg in args):
-            continue
-        try:
-            process_uid = _read_proc_uid(child / "status")
-        except (OSError, ValueError):
-            return [], "unknown"
-        if process_uid is None:
-            continue
-        if process_uid != expected_uid:
             continue
         pids.append(int(child.name))
     pids.sort()
