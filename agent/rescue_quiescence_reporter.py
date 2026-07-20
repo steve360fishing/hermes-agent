@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import argparse
 from collections import OrderedDict
+import hashlib
 import json
 import math
 import os
@@ -36,6 +37,21 @@ _EVENT_WORK = _EVENT_BASE | {"work_id"}
 _EVENT_TURN_START = _EVENT_BASE | {"lane", "artifact_requested"}
 _POLICY_RETENTION_SECONDS = 120.0
 _CONTINUITY_INITIALIZED = b"hermes-rescue-continuity-initialized-v1"
+_RECOVERY_STABLE_EMISSIONS = 3
+_RECOVERY_MAX_TTL_SECONDS = 300.0
+_RECOVERY_ID_CAPACITY = 256
+_RECOVERABLE_DEGRADATION_REASONS = frozenset({"continuity_gap", "legacy_unattributed"})
+_DEGRADATION_REASONS = frozenset({
+    "active_work_bound",
+    "background_unknown",
+    "capacity_exhausted",
+    "continuity_gap",
+    "gateway_unknown",
+    "legacy_unattributed",
+    "recovery_ledger_exhausted",
+    "sequence_exhausted",
+    "worker_crash",
+})
 
 
 def _posix_uid() -> int:
@@ -51,6 +67,10 @@ def _posix_uid() -> int:
 
 class ReporterCapacityExhausted(ValueError):
     """Reporter cannot retain another turn without violating policy history."""
+
+    def __init__(self, message: str, *, reason: str = "capacity_exhausted") -> None:
+        super().__init__(message)
+        self.reason = reason
 
 
 def _bounded_text(value: Any, *, limit: int = 256) -> bool:
@@ -89,6 +109,40 @@ class ReporterState:
         self.seen_events: OrderedDict[str, None] = OrderedDict()
         self.telemetry_health = "healthy"
         self.reconciled_crashes = 0
+        self.event_generation = 0
+        self.degradation_reasons: set[str] = set()
+        self.recovery_idle_emissions = 0
+        self.consumed_recovery_ids: list[str] = []
+
+    def degrade(self, reason: str) -> None:
+        if reason not in _DEGRADATION_REASONS:
+            raise ValueError("unknown degradation reason")
+        self.telemetry_health = "degraded"
+        self.degradation_reasons.add(reason)
+        self.recovery_idle_emissions = 0
+
+    def note_activity(self) -> None:
+        self.recovery_idle_emissions = 0
+
+    def recover(self, authorization_id: str | None = None) -> None:
+        if self.telemetry_health != "degraded":
+            raise ValueError("reporter is not degraded")
+        if not self.degradation_reasons or not self.degradation_reasons.issubset(
+            _RECOVERABLE_DEGRADATION_REASONS
+        ):
+            raise ValueError("reporter degradation is not recoverable")
+        if authorization_id is not None:
+            if authorization_id in self.consumed_recovery_ids:
+                raise ValueError("recovery authorization already consumed")
+            if len(self.consumed_recovery_ids) >= _RECOVERY_ID_CAPACITY:
+                self.degrade("recovery_ledger_exhausted")
+                raise ReporterCapacityExhausted(
+                    "recovery authorization ledger exhausted"
+                )
+            self.consumed_recovery_ids.append(authorization_id)
+        self.telemetry_health = "healthy"
+        self.degradation_reasons.clear()
+        self.recovery_idle_emissions = 0
 
     def _validate_event(self, event: Mapping[str, Any]) -> str:
         if type(event) is not dict:
@@ -110,7 +164,10 @@ class ReporterState:
             expected = _EVENT_WORK
         else:
             raise ValueError("unknown event")
-        if set(event) != expected or event.get("schema_version") != EVENT_SCHEMA_VERSION:
+        if (
+            set(event) != expected
+            or event.get("schema_version") != EVENT_SCHEMA_VERSION
+        ):
             raise ValueError("malformed event")
         if not _bounded_text(event.get("event_id"), limit=64):
             raise ValueError("invalid event id")
@@ -134,13 +191,24 @@ class ReporterState:
         now: float,
     ) -> bool:
         kind = self._validate_event(event)
-        if type(peer_pid) is not int or peer_pid <= 0 or type(peer_uid) is not int or peer_uid < 0:
+        if (
+            type(peer_pid) is not int
+            or peer_pid <= 0
+            or type(peer_uid) is not int
+            or peer_uid < 0
+        ):
             raise ValueError("invalid peer credentials")
         if type(now) not in {int, float} or not math.isfinite(float(now)):
             raise ValueError("invalid event time")
         event_id = str(event["event_id"])
         if event_id in self.seen_events:
             return False
+        if self.event_generation >= (2**63 - 1):
+            self.degrade("sequence_exhausted")
+            raise ReporterCapacityExhausted(
+                "event generation exhausted",
+                reason="sequence_exhausted",
+            )
 
         turn_id = str(event["turn_id"])
         if kind == "turn_start":
@@ -151,7 +219,7 @@ class ReporterState:
             if existing:
                 raise ValueError("retained turn id cannot be reused")
             if len(self.turns) >= self.max_turns:
-                self.telemetry_health = "degraded"
+                self.degrade("capacity_exhausted")
                 raise ReporterCapacityExhausted("policy evidence capacity exhausted")
             self.turns[turn_id] = {
                 "turn_id": turn_id,
@@ -165,7 +233,11 @@ class ReporterState:
             self.turns.move_to_end(turn_id)
         elif kind == "turn_end":
             turn = self.turns.get(turn_id)
-            if not turn or turn["completed_at"] is not None or turn["peer_pid"] != peer_pid:
+            if (
+                not turn
+                or turn["completed_at"] is not None
+                or turn["peer_pid"] != peer_pid
+            ):
                 raise ValueError("turn end does not match active owner")
             turn["completed_at"] = float(now)
         else:
@@ -183,8 +255,11 @@ class ReporterState:
                     len(self.tools) + len(self.providers) + len(self.backgrounds)
                     >= self.max_work
                 ):
-                    self.telemetry_health = "degraded"
-                    raise ValueError("active work bound exceeded")
+                    self.degrade("active_work_bound")
+                    raise ReporterCapacityExhausted(
+                        "active work bound exceeded",
+                        reason="active_work_bound",
+                    )
                 collection[work_id] = {
                     "turn_id": turn_id,
                     "peer_pid": peer_pid,
@@ -193,7 +268,11 @@ class ReporterState:
                 }
             elif kind.endswith("_end"):
                 active = collection.get(work_id)
-                if not active or active["peer_pid"] != peer_pid or active["turn_id"] != turn_id:
+                if (
+                    not active
+                    or active["peer_pid"] != peer_pid
+                    or active["turn_id"] != turn_id
+                ):
                     raise ValueError("work end does not match active owner")
                 del collection[work_id]
             else:
@@ -204,8 +283,9 @@ class ReporterState:
                     or active["turn_id"] != turn_id
                 ):
                     raise ValueError("work uncertainty does not match active owner")
-                self.telemetry_health = "degraded"
+                self.degrade("background_unknown")
         self.seen_events[event_id] = None
+        self.event_generation += 1
         while len(self.seen_events) > max(1024, self.max_work * 2):
             self.seen_events.popitem(last=False)
         self._prune(float(now))
@@ -233,7 +313,7 @@ class ReporterState:
         dead = {pid for pid in active_pids if not is_pid_alive(pid)}
         if dead:
             newly_degraded = self.telemetry_health != "degraded"
-            self.telemetry_health = "degraded"
+            self.degrade("worker_crash")
             if newly_degraded:
                 self.reconciled_crashes = min(
                     100_000, self.reconciled_crashes + len(dead)
@@ -262,7 +342,7 @@ class ReporterState:
 
     def to_payload(self) -> dict[str, Any]:
         return {
-            "schema_version": "hermes-rescue-reporter-state-v1",
+            "schema_version": "hermes-rescue-reporter-state-v2",
             "max_turns": self.max_turns,
             "max_work": self.max_work,
             "turns": list(self.turns.values()),
@@ -272,11 +352,28 @@ class ReporterState:
             "seen_events": list(self.seen_events),
             "telemetry_health": self.telemetry_health,
             "reconciled_crashes": self.reconciled_crashes,
+            "event_generation": self.event_generation,
+            "degradation_reasons": sorted(self.degradation_reasons),
+            "recovery_idle_emissions": self.recovery_idle_emissions,
+            "consumed_recovery_ids": self.consumed_recovery_ids,
+        }
+
+    def recovery_subject_payload(self) -> dict[str, Any]:
+        return {
+            "max_turns": self.max_turns,
+            "max_work": self.max_work,
+            "turns": list(self.turns.values()),
+            "tools": self.tools,
+            "providers": self.providers,
+            "backgrounds": self.backgrounds,
+            "seen_events": list(self.seen_events),
+            "reconciled_crashes": self.reconciled_crashes,
+            "event_generation": self.event_generation,
         }
 
     @classmethod
     def from_payload(cls, payload: Mapping[str, Any]) -> "ReporterState":
-        expected = {
+        expected_v1 = {
             "schema_version",
             "max_turns",
             "max_work",
@@ -287,14 +384,29 @@ class ReporterState:
             "telemetry_health",
             "reconciled_crashes",
         }
-        if type(payload) is not dict or frozenset(payload) not in {
-            frozenset(expected),
-            frozenset(expected | {"backgrounds"}),
-        }:
+        expected_v2 = expected_v1 | {
+            "backgrounds",
+            "degradation_reasons",
+            "recovery_idle_emissions",
+            "consumed_recovery_ids",
+            "event_generation",
+        }
+        if type(payload) is not dict:
+            raise ValueError("corrupt reporter state")
+        is_v1 = payload.get("schema_version") == "hermes-rescue-reporter-state-v1"
+        if is_v1:
+            if frozenset(payload) not in {
+                frozenset(expected_v1),
+                frozenset(expected_v1 | {"backgrounds"}),
+            }:
+                raise ValueError("corrupt reporter state")
+        elif payload.get(
+            "schema_version"
+        ) != "hermes-rescue-reporter-state-v2" or frozenset(payload) != frozenset(
+            expected_v2
+        ):
             raise ValueError("corrupt reporter state")
         state = cls(max_turns=payload["max_turns"], max_work=payload["max_work"])
-        if payload["schema_version"] != "hermes-rescue-reporter-state-v1":
-            raise ValueError("corrupt reporter state")
         if payload["telemetry_health"] not in {"healthy", "degraded"}:
             raise ValueError("corrupt reporter health")
         if (
@@ -373,7 +485,71 @@ class ReporterState:
             state.seen_events[event_id] = None
         state.telemetry_health = payload["telemetry_health"]
         state.reconciled_crashes = payload["reconciled_crashes"]
+        if is_v1:
+            state.event_generation = len(state.seen_events)
+            if state.telemetry_health == "degraded":
+                state.degradation_reasons = {"legacy_unattributed"}
+        else:
+            reasons = payload["degradation_reasons"]
+            idle_emissions = payload["recovery_idle_emissions"]
+            consumed = payload["consumed_recovery_ids"]
+            if (
+                type(reasons) is not list
+                or len(reasons) > len(_DEGRADATION_REASONS)
+                or any(
+                    type(reason) is not str or reason not in _DEGRADATION_REASONS
+                    for reason in reasons
+                )
+                or len(set(reasons)) != len(reasons)
+                or type(idle_emissions) is not int
+                or not 0 <= idle_emissions < _RECOVERY_STABLE_EMISSIONS
+                or type(consumed) is not list
+                or len(consumed) > _RECOVERY_ID_CAPACITY
+                or any(
+                    type(value) is not str
+                    or not __import__("re").fullmatch(
+                        r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                        value,
+                    )
+                    for value in consumed
+                )
+            ):
+                raise ValueError("corrupt reporter recovery state")
+            if type(payload["event_generation"]) is not int or not len(
+                state.seen_events
+            ) <= payload["event_generation"] <= (2**63 - 1):
+                raise ValueError("corrupt reporter event generation")
+            state.event_generation = payload["event_generation"]
+            state.degradation_reasons = set(reasons)
+            state.recovery_idle_emissions = idle_emissions
+            state.consumed_recovery_ids = list(consumed)
+            if (state.telemetry_health == "healthy") != (not reasons):
+                raise ValueError("corrupt reporter recovery health")
         return state
+
+
+def recovery_subject_hash(
+    *,
+    producer_epoch: str,
+    state: ReporterState,
+    count_floor: Mapping[str, int],
+    policy_evidence_floor: list[dict[str, Any]],
+) -> str:
+    payload = {
+        "schema_version": "hermes-rescue-recovery-subject-v1",
+        "producer_epoch": producer_epoch,
+        "aggregate": state.recovery_subject_payload(),
+        "active_count_floor": dict(count_floor),
+        "policy_evidence_floor": policy_evidence_floor,
+    }
+    return hashlib.sha256(
+        json.dumps(
+            payload,
+            sort_keys=True,
+            separators=(",", ":"),
+            allow_nan=False,
+        ).encode("ascii")
+    ).hexdigest()
 
 
 def _read_proc_uid(status: Path) -> int | None:
@@ -482,21 +658,23 @@ class QuiescenceReporter:
         image_id: str,
         expected_hermes_uid: int,
         max_turns: int = 256,
+        recovery_authorization_path: Path | None = Path(
+            "/run/hermes-rescue-secrets/telemetry-recovery-v1.json"
+        ),
     ) -> None:
         self.runtime_dir = runtime_dir
         self.continuity_dir = continuity_dir
         self.socket_path = runtime_dir / "events.sock"
         self.output_path = runtime_dir / "quiescence-v1.json"
         self.continuity_state_path = continuity_dir / "continuity-state-v1.json"
-        self.continuity_initialized_path = (
-            continuity_dir / "continuity-initialized-v1"
-        )
+        self.continuity_initialized_path = continuity_dir / "continuity-initialized-v1"
         self.state_path = self.continuity_state_path
         self.producer_state_path = self.continuity_state_path
         self.keyring = keyring
         self.source_sha = source_sha
         self.image_id = image_id
         self.expected_hermes_uid = expected_hermes_uid
+        self.recovery_authorization_path = recovery_authorization_path
         runtime_info = runtime_dir.lstat()
         if (
             runtime_dir.is_symlink()
@@ -526,7 +704,112 @@ class QuiescenceReporter:
         self.producer_epoch = ""
         self.sequence = 0
         self._load_or_create_continuity()
+        self.recovery_authorization = self._load_recovery_authorization()
         self._lock = threading.RLock()
+
+    def _recovery_subject_hash(self) -> str:
+        return recovery_subject_hash(
+            producer_epoch=self.producer_epoch,
+            state=self.state,
+            count_floor=self.count_floor,
+            policy_evidence_floor=self.policy_evidence_floor,
+        )
+
+    def _load_recovery_authorization(self) -> dict[str, Any] | None:
+        if self.recovery_authorization_path is None:
+            return None
+        try:
+            raw = _secure_read(
+                self.recovery_authorization_path,
+                expected_uid=_posix_uid(),
+                expected_gid=self.runtime_gid,
+                file_mode=0o400,
+                parent_mode=0o750,
+                max_bytes=4096,
+            )
+        except FileNotFoundError:
+            return None
+        payload = _strict_json_object(raw)
+        if (
+            set(payload)
+            != {
+                "schema_version",
+                "authorization_id",
+                "expected_reason",
+                "expected_producer_epoch",
+                "expected_state_hash",
+                "expected_prior_source_sha",
+                "expected_prior_image_id",
+                "expected_target_source_sha",
+                "expected_target_image_id",
+                "issued_at",
+                "expires_at",
+            }
+            or payload["schema_version"] != "hermes-rescue-recovery-authorization-v1"
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
+                str(payload["authorization_id"]),
+            )
+            or payload["expected_reason"] != "legacy_unattributed"
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{32}", str(payload["expected_producer_epoch"])
+            )
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{64}", str(payload["expected_state_hash"])
+            )
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(payload["expected_prior_source_sha"]),
+            )
+            or not __import__("re").fullmatch(
+                r"sha256:[0-9a-f]{64}", str(payload["expected_prior_image_id"])
+            )
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{40}|[0-9a-f]{64}",
+                str(payload["expected_target_source_sha"]),
+            )
+            or not __import__("re").fullmatch(
+                r"sha256:[0-9a-f]{64}", str(payload["expected_target_image_id"])
+            )
+            or type(payload["issued_at"]) not in {int, float}
+            or not math.isfinite(float(payload["issued_at"]))
+            or type(payload["expires_at"]) not in {int, float}
+            or not math.isfinite(float(payload["expires_at"]))
+            or not 0
+            < float(payload["expires_at"]) - float(payload["issued_at"])
+            <= _RECOVERY_MAX_TTL_SECONDS
+        ):
+            raise ValueError("invalid telemetry recovery authorization")
+        if (
+            payload["expected_target_source_sha"] != self.source_sha
+            or payload["expected_target_image_id"] != self.image_id
+            or payload["expected_producer_epoch"] != self.producer_epoch
+        ):
+            return None
+        recover_snapshot_sequence(
+            self.output_path,
+            keyring=self.keyring,
+            expected_uid=_posix_uid(),
+            expected_gid=self.runtime_gid,
+        )
+        snapshot = _strict_json_object(
+            _secure_read(
+                self.output_path,
+                expected_uid=_posix_uid(),
+                expected_gid=self.runtime_gid,
+                file_mode=0o600,
+                parent_mode=0o750,
+                max_bytes=2_000_000,
+            )
+        )
+        if (
+            snapshot.get("producer_epoch") != self.producer_epoch
+            or snapshot.get("source_sha") != payload["expected_prior_source_sha"]
+            or snapshot.get("image_id") != payload["expected_prior_image_id"]
+            or snapshot.get("telemetry_health") != "degraded"
+        ):
+            return None
+        return payload
 
     def _load_or_create_continuity(self) -> None:
         try:
@@ -565,7 +848,10 @@ class QuiescenceReporter:
         if (
             type(floor) is not dict
             or set(floor) != {"turn", "tool", "provider"}
-            or any(type(value) is not int or not 0 <= value <= 100_000 for value in floor.values())
+            or any(
+                type(value) is not int or not 0 <= value <= 100_000
+                for value in floor.values()
+            )
             or type(payload["policy_evidence_floor"]) is not list
             or len(payload["policy_evidence_floor"]) > 256
         ):
@@ -608,7 +894,20 @@ class QuiescenceReporter:
         )
         self.producer_epoch = str(snapshot["producer_epoch"])
         self.sequence = sequence
-        self.state.telemetry_health = "degraded"
+        if (
+            snapshot.get("telemetry_health") == "healthy"
+            and snapshot.get("active_turn_count") == 0
+            and snapshot.get("active_tool_count") == 0
+            and snapshot.get("active_provider_action_count") == 0
+            and not any(
+                item.get("completed_at") is None
+                for item in snapshot.get("policy_evidence", [])
+                if type(item) is dict
+            )
+        ):
+            self.state.degrade("continuity_gap")
+        else:
+            self.state.degrade("legacy_unattributed")
         self.count_floor = {
             "turn": int(snapshot["active_turn_count"]),
             "tool": int(snapshot["active_tool_count"]),
@@ -735,6 +1034,61 @@ class QuiescenceReporter:
     def _persist_state(self) -> None:
         self._persist_continuity_state()
 
+    def _maybe_recover(
+        self,
+        *,
+        current: float,
+        gateway_state: str,
+        active_counts: tuple[int, int, int],
+        policy_evidence: list[dict[str, Any]],
+    ) -> bool:
+        if self.state.telemetry_health != "degraded":
+            if self.state.recovery_idle_emissions:
+                self.state.recovery_idle_emissions = 0
+                return True
+            return False
+        reasons = self.state.degradation_reasons
+        if reasons == {"continuity_gap"}:
+            authorization_id: str | None = None
+        elif reasons == {"legacy_unattributed"}:
+            authorization = self.recovery_authorization
+            if (
+                authorization is None
+                or current < float(authorization["issued_at"])
+                or current > float(authorization["expires_at"])
+                or authorization["authorization_id"] in self.state.consumed_recovery_ids
+                or authorization["expected_state_hash"] != self._recovery_subject_hash()
+            ):
+                if self.state.recovery_idle_emissions:
+                    self.state.recovery_idle_emissions = 0
+                    return True
+                return False
+            authorization_id = str(authorization["authorization_id"])
+            if len(self.state.consumed_recovery_ids) >= _RECOVERY_ID_CAPACITY:
+                self.state.degrade("recovery_ledger_exhausted")
+                return True
+        else:
+            if self.state.recovery_idle_emissions:
+                self.state.recovery_idle_emissions = 0
+                return True
+            return False
+        safe_idle = (
+            gateway_state == "active"
+            and active_counts == (0, 0, 0)
+            and all(value == 0 for value in self.count_floor.values())
+            and self.state.reconciled_crashes == 0
+            and not any(item["completed_at"] is None for item in policy_evidence)
+        )
+        if not safe_idle:
+            if self.state.recovery_idle_emissions:
+                self.state.recovery_idle_emissions = 0
+                return True
+            return False
+        self.state.recovery_idle_emissions += 1
+        if self.state.recovery_idle_emissions >= _RECOVERY_STABLE_EMISSIONS:
+            self.state.recover(authorization_id)
+        return True
+
     def process_event(
         self,
         payload: bytes,
@@ -761,15 +1115,16 @@ class QuiescenceReporter:
                     now=event_now,
                 )
                 if changed:
+                    self.state.note_activity()
                     if is_start:
                         self._invalidate_snapshot()
                     self._persist_state()
                     durably_persisted = True
                     if is_start:
                         self.emit_snapshot(now=float(event_now))
-            except ReporterCapacityExhausted:
+            except ReporterCapacityExhausted as exc:
                 self.state = prior
-                self.state.telemetry_health = "degraded"
+                self.state.degrade(exc.reason)
                 self._invalidate_snapshot()
                 self._persist_state()
                 self.emit_snapshot(now=float(event_now))
@@ -788,15 +1143,13 @@ class QuiescenceReporter:
                 expected_uid=self.expected_hermes_uid
             )
             if gateway_state == "unknown":
-                self.state.telemetry_health = "degraded"
+                self.state.degrade("gateway_unknown")
                 self._persist_state()
             if self.sequence >= (2**63 - 1):
-                self.state.telemetry_health = "degraded"
+                self.state.degrade("sequence_exhausted")
                 self._persist_state()
                 self._invalidate_snapshot()
                 raise OverflowError("producer sequence exhausted")
-            self.sequence += 1
-            self._persist_producer_state()
             active_turns, active_tools, active_providers = self.state.active_counts()
             active_turns = max(active_turns, self.count_floor["turn"])
             active_tools = max(active_tools, self.count_floor["tool"])
@@ -808,6 +1161,8 @@ class QuiescenceReporter:
                 for item in self.state.policy_evidence()
                 if item["turn_id"] not in retained_turn_ids
             )
+            self.sequence += 1
+            self._persist_producer_state()
             unsigned = {
                 "schema_version": QUIESCENCE_SCHEMA_VERSION,
                 "producer_epoch": self.producer_epoch,
@@ -836,6 +1191,18 @@ class QuiescenceReporter:
                 expected_parent_uid=_posix_uid(),
                 expected_parent_gid=self.runtime_gid,
             )
+            prior_recovery_state = ReporterState.from_payload(self.state.to_payload())
+            try:
+                if self._maybe_recover(
+                    current=current,
+                    gateway_state=gateway_state,
+                    active_counts=(active_turns, active_tools, active_providers),
+                    policy_evidence=policy_evidence,
+                ):
+                    self._persist_state()
+            except Exception:
+                self.state = prior_recovery_state
+                raise
             return snapshot
 
     def serve(
@@ -884,7 +1251,12 @@ class QuiescenceReporter:
                                 peer_pid=peer_pid,
                                 peer_uid=peer_uid,
                             )
-                        except (ValueError, PermissionError, json.JSONDecodeError, OSError):
+                        except (
+                            ValueError,
+                            PermissionError,
+                            json.JSONDecodeError,
+                            OSError,
+                        ):
                             connection.sendall(b"REJECT\n")
                         else:
                             connection.sendall(b"OK\n")
@@ -907,14 +1279,18 @@ def _read_identity(
     expected_uid: int,
     expected_gid: int,
 ) -> str:
-    value = _secure_read(
-        path,
-        expected_uid=expected_uid,
-        expected_gid=expected_gid,
-        file_mode=0o400,
-        parent_mode=0o750,
-        max_bytes=256,
-    ).decode("ascii").strip()
+    value = (
+        _secure_read(
+            path,
+            expected_uid=expected_uid,
+            expected_gid=expected_gid,
+            file_mode=0o400,
+            parent_mode=0o750,
+            max_bytes=256,
+        )
+        .decode("ascii")
+        .strip()
+    )
     if not __import__("re").fullmatch(pattern, value):
         raise ValueError(f"invalid identity file: {path.name}")
     return value
@@ -928,6 +1304,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--continuity-dir", type=Path, default=Path("/var/lib/hermes-rescue")
+    )
+    parser.add_argument(
+        "--recovery-authorization",
+        type=Path,
+        default=Path("/run/hermes-rescue-secrets/telemetry-recovery-v1.json"),
     )
     parser.add_argument(
         "--current-key",
@@ -995,12 +1376,22 @@ def main() -> int:
             expected_uid=reporter_uid,
             expected_gid=runtime_gid,
         ),
-        read_hmac_key(args.current_key, expected_uid=reporter_uid, expected_gid=runtime_gid),
+        read_hmac_key(
+            args.current_key, expected_uid=reporter_uid, expected_gid=runtime_gid
+        ),
     )
     next_slot = None
     cutover = None
-    if args.next_key.exists() or args.next_key_id_file.exists() or args.cutover_file.exists():
-        if not (args.next_key.exists() and args.next_key_id_file.exists() and args.cutover_file.exists()):
+    if (
+        args.next_key.exists()
+        or args.next_key_id_file.exists()
+        or args.cutover_file.exists()
+    ):
+        if not (
+            args.next_key.exists()
+            and args.next_key_id_file.exists()
+            and args.cutover_file.exists()
+        ):
             raise ValueError("incomplete next-key rotation slot")
         next_slot = KeySlot(
             _read_identity(
@@ -1009,7 +1400,9 @@ def main() -> int:
                 expected_uid=reporter_uid,
                 expected_gid=runtime_gid,
             ),
-            read_hmac_key(args.next_key, expected_uid=reporter_uid, expected_gid=runtime_gid),
+            read_hmac_key(
+                args.next_key, expected_uid=reporter_uid, expected_gid=runtime_gid
+            ),
         )
         cutover = float(
             _read_identity(
@@ -1039,6 +1432,7 @@ def main() -> int:
         source_sha=source_sha,
         image_id=image_id,
         expected_hermes_uid=args.expected_hermes_uid,
+        recovery_authorization_path=args.recovery_authorization,
     ).serve()
     return 0
 

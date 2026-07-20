@@ -64,6 +64,7 @@ def _durable_reporter(
     continuity_dir: Path,
     *,
     max_turns: int = 8,
+    recovery_authorization_path: Path | None = None,
 ):
     from agent.rescue_plane_core import KeyRing, KeySlot
     from agent.rescue_quiescence_reporter import QuiescenceReporter
@@ -80,7 +81,102 @@ def _durable_reporter(
         image_id="sha256:" + "b" * 64,
         expected_hermes_uid=os.getuid(),
         max_turns=max_turns,
+        recovery_authorization_path=recovery_authorization_path,
     )
+
+
+def _write_recovery_authorization(
+    path: Path,
+    *,
+    reporter,
+    authorization_id: str = "4faeb31c-15fe-4f14-a1e2-11892cbcb5b6",
+    expected_state_hash: str | None = None,
+    prior_source_sha: str = "a" * 40,
+    prior_image_id: str = "sha256:" + "b" * 64,
+    target_source_sha: str = "a" * 40,
+    target_image_id: str = "sha256:" + "b" * 64,
+    issued_at: float = 0.0,
+    expires_at: float = 300.0,
+) -> None:
+    path.parent.mkdir(mode=0o750, exist_ok=True)
+    path.parent.chmod(0o750)
+    path.unlink(missing_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "hermes-rescue-recovery-authorization-v1",
+                "authorization_id": authorization_id,
+                "expected_reason": "legacy_unattributed",
+                "expected_producer_epoch": reporter.producer_epoch,
+                "expected_state_hash": (
+                    expected_state_hash or reporter._recovery_subject_hash()
+                ),
+                "expected_prior_source_sha": prior_source_sha,
+                "expected_prior_image_id": prior_image_id,
+                "expected_target_source_sha": target_source_sha,
+                "expected_target_image_id": target_image_id,
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="ascii",
+    )
+    path.chmod(0o400)
+
+
+def _downgrade_continuity_to_legacy_degraded(reporter) -> None:
+    payload = json.loads(reporter.continuity_state_path.read_text(encoding="ascii"))
+    aggregate = payload["aggregate"]
+    aggregate["schema_version"] = "hermes-rescue-reporter-state-v1"
+    aggregate["telemetry_health"] = "degraded"
+    aggregate.pop("degradation_reasons", None)
+    aggregate.pop("recovery_idle_emissions", None)
+    aggregate.pop("consumed_recovery_ids", None)
+    aggregate.pop("event_generation", None)
+    reporter.continuity_state_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="ascii",
+    )
+    reporter.continuity_state_path.chmod(0o600)
+
+
+@linux_only
+def test_healthy_legacy_state_without_backgrounds_migrates_and_persists_v2(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+
+    payload = json.loads(reporter.continuity_state_path.read_text(encoding="ascii"))
+    aggregate = payload["aggregate"]
+    aggregate["schema_version"] = "hermes-rescue-reporter-state-v1"
+    aggregate.pop("backgrounds", None)
+    aggregate.pop("degradation_reasons", None)
+    aggregate.pop("recovery_idle_emissions", None)
+    aggregate.pop("consumed_recovery_ids", None)
+    aggregate.pop("event_generation", None)
+    reporter.continuity_state_path.write_text(
+        json.dumps(payload, sort_keys=True, separators=(",", ":")),
+        encoding="ascii",
+    )
+    reporter.continuity_state_path.chmod(0o600)
+
+    migrated = _durable_reporter(runtime, continuity)
+    assert migrated.state.telemetry_health == "healthy"
+    assert migrated.state.degradation_reasons == set()
+    assert migrated.state.backgrounds == {}
+
+    migrated._persist_state()
+    persisted = json.loads(
+        migrated.continuity_state_path.read_text(encoding="ascii")
+    )["aggregate"]
+    assert persisted["schema_version"] == "hermes-rescue-reporter-state-v2"
+    assert persisted["backgrounds"] == {}
+    assert persisted["degradation_reasons"] == []
 
 
 @linux_only
@@ -231,6 +327,46 @@ def test_reporter_recovers_missing_signed_continuity_but_rejects_corruption(
 
 
 @linux_only
+def test_prospective_idle_continuity_gap_recovers_without_legacy_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    reporter = _reporter(tmp_path)
+    before = reporter.emit_snapshot(now=10.0)
+    reporter.producer_state_path.unlink()
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+
+    recovered = _reporter(tmp_path)
+    assert recovered.state.degradation_reasons == {"continuity_gap"}
+    assert recovered.emit_snapshot(now=11.0)["telemetry_health"] == "degraded"
+    assert recovered.emit_snapshot(now=12.0)["telemetry_health"] == "degraded"
+    assert recovered.emit_snapshot(now=13.0)["telemetry_health"] == "degraded"
+    after = recovered.emit_snapshot(now=14.0)
+    assert after["telemetry_health"] == "healthy"
+    assert after["producer_epoch"] == before["producer_epoch"]
+    assert after["sequence"] == before["sequence"] + 4
+
+
+def test_reporter_accumulates_prospective_degradation_reasons() -> None:
+    from agent.rescue_quiescence_reporter import ReporterState
+
+    state = ReporterState()
+    state.degrade("continuity_gap")
+    state.degrade("gateway_unknown")
+    state.reconcile(lambda _pid: False, now=10.0)
+
+    assert state.telemetry_health == "degraded"
+    assert state.degradation_reasons == {"continuity_gap", "gateway_unknown"}
+    assert state.recovery_idle_emissions == 0
+
+
+@linux_only
 def test_partial_aggregate_loss_with_live_provider_recovers_sticky_degraded(
     tmp_path: Path,
 ) -> None:
@@ -267,6 +403,480 @@ def test_partial_aggregate_loss_with_live_provider_recovers_sticky_degraded(
     assert sticky["sequence"] == recovered["sequence"] + 1
     assert sticky["active_provider_action_count"] >= 1
     assert sticky["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_legacy_degraded_requires_explicit_bound_authorization_to_recover(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+
+    unauthorized = _durable_reporter(runtime, continuity)
+    for now in range(20, 30):
+        assert unauthorized.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=unauthorized)
+    authorized = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(30, 33):
+        assert authorized.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+    assert authorized.emit_snapshot(now=33.0)["telemetry_health"] == "healthy"
+
+
+@linux_only
+def test_recovery_streak_is_durable_across_restart(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=degraded)
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+
+    recovering = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    assert recovering.emit_snapshot(now=20.0)["telemetry_health"] == "degraded"
+    restarted = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    assert restarted.emit_snapshot(now=21.0)["telemetry_health"] == "degraded"
+    assert restarted.emit_snapshot(now=22.0)["telemetry_health"] == "degraded"
+    assert restarted.state.telemetry_health == "healthy"
+    final = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    assert final.emit_snapshot(now=23.0)["telemetry_health"] == "healthy"
+
+
+@linux_only
+def test_authenticated_activity_invalidates_state_bound_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=degraded)
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    recovering = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    assert recovering.emit_snapshot(now=20.0)["telemetry_health"] == "degraded"
+    recovering.process_event(
+        json.dumps(
+            {
+                "schema_version": "hermes-rescue-event-v1",
+                "event": "turn_start",
+                "event_id": "recovery-turn-start",
+                "turn_id": "recovery-turn",
+                "lane": "normal",
+                "artifact_requested": False,
+            }
+        ).encode("ascii"),
+        peer_pid=os.getpid(),
+        peer_uid=os.getuid(),
+        now=25.0,
+    )
+    recovering.process_event(
+        json.dumps(
+            {
+                "schema_version": "hermes-rescue-event-v1",
+                "event": "turn_end",
+                "event_id": "recovery-turn-end",
+                "turn_id": "recovery-turn",
+            }
+        ).encode("ascii"),
+        peer_pid=os.getpid(),
+        peer_uid=os.getuid(),
+        now=26.0,
+    )
+    for now in range(27, 40):
+        assert recovering.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+@pytest.mark.parametrize(
+    "degradation_reason",
+    [
+        "background_unknown",
+        "capacity_exhausted",
+        "gateway_unknown",
+        "sequence_exhausted",
+        "worker_crash",
+    ],
+)
+def test_authorization_never_clears_nonrecoverable_degradation(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    degradation_reason: str,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.state.degrade(degradation_reason)
+    reporter._persist_state()
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    reporter.emit_snapshot(now=10.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=reporter)
+    restarted = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(20, 40):
+        assert restarted.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_recovery_authorization_is_target_bound_expires_and_cannot_replay(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(
+        authorization,
+        reporter=degraded,
+        target_source_sha="c" * 40,
+        expires_at=25.0,
+    )
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    mismatched = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(20, 30):
+        assert mismatched.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+    _write_recovery_authorization(
+        authorization,
+        reporter=mismatched,
+        expires_at=100.0,
+    )
+    authorized = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(40, 44):
+        snapshot = authorized.emit_snapshot(now=float(now))
+    assert snapshot["telemetry_health"] == "healthy"
+
+    authorized.state.degrade("legacy_unattributed")
+    authorized._persist_state()
+    replayed = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(50, 60):
+        assert replayed.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_recovery_authorization_rejects_insecure_mode_and_hardlink(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=degraded)
+
+    authorization.chmod(0o600)
+    with pytest.raises(PermissionError, match="mode"):
+        _durable_reporter(
+            runtime,
+            continuity,
+            recovery_authorization_path=authorization,
+        )
+
+    authorization.chmod(0o400)
+    linked = authorization.with_name("linked-recovery.json")
+    os.link(authorization, linked)
+    with pytest.raises(PermissionError, match="hardlink"):
+        _durable_reporter(
+            runtime,
+            continuity,
+            recovery_authorization_path=authorization,
+        )
+
+
+@linux_only
+def test_recovery_authorization_rejects_ttl_over_five_minutes(
+    tmp_path: Path,
+) -> None:
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(
+        authorization,
+        reporter=degraded,
+        issued_at=10.0,
+        expires_at=310.1,
+    )
+
+    with pytest.raises(ValueError, match="invalid telemetry recovery authorization"):
+        _durable_reporter(
+            runtime,
+            continuity,
+            recovery_authorization_path=authorization,
+        )
+
+
+@linux_only
+def test_mixed_legacy_reason_never_bypasses_authorization(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.state.degrade("legacy_unattributed")
+    reporter.state.degrade("continuity_gap")
+    reporter._persist_state()
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    for now in range(20, 30):
+        assert reporter.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_failed_snapshot_write_does_not_advance_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=degraded)
+    recovering = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    original_write = reporter_module.atomic_write_secure
+
+    def fail_snapshot(path: Path, *args, **kwargs):
+        if path == recovering.output_path:
+            raise OSError("snapshot write failed")
+        return original_write(path, *args, **kwargs)
+
+    monkeypatch.setattr(reporter_module, "atomic_write_secure", fail_snapshot)
+    with pytest.raises(OSError, match="snapshot write failed"):
+        recovering.emit_snapshot(now=20.0)
+    assert recovering.state.recovery_idle_emissions == 0
+
+    monkeypatch.setattr(reporter_module, "atomic_write_secure", original_write)
+    restarted = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in (21.0, 22.0, 23.0):
+        assert restarted.emit_snapshot(now=now)["telemetry_health"] == "degraded"
+    assert restarted.emit_snapshot(now=24.0)["telemetry_health"] == "healthy"
+
+
+def test_event_generation_prevents_seen_event_rollover_hash_restoration() -> None:
+    from agent.rescue_quiescence_reporter import ReporterState, recovery_subject_hash
+
+    state = ReporterState()
+    before = recovery_subject_hash(
+        producer_epoch="a" * 32,
+        state=state,
+        count_floor={"turn": 0, "tool": 0, "provider": 0},
+        policy_evidence_floor=[],
+    )
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "provider_start",
+            "event_id": "start",
+            "turn_id": "turn",
+            "work_id": "provider",
+        },
+        peer_pid=501,
+        peer_uid=10000,
+        now=1.0,
+    )
+    state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "provider_end",
+            "event_id": "end",
+            "turn_id": "turn",
+            "work_id": "provider",
+        },
+        peer_pid=501,
+        peer_uid=10000,
+        now=2.0,
+    )
+    state.seen_events.clear()
+    after = recovery_subject_hash(
+        producer_epoch="a" * 32,
+        state=state,
+        count_floor={"turn": 0, "tool": 0, "provider": 0},
+        policy_evidence_floor=[],
+    )
+
+    assert state.active_counts() == (0, 0, 0)
+    assert state.event_generation == 2
+    assert after != before
+
+
+def test_consumed_recovery_ids_are_not_silently_truncated() -> None:
+    from agent.rescue_quiescence_reporter import ReporterState
+
+    state = ReporterState()
+    state.consumed_recovery_ids = [
+        f"00000000-0000-4000-8000-{index:012x}" for index in range(32)
+    ]
+
+    restored = ReporterState.from_payload(state.to_payload())
+
+    assert restored.consumed_recovery_ids == state.consumed_recovery_ids
+
+
+@linux_only
+def test_unknown_gateway_permanently_blocks_authorized_recovery(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    reporter.emit_snapshot(now=10.0)
+    _downgrade_continuity_to_legacy_degraded(reporter)
+    degraded = _durable_reporter(runtime, continuity)
+    degraded.emit_snapshot(now=11.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v1.json"
+    _write_recovery_authorization(authorization, reporter=degraded)
+    states = iter(
+        [
+            ([321], "active"),
+            ([321], "active"),
+            ([], "unknown"),
+            ([321], "active"),
+            ([321], "active"),
+            ([321], "active"),
+            ([321], "active"),
+            ([321], "active"),
+            ([321], "active"),
+        ]
+    )
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: next(states),
+    )
+    recovering = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+
+    assert recovering.emit_snapshot(now=20.0)["telemetry_health"] == "degraded"
+    assert recovering.emit_snapshot(now=21.0)["telemetry_health"] == "degraded"
+    assert recovering.emit_snapshot(now=22.0)["telemetry_health"] == "degraded"
+    for now in range(23, 29):
+        assert recovering.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
 
 
 @linux_only
@@ -448,7 +1058,6 @@ def test_policy_evidence_retains_120_seconds_and_capacity_fails_closed() -> None
     ]
     assert state.telemetry_health == "degraded"
 
-    state.telemetry_health = "healthy"
     state.apply_event(third, peer_pid=503, peer_uid=10000, now=122.0)
     assert [item["turn_id"] for item in state.policy_evidence()] == [
         "turn-2",
@@ -627,6 +1236,60 @@ def test_capacity_exhaustion_publishes_degraded_snapshot_and_rejects_start(
         "turn-0",
         "turn-1",
     ]
+
+
+@linux_only
+@pytest.mark.parametrize(
+    ("setup_active_work", "expected_reason"),
+    [(True, "active_work_bound"), (False, "sequence_exhausted")],
+)
+def test_reporter_persists_nonrecoverable_reason_when_event_is_rejected(
+    tmp_path: Path,
+    setup_active_work: bool,
+    expected_reason: str,
+) -> None:
+    from agent.rescue_quiescence_reporter import ReporterState
+
+    reporter = _reporter(tmp_path)
+    reporter.state = ReporterState(max_turns=8, max_work=1)
+    if setup_active_work:
+        reporter.process_event(
+            json.dumps(
+                {
+                    "schema_version": "hermes-rescue-event-v1",
+                    "event": "provider_start",
+                    "event_id": "first-start",
+                    "turn_id": "turn",
+                    "work_id": "first",
+                }
+            ).encode("ascii"),
+            peer_pid=os.getpid(),
+            peer_uid=os.getuid(),
+            now=10.0,
+        )
+    else:
+        reporter.state.event_generation = 2**63 - 1
+        reporter._persist_state()
+
+    with pytest.raises(ValueError, match="bound exceeded|exhausted"):
+        reporter.process_event(
+            json.dumps(
+                {
+                    "schema_version": "hermes-rescue-event-v1",
+                    "event": "provider_start",
+                    "event_id": "rejected-start",
+                    "turn_id": "turn",
+                    "work_id": "rejected",
+                }
+            ).encode("ascii"),
+            peer_pid=os.getpid(),
+            peer_uid=os.getuid(),
+            now=11.0,
+        )
+
+    restarted = _reporter(tmp_path)
+    assert restarted.state.telemetry_health == "degraded"
+    assert expected_reason in restarted.state.degradation_reasons
 
 
 def test_reporter_rolls_back_exit_when_durable_persist_fails(
