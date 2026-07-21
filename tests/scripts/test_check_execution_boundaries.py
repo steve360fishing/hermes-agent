@@ -3,10 +3,13 @@ from __future__ import annotations
 import importlib.util
 import copy
 import json
+import os
 import subprocess
 import sys
 from copy import deepcopy
 from pathlib import Path
+
+import pytest
 
 
 REPO_ROOT = Path(__file__).resolve().parents[2]
@@ -24,6 +27,9 @@ def _load_checker():
 
 
 def test_repository_execution_boundary_registry_is_complete():
+    if os.environ.get("HERMES_SKIP_DUPLICATE_BOUNDARY_REPOSITORY_CHECK") == "1":
+        pytest.skip("covered by the dedicated blocking execution-boundary job")
+
     result = subprocess.run(
         [sys.executable, str(SCRIPT), "--root", str(REPO_ROOT)],
         capture_output=True,

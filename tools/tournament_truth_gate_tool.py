@@ -8,6 +8,7 @@ there is intentionally no provider fetch or retry path here.
 from __future__ import annotations
 
 import json
+import os
 from datetime import datetime, timezone
 from pathlib import Path
 import subprocess
@@ -22,6 +23,7 @@ from agent.tournament_research_contract import (
     canonical_json_sha256,
     configured_runtime_roots,
     contained_path,
+    secure_read_contained_text,
 )
 from tools.registry import registry, tool_error, tool_result
 
@@ -64,7 +66,7 @@ def _run_preflight(contract, roots, request_payload: Mapping[str, Any], *, suffi
     try:
         output_dir.mkdir(parents=True, exist_ok=False)
         with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", dir=output_dir, delete=False) as handle:
-            json.dump(request_payload, handle, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            json.dump(request_payload, handle, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
             request_path = Path(handle.name)
         command = _audit_command() + [
             "--request-json", str(request_path), "--journal-pointer", str(roots.journal_root / "LATEST-JOURNAL.json"),
@@ -74,6 +76,8 @@ def _run_preflight(contract, roots, request_payload: Mapping[str, Any], *, suffi
         completed = subprocess.run(
             command, shell=False, stdin=subprocess.DEVNULL, capture_output=True,
             text=True, timeout=TIMEOUT_SECONDS, check=False,
+            cwd=roots.source_snapshot_root,
+            env={"PATH": os.environ.get("PATH", ""), "PYTHONUTF8": "1", "PYTHONSAFEPATH": "1"},
         )
     except subprocess.TimeoutExpired:
         return None, None, "audit_preflight_timeout"
@@ -86,8 +90,12 @@ def _run_preflight(contract, roots, request_payload: Mapping[str, Any], *, suffi
         return None, None, "audit_preflight_failed"
     try:
         result = json.loads(completed.stdout)
-        receipt_path = contained_path(roots.receipt_root, str(result.get("receipt_path") or ""))
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path else None
+        expected_receipt_path = output_dir / "receipt.json"
+        receipt_path = contained_path(roots.receipt_root, expected_receipt_path)
+        if str(result.get("receipt_path") or "") != str(expected_receipt_path):
+            return None, None, "audit_receipt_path_mismatch"
+        receipt_text = secure_read_contained_text(roots.receipt_root, receipt_path) if receipt_path else None
+        receipt = json.loads(receipt_text) if receipt_text else None
     except (OSError, ValueError, TypeError, UnicodeDecodeError):
         return None, None, "audit_receipt_invalid"
     return receipt_path, receipt, "receipt_loaded"

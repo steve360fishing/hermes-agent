@@ -128,19 +128,7 @@ def _finalize_turn_impl(
                 error_code="artifact_write_not_verified",
             )
 
-    # Tournament output is a request-local integrity boundary, not a generic
-    # plugin hook.  It must resolve before this finalizer adds/persists an
-    # assistant row or lets buffered Telegram/TTS streaming escape.
-    from agent.tournament_research_contract import finalize_tournament_output
-
-    final_response, tournament_telemetry, tournament_failed = finalize_tournament_output(
-        agent,
-        candidate=final_response,
-        messages=messages,
-    )
-    if tournament_failed:
-        failed = True
-        _turn_exit_reason = final_response or "ROUTE_HOLD"
+    tournament_telemetry = None
 
     if final_response is None and (
         api_call_count >= agent.max_iterations
@@ -449,6 +437,18 @@ def _finalize_turn_impl(
                     break  # First non-empty string wins
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
+
+    # This is deliberately after every response transform/hook and before the
+    # deferred session write and gateway return. The one accepted byte string
+    # is therefore the only version that can be persisted or delivered.
+    from agent.tournament_research_contract import finalize_tournament_output
+
+    final_response, tournament_telemetry, tournament_failed = finalize_tournament_output(
+        agent, candidate=final_response, messages=messages,
+    )
+    if tournament_failed:
+        failed = True
+        _turn_exit_reason = final_response or "ROUTE_HOLD"
 
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.

@@ -1,7 +1,7 @@
 # Tournament research contract
 
 Hermes protects tournament-result turns against the SportFish audit repair head
-`271141abc8fd63cee3c9773fc800bdd786d871ef` and
+`8904a313dfae6cd364c34c0b247c1a71d9b5cc01` and
 `tournament_route_preflight.v2`. This reference remains under audit re-review;
 it is not described as frozen.
 

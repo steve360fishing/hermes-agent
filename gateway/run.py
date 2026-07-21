@@ -19231,7 +19231,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # also the sole guard on the fallback branch taken when mid-run
             # context compression shrinks the message list below the original
             # history length, preserving the compression-safe behaviour of #160.
-            if "MEDIA:" not in final_response:
+            # Tournament final text is receipt-bound and already persisted.
+            # Do not append tool-derived media directives after that binding.
+            if "MEDIA:" not in final_response and not result.get("tournament_research"):
                 media_tags, has_voice_directive = _collect_auto_append_media_tags(
                     result.get("messages", []),
                     history_offset=len(agent_history),

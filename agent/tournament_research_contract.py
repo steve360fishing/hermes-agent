@@ -24,6 +24,10 @@ from typing import Any, Callable, Mapping
 
 AUDIT_SCHEMA_VERSION = "tournament_route_preflight.v2"
 RECEIPT_LIFETIME = timedelta(minutes=15)
+AUDIT_SOURCE_REPOSITORY = "sportfishhub-audit"
+# This remains the attested repair head until the audit repository publishes
+# its reviewed final head; the compatibility fixture deliberately documents it.
+AUDIT_CONTRACT_COMMIT = "8904a313dfae6cd364c34c0b247c1a71d9b5cc01"
 
 
 class TournamentIntent(str, Enum):
@@ -52,18 +56,18 @@ _TOURNAMENT_IDENTITY_CUE = re.compile(
     re.IGNORECASE,
 )
 _SPORTFISH_CUE = re.compile(
-    r"\b(?:boat|angler|captain|team|fleet|marlin|sailfish|wahoo|mahi|"
+    r"\b(?:boat|angler|captain|fleet|marlin|sailfish|wahoo|mahi|"
     r"tuna|kingfish|game\s+fish)\b",
     re.IGNORECASE,
 )
 _PRIVATE_CUE = re.compile(r"\b(?:private|internal|draft|research|audit|review|verify)\b", re.IGNORECASE)
 _RESULT_CUE = re.compile(r"\b(?:results?|scor(?:e|ing)|winner|won|placing|points?)\b", re.IGNORECASE)
-_PUBLIC_CUE = re.compile(r"\b(?:public|publish|post|send|announce|share|carousel|story|newsletter|image|caption)\b", re.IGNORECASE)
+_PUBLIC_CUE = re.compile(r"\b(?:public|publish|post|send|announce|share|carousel|story|newsletter|image|caption|flyer|graphic|website)\b", re.IGNORECASE)
 
 
 def canonical_json_sha256(value: Mapping[str, Any]) -> str:
     return hashlib.sha256(
-        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=True).encode("utf-8")
+        json.dumps(value, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode("utf-8")
     ).hexdigest()
 
 
@@ -78,7 +82,7 @@ def _trusted_journal_aliases() -> set[str] | None:
     try:
         pointer_text = secure_read_contained_text(roots.journal_root, pointer_path)
         pointer = json.loads(pointer_text) if pointer_text else None
-        journal_path = contained_path(roots.journal_root, pointer.get("canonical_journal_path", ""))
+        journal_path = contained_path(roots.journal_root, pointer_path.parent / str(pointer.get("canonical_journal_path", "")))
         journal_text = secure_read_contained_text(roots.journal_root, journal_path) if journal_path else None
         journal = json.loads(journal_text) if journal_text else None
     except (OSError, ValueError, TypeError, UnicodeDecodeError):
@@ -191,6 +195,8 @@ class TournamentResearchContract:
     stream_deltas: list[str] = field(default_factory=list)
     original_stream_delta_callback: Callable[[str | None], None] | None = None
     original_stream_callback: Callable[[str | None], None] | None = None
+    original_persist_session: Callable[..., None] | None = None
+    pending_persistence: tuple[list[dict[str, Any]], list[dict[str, Any]] | None] | None = None
     buffer_callback: Callable[[str | None], None] | None = None
     receipt_path: Path | None = None
     receipt_candidate_sha256: str | None = None
@@ -199,10 +205,11 @@ class TournamentResearchContract:
     receipt_expires_at: datetime | None = None
     used: bool = False
     closed: bool = False
+    added_tool_schema: bool = False
 
     def buffer(self, delta: str | None) -> None:
-        if isinstance(delta, str) and delta:
-            self.stream_deltas.append(delta)
+        # Tool-call prose and intermediate candidates must never escape.
+        return None
 
     def attach_receipt(
         self, *, receipt_path: Path, candidate: str, metadata: Mapping[str, Any], audit_request: Mapping[str, Any], expires_at: datetime
@@ -237,14 +244,13 @@ class TournamentResearchContract:
             "streamed_chars": sum(len(delta) for delta in self.stream_deltas),
         }
 
-    def release(self) -> bool:
+    def release(self, candidate: str) -> bool:
         delivered = False
         for callback in self.callbacks:
             try:
-                for delta in self.stream_deltas:
-                    callback(delta)
+                callback(candidate)
                 callback(None)
-                delivered = bool(self.stream_deltas) or delivered
+                delivered = bool(candidate) or delivered
             except Exception:
                 pass
         self.stream_deltas.clear()
@@ -254,16 +260,34 @@ class TournamentResearchContract:
         if self.closed:
             return
         self.closed = True
-        if getattr(agent, "stream_delta_callback", None) is self.buffer_callback:
+        if _same_callback(getattr(agent, "stream_delta_callback", None), self.buffer_callback):
             agent.stream_delta_callback = self.original_stream_delta_callback
-        if getattr(agent, "_stream_callback", None) is self.buffer_callback:
+        if _same_callback(getattr(agent, "_stream_callback", None), self.buffer_callback):
             agent._stream_callback = self.original_stream_callback
+        if _same_callback(getattr(agent, "_persist_session", None), self._defer_persistence):
+            agent._persist_session = self.original_persist_session
         guardrails = getattr(agent, "_tool_guardrails", None)
         if guardrails is not None:
             guardrails.set_tournament_contract(None)
+        if self.added_tool_schema:
+            tools = getattr(agent, "tools", None)
+            if isinstance(tools, list):
+                agent.tools = [tool for tool in tools if tool.get("function", {}).get("name") != "tournament_truth_gate"]
+            valid_names = getattr(agent, "valid_tool_names", None)
+            if isinstance(valid_names, set):
+                valid_names.discard("tournament_truth_gate")
         with _CONTRACTS_LOCK:
             _CONTRACTS.pop((self.task_id, self.session_id), None)
         self.stream_deltas.clear()
+
+    def _defer_persistence(self, messages, conversation_history=None) -> None:
+        self.pending_persistence = (messages, conversation_history)
+
+    def persist_final_bytes(self, agent) -> None:
+        pending = self.pending_persistence
+        self.pending_persistence = None
+        if pending and callable(self.original_persist_session):
+            self.original_persist_session(*pending)
 
 
 def begin_tournament_research_contract(agent, *, message: object, task_id: str, stream_callback=None) -> TournamentResearchContract | None:
@@ -280,14 +304,27 @@ def begin_tournament_research_contract(agent, *, message: object, task_id: str, 
         intent=intent, task_id=task_id, session_id=session_id, turn_id=turn_id,
         entrypoint=entrypoint, destination=f"platform:{platform}",
     )
+    from tools.tournament_truth_gate_tool import TOURNAMENT_TRUTH_GATE_SCHEMA
+    tools = getattr(agent, "tools", None)
+    if isinstance(tools, list) and not any(
+        tool.get("function", {}).get("name") == "tournament_truth_gate" for tool in tools
+    ):
+        tools.append({"type": "function", "function": TOURNAMENT_TRUTH_GATE_SCHEMA})
+        valid_names = getattr(agent, "valid_tool_names", None)
+        if isinstance(valid_names, set):
+            valid_names.add("tournament_truth_gate")
+        contract.added_tool_schema = True
     contract.buffer_callback = contract.buffer
     contract.original_stream_delta_callback = getattr(agent, "stream_delta_callback", None)
     contract.original_stream_callback = getattr(agent, "_stream_callback", None)
+    contract.original_persist_session = getattr(agent, "_persist_session", None)
     for callback in (contract.original_stream_delta_callback, contract.original_stream_callback, stream_callback):
         if callable(callback) and not any(_same_callback(callback, existing) for existing in contract.callbacks):
             contract.callbacks.append(callback)
     agent.stream_delta_callback = contract.buffer_callback
     agent._stream_callback = contract.buffer_callback
+    if callable(contract.original_persist_session):
+        agent._persist_session = contract._defer_persistence
     agent._tournament_research_contract = contract
     guardrails = getattr(agent, "_tool_guardrails", None)
     if guardrails is not None:
@@ -311,8 +348,9 @@ def _same_callback(left, right) -> bool:
 
 def clear_tournament_research_contract(agent) -> None:
     contract = getattr(agent, "_tournament_research_contract", None)
-    if isinstance(contract, TournamentResearchContract):
-        contract.cleanup(agent)
+    cleanup = getattr(contract, "cleanup", None)
+    if callable(cleanup):
+        cleanup(agent)
     agent._tournament_research_contract = None
 
 
@@ -369,6 +407,10 @@ def _verify_receipt(contract: TournamentResearchContract, candidate: str) -> Tou
         return TournamentReceiptDecision(False, code)
     if receipt.get("schema_version") != AUDIT_SCHEMA_VERSION:
         return TournamentReceiptDecision(False, "receipt_schema_mismatch")
+    if receipt.get("source_repository") != AUDIT_SOURCE_REPOSITORY:
+        return TournamentReceiptDecision(False, "receipt_source_repository_mismatch")
+    if receipt.get("contract_commit") != AUDIT_CONTRACT_COMMIT:
+        return TournamentReceiptDecision(False, "receipt_contract_commit_mismatch")
     if receipt.get("receipt_hash") != canonical_json_sha256({k: v for k, v in receipt.items() if k != "receipt_hash"}):
         return TournamentReceiptDecision(False, "receipt_hash_mismatch")
     expected_decision = "ALLOW_PRIVATE_ANSWER" if contract.intent is TournamentIntent.PRIVATE else "ALLOW_PUBLIC_ARTIFACT"
@@ -391,12 +433,22 @@ def _verify_receipt(contract: TournamentResearchContract, candidate: str) -> Tou
 
 
 def _redact_current_turn(messages: list[dict[str, Any]], replacement: str) -> None:
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            del messages[index + 1:]
+            messages.append({"role": "assistant", "content": replacement})
+            return
+    messages[:] = [{"role": "assistant", "content": replacement}]
+
+
+def _bind_current_turn_output(messages: list[dict[str, Any]], candidate: str) -> None:
     for message in reversed(messages):
         if message.get("role") == "user":
             break
         if message.get("role") == "assistant" and not message.get("tool_calls"):
-            message["content"] = replacement
+            message["content"] = candidate
             return
+    messages.append({"role": "assistant", "content": candidate})
 
 
 def finalize_tournament_output(agent, *, candidate: str | None, messages: list[dict[str, Any]]) -> tuple[str | None, dict[str, object] | None, bool]:
@@ -407,9 +459,11 @@ def finalize_tournament_output(agent, *, candidate: str | None, messages: list[d
     decision = _verify_receipt(contract, candidate_text)
     if decision.accepted:
         contract.used = True
-        delivered = contract.release()
+        _bind_current_turn_output(messages, candidate_text)
+        delivered = contract.release(candidate_text)
         agent._response_was_previewed = delivered
         telemetry = contract.telemetry(accepted=True, code=decision.code, candidate=candidate_text)
+        contract.persist_final_bytes(agent)
         contract.cleanup(agent)
         agent._tournament_research_contract = None
         return candidate, telemetry, False
@@ -417,6 +471,7 @@ def finalize_tournament_output(agent, *, candidate: str | None, messages: list[d
     _redact_current_turn(messages, response)
     agent._response_was_previewed = False
     telemetry = contract.telemetry(accepted=False, code=decision.code, candidate=candidate_text)
+    contract.persist_final_bytes(agent)
     contract.cleanup(agent)
     agent._tournament_research_contract = None
     return response, telemetry, True
