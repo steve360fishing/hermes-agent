@@ -7,6 +7,15 @@ from unittest.mock import AsyncMock, MagicMock, patch
 import pytest
 
 
+@pytest.fixture(autouse=True)
+def _clear_auxiliary_client_cache():
+    from agent.auxiliary_client import shutdown_cached_clients
+
+    shutdown_cached_clients()
+    yield
+    shutdown_cached_clients()
+
+
 def _enabled_config() -> dict:
     return {
         "model": {
@@ -370,7 +379,7 @@ def test_goal_judge_real_caller_remains_available_on_protected_sol_max(caplog) -
         "agent.auxiliary_client.resolve_provider_client",
         return_value=(client, "gpt-5.6-sol"),
     ), caplog.at_level("INFO", logger="agent.auxiliary_client"):
-        verdict, reason, parse_failed, wait_directive = goals.judge_goal(
+        verdict, reason, parse_failed, wait_directive, transport_failed = goals.judge_goal(
             "finish the task",
             "All acceptance checks passed.",
         )
@@ -379,6 +388,7 @@ def test_goal_judge_real_caller_remains_available_on_protected_sol_max(caplog) -
     assert reason == "all acceptance checks passed"
     assert parse_failed is False
     assert wait_directive is None
+    assert transport_failed is False
     kwargs = client.chat.completions.create.call_args.kwargs
     assert kwargs["model"] == "gpt-5.6-sol"
     assert kwargs["extra_body"]["reasoning"] == {
@@ -413,7 +423,7 @@ def test_goal_judge_uses_one_enabled_policy_snapshot() -> None:
         "agent.auxiliary_client.resolve_provider_client",
         return_value=(client, "gpt-5.6-sol"),
     ):
-        verdict, reason, parse_failed, wait_directive = goals.judge_goal(
+        verdict, reason, parse_failed, wait_directive, transport_failed = goals.judge_goal(
             "finish the task",
             "Verified evidence is attached.",
         )
@@ -422,6 +432,7 @@ def test_goal_judge_uses_one_enabled_policy_snapshot() -> None:
     assert reason == "verified"
     assert parse_failed is False
     assert wait_directive is None
+    assert transport_failed is False
     kwargs = client.chat.completions.create.call_args.kwargs
     assert kwargs["model"] == "gpt-5.6-sol"
     assert kwargs["extra_body"]["reasoning"] == {

@@ -62,6 +62,11 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         "api_key": parent_runtime.get("api_key") or None,
         "base_url": parent_runtime.get("base_url") or None,
         "api_mode": parent_api_mode,
+        "credential_pool": getattr(agent, "_credential_pool", None),
+        "request_overrides": dict(getattr(agent, "request_overrides", {}) or {}),
+        "max_tokens": getattr(agent, "max_tokens", None),
+        "command": getattr(agent, "acp_command", None),
+        "args": list(getattr(agent, "acp_args", []) or []),
         "routed": False,
     }
     try:
@@ -147,10 +152,15 @@ def _resolve_review_runtime(agent: Any) -> Dict[str, Any]:
         )
         return {
             "provider": rp.get("provider") or task_provider,
-            "model": task_model,
+            "model": rp.get("model") or task_model,
             "api_key": rp.get("api_key"),
             "base_url": rp.get("base_url"),
             "api_mode": rp.get("api_mode"),
+            "credential_pool": rp.get("credential_pool"),
+            "request_overrides": dict(rp.get("request_overrides") or {}),
+            "max_tokens": rp.get("max_output_tokens"),
+            "command": rp.get("command"),
+            "args": list(rp.get("args") or []),
             "routed": True,
         }
     except Exception as e:
@@ -748,6 +758,31 @@ def _run_review_in_thread(
             # Match parent's toolset config so ``tools[]`` is byte-identical
             # in the request body — Anthropic's cache key includes it.
             # (The runtime whitelist below still restricts dispatch.)
+            _fork_kwargs: Dict[str, Any] = {}
+            if isinstance(_rt.get("max_tokens"), int):
+                _fork_kwargs["max_tokens"] = _rt["max_tokens"]
+            if isinstance(_rt.get("command"), str) and _rt["command"]:
+                _fork_kwargs["acp_command"] = _rt["command"]
+                _fork_kwargs["acp_args"] = _rt.get("args") or []
+            # Match parent's reasoning config so the fork's ``thinking`` /
+            # ``output_config`` are byte-identical in the request body —
+            # Anthropic's cache key is namespaced by ``thinking`` presence.
+            # Same-model path only: when routed to a different aux model the
+            # cache is cold regardless (parity buys nothing) and the parent's
+            # effort vocabulary may not be valid for the routed model/provider
+            # (e.g. OpenRouter ``extra_body.reasoning.effort`` is forwarded
+            # unclamped; codex_responses passes ``max``/``ultra`` through
+            # unmapped except on gpt-5.6/xAI). Let the routed fork use
+            # provider defaults — matching the ``not _routed`` gate on
+            # _cached_system_prompt below.
+            if not _routed:
+                _fork_kwargs["reasoning_config"] = getattr(agent, "reasoning_config", None)
+            elif _routing_spec is not None:
+                _fork_kwargs["reasoning_config"] = {
+                    "enabled": True,
+                    "effort": _routing_spec.effort,
+                }
+                _fork_kwargs["fallback_model"] = []
             review_agent = AIAgent(
                 model=_rt.get("model") or agent.model,
                 max_iterations=16,
@@ -760,18 +795,14 @@ def _run_review_in_thread(
                 credential_pool=(
                     None
                     if _routing_spec is not None
-                    else getattr(agent, "_credential_pool", None)
+                    else (_rt.get("credential_pool") or getattr(agent, "_credential_pool", None))
                 ),
+                request_overrides=_rt.get("request_overrides") or {},
                 parent_session_id=agent.session_id,
                 enabled_toolsets=getattr(agent, "enabled_toolsets", None),
                 disabled_toolsets=getattr(agent, "disabled_toolsets", None),
                 skip_memory=True,
-                reasoning_config=(
-                    {"enabled": True, "effort": _routing_spec.effort}
-                    if _routing_spec is not None
-                    else None
-                ),
-                fallback_model=[] if _routing_spec is not None else None,
+                **_fork_kwargs,
             )
             if _routing_spec is not None:
                 from hermes_cli.gpt56_routing import validate_codex_route_runtime

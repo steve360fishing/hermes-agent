@@ -65,13 +65,14 @@ def _patches(client, *, task_timeout):
         patch("agent.auxiliary_client._get_cached_client",
               return_value=(client, "gpt-5.5")),
         patch("agent.auxiliary_client._validate_llm_response",
-              side_effect=lambda resp, _task: resp),
+              side_effect=lambda resp, _task, **_kw: resp),
         patch(
             "agent.auxiliary_client._load_auxiliary_config_snapshot",
             return_value={
                 "auxiliary": {
                     "compression": {"timeout": task_timeout},
                     "title_generation": {"timeout": task_timeout},
+                    "session_search": {"timeout": task_timeout},
                 }
             },
         ),
