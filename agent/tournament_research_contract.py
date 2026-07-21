@@ -63,6 +63,14 @@ _SPORTFISH_CUE = re.compile(
 _PRIVATE_CUE = re.compile(r"\b(?:private|internal|draft|research|audit|review|verify)\b", re.IGNORECASE)
 _RESULT_CUE = re.compile(r"\b(?:results?|scor(?:e|ing)|winner|won|placing|points?)\b", re.IGNORECASE)
 _PUBLIC_CUE = re.compile(r"\b(?:public|publish|post|send|announce|share|carousel|story|newsletter|image|caption|flyer|graphic|website)\b", re.IGNORECASE)
+_NEGATION_CUE = re.compile(r"\b(?:do\s+not|don't|without)\b", re.IGNORECASE)
+_NEGATION_RESET = re.compile(
+    r"\b(?:but|instead|then|however)\b|"
+    r",\s*please\b|"
+    r"[-\u2014]\s*(?:please\s+)?(?:create|make|publish|post|send|share|announce|add)\b",
+    re.IGNORECASE,
+)
+_CLAUSE_BOUNDARY = frozenset(".!?;\n")
 
 
 def canonical_json_sha256(value: Mapping[str, Any]) -> str:
@@ -119,7 +127,23 @@ def classify_tournament_intent(message: object) -> TournamentIntent | None:
     alias_match = bool(aliases and any(alias in message.casefold() for alias in aliases))
     if not explicit_identity and not sportfish_result and not alias_match:
         return None
-    return TournamentIntent.PUBLIC if _PUBLIC_CUE.search(message) else TournamentIntent.PRIVATE
+    return TournamentIntent.PUBLIC if _has_affirmative_public_cue(message) else TournamentIntent.PRIVATE
+
+
+def _has_affirmative_public_cue(message: str) -> bool:
+    """Ignore public-output words that occur only inside a negated directive."""
+    for match in _PUBLIC_CUE.finditer(message):
+        clause_start = max(
+            (message.rfind(boundary, 0, match.start()) for boundary in _CLAUSE_BOUNDARY),
+            default=-1,
+        ) + 1
+        prefix = message[clause_start : match.start()]
+        negations = list(_NEGATION_CUE.finditer(prefix))
+        if not negations:
+            return True
+        if _NEGATION_RESET.search(prefix[negations[-1].end() :]):
+            return True
+    return False
 
 
 def configured_runtime_roots() -> RuntimeRoots | None:
@@ -355,8 +379,9 @@ def clear_tournament_research_contract(agent) -> None:
 
 
 def _blocked_response(intent: TournamentIntent, reason: str) -> str:
-    code = "ROUTE_HOLD" if intent is TournamentIntent.PRIVATE else "PUBLIC_ARTIFACT_BLOCKED"
-    return f"{code}: Tournament output was held ({reason}). Re-run the SportFish audit with a current trusted receipt."
+    if intent is TournamentIntent.PRIVATE:
+        return "ROUTE_HOLD"
+    return f"PUBLIC_ARTIFACT_BLOCKED: Tournament output was held ({reason}). Re-run the SportFish audit with a current trusted receipt."
 
 
 def _load_receipt(contract: TournamentResearchContract) -> tuple[Mapping[str, Any] | None, str]:
