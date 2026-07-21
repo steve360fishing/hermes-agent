@@ -1,0 +1,7 @@
+{
+  "contract_commit": "8904a313dfae6cd364c34c0b247c1a71d9b5cc01",
+  "schema_version": "tournament_route_preflight.v2",
+  "source_repository": "sportfishhub-audit",
+  "audit_re_review": "passed",
+  "notes": "Pinned repair-head identity; not frozen until audit re-review passes."
+}

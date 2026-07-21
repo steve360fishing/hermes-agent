@@ -109,6 +109,9 @@ jobs:
           source .venv/bin/activate
           scripts/run_tests.sh --files '${{ matrix.slice.files }}'
         env:
+          # The full repository scan runs in the dedicated blocking lint job.
+          # Keep the matrix's unit-level checker tests without duplicating that scan.
+          HERMES_SKIP_DUPLICATE_BOUNDARY_REPOSITORY_CHECK: "1"
           # Ensure tests don't accidentally call real APIs
           OPENROUTER_API_KEY: ""
           OPENAI_API_KEY: ""
