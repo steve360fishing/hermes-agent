@@ -550,7 +550,9 @@ def _clear_request_contract_after_turn(func):
                 # which blocks restart. Do not discard the user's response.
                 logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
             from agent.task_execution_contract import clear_task_execution_contract
+            from agent.tournament_research_contract import clear_tournament_research_contract
 
+            clear_tournament_research_contract(agent)
             clear_task_execution_contract(agent)
 
     return wrapper
@@ -602,6 +604,12 @@ def run_conversation(
         except Exception:
             pass
 
+    # A previous exception/cancel/reload may have skipped finalization.  Never
+    # let a buffered tournament candidate or persistence wrapper cross turns.
+    from agent.tournament_research_contract import clear_tournament_research_contract
+
+    clear_tournament_research_contract(agent)
+
     # Resolve file-artifact policy before any context compression, plugin, or
     # provider work. A contradictory destination must fail without invoking a
     # model or leaving a reduced-capability contract attached to the session.
@@ -615,6 +623,19 @@ def run_conversation(
     _contract_message = (
         persist_user_message if persist_user_message is not None else user_message
     )
+    # Install the tournament buffer before turn-context setup assigns the
+    # request-local callback, so both that callback and gateway preview output
+    # are guarded by the same request-local contract.
+    from agent.tournament_research_contract import begin_tournament_research_contract
+
+    _tournament_contract = begin_tournament_research_contract(
+        agent,
+        message=_contract_message,
+        task_id=task_id,
+        stream_callback=stream_callback,
+    )
+    if _tournament_contract is not None:
+        stream_callback = _tournament_contract.buffer_callback
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,

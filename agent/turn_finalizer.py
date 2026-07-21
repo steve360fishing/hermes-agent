@@ -128,6 +128,20 @@ def _finalize_turn_impl(
                 error_code="artifact_write_not_verified",
             )
 
+    # Tournament output is a request-local integrity boundary, not a generic
+    # plugin hook.  It must resolve before this finalizer adds/persists an
+    # assistant row or lets buffered Telegram/TTS streaming escape.
+    from agent.tournament_research_contract import finalize_tournament_output
+
+    final_response, tournament_telemetry, tournament_failed = finalize_tournament_output(
+        agent,
+        candidate=final_response,
+        messages=messages,
+    )
+    if tournament_failed:
+        failed = True
+        _turn_exit_reason = final_response or "ROUTE_HOLD"
+
     if final_response is None and (
         api_call_count >= agent.max_iterations
         or agent.iteration_budget.remaining <= 0
@@ -518,6 +532,9 @@ def _finalize_turn_impl(
             decision_status=decision_status,
         )
         logger.info("task execution metadata: %s", result["task_execution"])
+    if tournament_telemetry is not None:
+        result["tournament_research"] = tournament_telemetry
+        logger.info("tournament research metadata: %s", tournament_telemetry)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

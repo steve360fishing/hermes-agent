@@ -1,0 +1,6 @@
+{
+  "contract_commit": "a23b30167011d888900630eb2c0412a94634035d",
+  "schema_version": "tournament_route_preflight.v2",
+  "source_repository": "sportfishhub-audit",
+  "notes": "Pinned cross-repository v2 fixture identity; generated receipts are validated at runtime."
+}

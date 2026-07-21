@@ -230,11 +230,32 @@ class ToolCallGuardrailController:
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
         self._execution_contract: TaskExecutionContract | None = None
+        self._tournament_contract: Any | None = None
         self.reset_for_turn()
 
     def set_execution_contract(self, contract: TaskExecutionContract | None) -> None:
         """Bind the request-local policy evaluated before loop guardrails."""
         self._execution_contract = contract
+
+    def set_tournament_contract(self, contract: Any | None) -> None:
+        """Bind the active request-local tournament safety contract."""
+        self._tournament_contract = contract
+
+    def _tournament_preflight(self, tool_name: str, signature: ToolCallSignature) -> ToolGuardrailDecision | None:
+        contract = self._tournament_contract
+        if contract is None:
+            return None
+        try:
+            authorized = bool(contract.has_valid_receipt())
+        except Exception:
+            authorized = False
+        if authorized or tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
+            return None
+        return ToolGuardrailDecision(
+            action="deny", code="tournament_receipt_required",
+            message="Tournament turn is read-only until tournament_truth_gate binds a current trusted receipt.",
+            tool_name=tool_name, signature=signature,
+        )
 
     def bound_result(self, result: str | None) -> str:
         if self._execution_contract is None:
@@ -248,6 +269,9 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         """Apply request-local shape checks before tool middleware."""
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        tournament_decision = self._tournament_preflight(tool_name, signature)
+        if tournament_decision is not None:
+            return tournament_decision
         if self._execution_contract is None:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         authorization = self._execution_contract.preflight_tool(tool_name, _coerce_args(args))
@@ -278,6 +302,9 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
+        tournament_decision = self._tournament_preflight(tool_name, signature)
+        if tournament_decision is not None:
+            return tournament_decision
         if self._execution_contract is not None:
             authorization = self._execution_contract.before_tool(tool_name, _coerce_args(args))
             if not authorization.allowed:
