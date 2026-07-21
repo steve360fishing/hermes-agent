@@ -3217,7 +3217,9 @@ def run_job(
 
         # Validate an explicit per-job effort before provider resolution. The
         # final model-aware config is resolved after any auth fallback below.
-        _resolve_cron_reasoning_config(job, _cfg)
+        job_reasoning_config = None
+        if job.get("reasoning_effort") not in (None, ""):
+            job_reasoning_config = _resolve_cron_reasoning_config(job, _cfg)
         # Reasoning config is resolved after provider authentication so an auth
         # fallback can first replace the primary model with its configured model.
         from hermes_constants import resolve_reasoning_config
@@ -3345,7 +3347,7 @@ def run_job(
             message = format_runtime_provider_error(exc)
             raise RuntimeError(message) from exc
 
-        reasoning_config = resolve_reasoning_config(
+        reasoning_config = job_reasoning_config or resolve_reasoning_config(
             _cfg if isinstance(_cfg, dict) else {}, str(model)
         )
 

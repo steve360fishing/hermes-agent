@@ -3949,7 +3949,7 @@ def _call_fallback_candidate_sync(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
-    reasoning_config: Optional[dict],
+    reasoning_config: Optional[dict] = None,
 ) -> Optional[Any]:
     """Call one fallback candidate with stale-credential recovery.
 
@@ -3971,12 +3971,12 @@ def _call_fallback_candidate_sync(
     fallback tuned differently from the primary is allowed its own budget
     (#62452).
     """
-    fb_timeout = _fallback_entry_timeout(task, fb_label)
+    fb_timeout = _fallback_entry_timeout(task, source_label)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
             "(task-level was %.0fs)",
-            task or "call", fb_label, fb_timeout, effective_timeout,
+            task or "call", source_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
     fb_base = str(getattr(fb_client, "base_url", "") or "")
@@ -4040,15 +4040,15 @@ async def _call_fallback_candidate_async(
     tools: Optional[list],
     effective_timeout: float,
     effective_extra_body: dict,
-    reasoning_config: Optional[dict],
+    reasoning_config: Optional[dict] = None,
 ) -> Optional[Any]:
     """Async mirror of :func:`_call_fallback_candidate_sync`."""
-    fb_timeout = _fallback_entry_timeout(task, fb_label)
+    fb_timeout = _fallback_entry_timeout(task, source_label)
     if fb_timeout is not None and fb_timeout != effective_timeout:
         logger.info(
             "Auxiliary %s: %s using its configured timeout %.0fs "
             "(task-level was %.0fs)",
-            task or "call", fb_label, fb_timeout, effective_timeout,
+            task or "call", source_label, fb_timeout, effective_timeout,
         )
         effective_timeout = fb_timeout
     fb_base = str(getattr(fb_client, "base_url", "") or "")
@@ -6763,8 +6763,10 @@ def resolve_auxiliary_route_decision(
             "codex_responses" if policy_spec is not None else api_mode
         )
 
-    raw_extra_body = task_config.get("extra_body")
-    task_extra_body = raw_extra_body if isinstance(raw_extra_body, dict) else {}
+    task_extra_body = _get_task_extra_body(
+        normalized_task,
+        task_config=task_config,
+    )
     return AuxiliaryRouteDecision(
         task=normalized_task,
         provider=resolved_provider,
@@ -6924,7 +6926,11 @@ def _effective_aux_timeout(
     return effective
 
 
-def _get_task_extra_body(task: str) -> Dict[str, Any]:
+def _get_task_extra_body(
+    task: str,
+    *,
+    task_config: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
     """Read auxiliary.<task>.extra_body and return a shallow copy when valid.
 
     Also folds in ``auxiliary.<task>.reasoning_effort`` as an
@@ -6942,7 +6948,11 @@ def _get_task_extra_body(task: str) -> Dict[str, Any]:
     auxiliary-task knob — an ensemble-wide value would override the
     per-slot ones.
     """
-    task_config = _get_auxiliary_task_config(task)
+    task_config = (
+        _get_auxiliary_task_config(task)
+        if task_config is None
+        else task_config
+    )
     raw = task_config.get("extra_body")
     result = dict(raw) if isinstance(raw, dict) else {}
     if "reasoning" not in result:

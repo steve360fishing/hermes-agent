@@ -158,6 +158,7 @@ async def test_initial_start_polling_does_not_write_false_green():
     adapter._polling_receive_evidence = True
     adapter._record_polling_liveness = MagicMock()
     adapter._publish_safe_mode_receive_readiness = MagicMock()
+    adapter._schedule_polling_progress_verifier = MagicMock()
 
     assert await adapter._start_polling_resilient(
         drop_pending_updates=False, error_callback=None
@@ -166,6 +167,7 @@ async def test_initial_start_polling_does_not_write_false_green():
     adapter._record_polling_liveness.assert_not_called()
     assert adapter._polling_receive_evidence is False
     adapter._publish_safe_mode_receive_readiness.assert_called_once_with()
+    adapter._schedule_polling_progress_verifier.assert_called_once()
 
 
 @pytest.mark.asyncio

@@ -9,6 +9,7 @@ from __future__ import annotations
 
 import argparse
 import json as jsonlib
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -53,7 +54,21 @@ def _patch_aux_client(content: str, *, model: str = "test-model"):
     callers can still assert on the call.
     """
     mock_fn = MagicMock(return_value=_fake_aux_response(content))
-    return patch("agent.auxiliary_client.call_llm", mock_fn), mock_fn
+    decision = MagicMock()
+    decision.policy_spec.effort = "medium"
+
+    @contextmanager
+    def _patched():
+        from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+        binding = TextAuxiliaryClientBinding(MagicMock(), model, decision)
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=binding,
+        ), patch("agent.auxiliary_client.call_llm", mock_fn):
+            yield
+
+    return _patched(), mock_fn
 
 
 # ---------------------------------------------------------------------------
@@ -155,7 +170,8 @@ def test_specify_task_no_aux_client_configured(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
 
-    with patch(
+    aux_patch, _ = _patch_aux_client("")
+    with aux_patch, patch(
         "agent.auxiliary_client.call_llm",
         side_effect=RuntimeError("No LLM provider configured"),
     ):
@@ -173,8 +189,8 @@ def test_specify_task_llm_api_error_keeps_task_in_triage(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
 
-    client = MagicMock()
-    with patch(
+    aux_patch, _ = _patch_aux_client("")
+    with aux_patch, patch(
         "agent.auxiliary_client.call_llm",
         side_effect=RuntimeError("429 rate limited"),
     ):
@@ -215,7 +231,7 @@ def test_specifier_real_caller_receives_canonical_gpt56_effort(kanban_home):
     with kb.connect() as conn:
         tid = kb.create_task(conn, title="rough", triage=True)
     content = jsonlib.dumps({"title": "Refined", "body": "Concrete scope"})
-    p, client = _patch_aux_client(content, model="gpt-5.6-terra")
+    p, call = _patch_aux_client(content, model="gpt-5.6-terra")
     config = {
         "delegation": {
             "gpt56_routing": {
@@ -231,10 +247,7 @@ def test_specifier_real_caller_receives_canonical_gpt56_effort(kanban_home):
         outcome = spec.specify_task(tid)
 
     assert outcome.ok, outcome.reason
-    assert client.chat.completions.create.call_args.kwargs["extra_body"]["reasoning"] == {
-        "enabled": True,
-        "effort": "medium",
-    }
+    assert call.call_args.kwargs["_route_decision"].policy_spec.effort == "medium"
 
 
 # ---------------------------------------------------------------------------

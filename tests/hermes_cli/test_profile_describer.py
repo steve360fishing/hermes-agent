@@ -5,6 +5,7 @@ and the profile_describer LLM module.
 from __future__ import annotations
 
 import json as jsonlib
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -81,10 +82,22 @@ def _fake_aux_response(content: str):
 def _patch_aux_client(content: str):
     # describe_profile now routes through call_llm (#35566) — mock it at the
     # source module.
-    return patch(
-        "agent.auxiliary_client.call_llm",
-        return_value=_fake_aux_response(content),
-    )
+    mock_fn = MagicMock(return_value=_fake_aux_response(content))
+
+    @contextmanager
+    def _patched():
+        from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+        binding = TextAuxiliaryClientBinding(
+            MagicMock(), "test-model", MagicMock()
+        )
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=binding,
+        ), patch("agent.auxiliary_client.call_llm", mock_fn):
+            yield
+
+    return _patched()
 
 
 def test_describer_writes_description_with_auto_true(profile_env, monkeypatch):
@@ -172,10 +185,9 @@ def test_describer_real_caller_receives_canonical_gpt56_effort(profile_env, monk
     monkeypatch.setattr(profiles_mod, "profile_exists", lambda n: n == "myprof")
     monkeypatch.setattr(profiles_mod, "normalize_profile_name", lambda n: n)
     monkeypatch.setattr(profiles_mod, "get_profile_dir", lambda n: profile_env)
-    client = MagicMock()
-    client.chat.completions.create.return_value = _fake_aux_response(
+    call = MagicMock(return_value=_fake_aux_response(
         jsonlib.dumps({"description": "routes profiles cheaply"})
-    )
+    ))
     config = {
         "delegation": {
             "gpt56_routing": {
@@ -187,14 +199,21 @@ def test_describer_real_caller_receives_canonical_gpt56_effort(profile_env, monk
             }
         }
     }
+    from agent.auxiliary_client import (
+        TextAuxiliaryClientBinding,
+        resolve_auxiliary_route_decision,
+    )
+    decision = resolve_auxiliary_route_decision(
+        "profile_describer", _config=config
+    )
+    binding = TextAuxiliaryClientBinding(MagicMock(), "gpt-5.6-luna", decision)
     with patch(
         "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, "gpt-5.6-luna"),
-    ), patch("hermes_cli.config.load_config", return_value=config):
+        return_value=binding,
+    ), patch("agent.auxiliary_client.call_llm", call), patch(
+        "hermes_cli.config.load_config", return_value=config
+    ):
         outcome = describer.describe_profile("myprof")
 
     assert outcome.ok, outcome.reason
-    assert client.chat.completions.create.call_args.kwargs["extra_body"]["reasoning"] == {
-        "enabled": True,
-        "effort": "low",
-    }
+    assert call.call_args.kwargs["_route_decision"].policy_spec.effort == "low"

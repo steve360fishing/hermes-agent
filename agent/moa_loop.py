@@ -758,7 +758,6 @@ def aggregate_moa_context(
             temperature=aggregator_temperature,
             max_tokens=max_tokens,
             reasoning_config=_aggregator_reasoning_config(aggregator),
-            **agg_runtime,
             _route_decision=agg_decision,
         )
         synthesis = _extract_text(response)

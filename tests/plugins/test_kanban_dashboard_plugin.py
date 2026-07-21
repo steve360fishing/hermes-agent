@@ -2245,6 +2245,15 @@ def _patch_specifier_response(monkeypatch, *, content, model="test-model"):
     resp.choices[0].message.content = content
     # specify_task routes through call_llm now (#35566) — mock it directly.
     fake_call = MagicMock(return_value=resp)
+    from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+    binding = TextAuxiliaryClientBinding(
+        MagicMock(), model, MagicMock()
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _task: binding,
+    )
     monkeypatch.setattr("agent.auxiliary_client.call_llm", fake_call)
     return fake_call
 
@@ -2303,6 +2312,8 @@ def test_specify_non_triage_returns_ok_false_not_http_error(client, monkeypatch)
 
 
 def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
+    from unittest.mock import MagicMock
+
     t = client.post(
         "/api/plugins/kanban/tasks",
         json={"title": "rough", "triage": True},
@@ -2312,6 +2323,15 @@ def test_specify_no_aux_client_surfaces_reason(client, monkeypatch):
     # no provider resolves (#35566 routing).
     def _no_provider(**kwargs):
         raise RuntimeError("No LLM provider configured")
+    from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+    binding = TextAuxiliaryClientBinding(
+        MagicMock(), "test-model", MagicMock()
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _task: binding,
+    )
     monkeypatch.setattr("agent.auxiliary_client.call_llm", _no_provider)
 
     r = client.post(

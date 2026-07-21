@@ -84,7 +84,8 @@ def test_fallback_candidate_call_uses_entry_timeout():
     chain = [{"provider": "custom", "timeout": 240}]
     with _patch_task_config(chain):
         resp = _call_fallback_candidate_sync(
-            fb_client, "deepseek-v4-flash", "fallback_chain[0](custom)",
+            fb_client, "deepseek-v4-flash",
+            provider_id="custom", source_label="fallback_chain[0](custom)",
             task="compression", messages=[{"role": "user", "content": "hi"}],
             temperature=None, max_tokens=None, tools=None,
             effective_timeout=30.0,  # the primary's burned budget
@@ -110,7 +111,8 @@ def test_fallback_candidate_without_entry_timeout_keeps_task_timeout():
     )
     with _patch_task_config([{"provider": "custom"}]):
         _call_fallback_candidate_sync(
-            fb_client, "m", "fallback_chain[0](custom)",
+            fb_client, "m",
+            provider_id="custom", source_label="fallback_chain[0](custom)",
             task="compression", messages=[{"role": "user", "content": "hi"}],
             temperature=None, max_tokens=None, tools=None,
             effective_timeout=300.0,

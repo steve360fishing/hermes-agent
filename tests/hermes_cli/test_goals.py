@@ -32,6 +32,20 @@ def hermes_home(tmp_path, monkeypatch):
     goals._DB_CACHE.clear()
 
 
+@pytest.fixture(autouse=True)
+def auxiliary_route_binding(monkeypatch):
+    """Keep goal tests on the v0.19 route-binding contract without providers."""
+    from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+    binding = TextAuxiliaryClientBinding(
+        MagicMock(), "test-model", MagicMock()
+    )
+    monkeypatch.setattr(
+        "agent.auxiliary_client.get_text_auxiliary_client",
+        lambda _task: binding,
+    )
+
+
 # ──────────────────────────────────────────────────────────────────────
 # _parse_judge_response
 # ──────────────────────────────────────────────────────────────────────
