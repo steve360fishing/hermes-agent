@@ -287,7 +287,7 @@ def _run_agent_with_inactivity_timeout(
     timed_out = False
     activity: dict[str, Any] = {}
     try:
-        if inactivity_limit is None:
+        if inactivity_limit is None and on_poll is None:
             return future.result()
         while True:
             done, _ = concurrent.futures.wait({future}, timeout=poll_interval)
@@ -295,6 +295,8 @@ def _run_agent_with_inactivity_timeout(
                 return future.result()
             if on_poll is not None:
                 on_poll()
+            if inactivity_limit is None:
+                continue
             if hasattr(agent, "get_activity_summary"):
                 try:
                     activity = agent.get_activity_summary() or {}
