@@ -49,6 +49,62 @@ def _read_only_snapshot_ingestion(request: Mapping[str, Any], snapshot_root: Pat
     return None
 
 
+def _build_request_payload(contract, candidate: str, request: Mapping[str, Any], metadata: Mapping[str, Any]) -> dict[str, Any]:
+    payload = dict(request)
+    payload["artifact_type"] = "private_answer" if contract.intent.value == "private" else "public_copy"
+    payload["allowed_entrypoints"] = [contract.entrypoint]
+    payload["artifact_payload"] = build_artifact_payload(candidate, contract.destination, metadata)
+    payload.pop("receipt_path", None)
+    payload.pop("journal_pointer", None)
+    return payload
+
+
+def _run_preflight(contract, roots, request_payload: Mapping[str, Any], *, suffix: str):
+    output_dir = roots.receipt_root / "hermes-preflight" / contract.nonce / suffix
+    try:
+        output_dir.mkdir(parents=True, exist_ok=False)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", dir=output_dir, delete=False) as handle:
+            json.dump(request_payload, handle, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
+            request_path = Path(handle.name)
+        command = _audit_command() + [
+            "--request-json", str(request_path), "--journal-pointer", str(roots.journal_root / "LATEST-JOURNAL.json"),
+            "--approved-journal-root", str(roots.journal_root), "--approved-source-snapshot-root", str(roots.source_snapshot_root),
+            "--approved-receipt-root", str(roots.receipt_root), "--output-dir", str(output_dir),
+        ]
+        completed = subprocess.run(
+            command, shell=False, stdin=subprocess.DEVNULL, capture_output=True,
+            text=True, timeout=TIMEOUT_SECONDS, check=False,
+        )
+    except subprocess.TimeoutExpired:
+        return None, None, "audit_preflight_timeout"
+    except (OSError, ValueError):
+        return None, None, "audit_preflight_unavailable"
+    finally:
+        try: request_path.unlink(missing_ok=True)
+        except UnboundLocalError: pass
+    if completed.returncode != 0:
+        return None, None, "audit_preflight_failed"
+    try:
+        result = json.loads(completed.stdout)
+        receipt_path = contained_path(roots.receipt_root, str(result.get("receipt_path") or ""))
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path else None
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        return None, None, "audit_receipt_invalid"
+    return receipt_path, receipt, "receipt_loaded"
+
+
+def validate_tournament_sink(contract, candidate: str) -> tuple[bool, str]:
+    """Re-run the audit contract at final delivery against current trusted bytes."""
+    roots = configured_runtime_roots()
+    if roots is None or contract.audit_request is None or contract.receipt_metadata is None:
+        return False, "audit_sink_validator_unavailable"
+    path, receipt, code = _run_preflight(contract, roots, _build_request_payload(contract, candidate, contract.audit_request, contract.receipt_metadata), suffix="sink")
+    if path is None or not isinstance(receipt, Mapping):
+        return False, code
+    expected = "ALLOW_PRIVATE_ANSWER" if contract.intent.value == "private" else "ALLOW_PUBLIC_ARTIFACT"
+    return bool(receipt.get("schema_version") == AUDIT_SCHEMA_VERSION and receipt.get("decision") == expected), "receipt_sink_verified"
+
+
 def run_tournament_truth_gate(
     args: Mapping[str, Any], *, task_id: str = "", session_id: str = "", **_kwargs: Any
 ) -> str:
@@ -70,51 +126,17 @@ def run_tournament_truth_gate(
     if snapshot_error:
         return tool_error("No trusted direct-source snapshot is available; provider fetch was not attempted.", code=snapshot_error)
 
-    artifact_payload = build_artifact_payload(candidate, contract.destination, metadata)
-    request_payload = dict(request)
-    request_payload["artifact_type"] = "private_answer" if contract.intent.value == "private" else "public_copy"
-    request_payload["allowed_entrypoints"] = [contract.entrypoint]
-    request_payload["artifact_payload"] = artifact_payload
-    request_payload.pop("receipt_path", None)
-    request_payload.pop("journal_pointer", None)
-
-    output_dir = roots.receipt_root / "hermes-preflight" / contract.nonce
-    try:
-        output_dir.mkdir(parents=True, exist_ok=False)
-        with tempfile.NamedTemporaryFile("w", encoding="utf-8", suffix=".json", dir=output_dir, delete=False) as handle:
-            json.dump(request_payload, handle, sort_keys=True, separators=(",", ":"), ensure_ascii=True)
-            request_path = Path(handle.name)
-        command = _audit_command() + [
-            "--request-json", str(request_path), "--journal-pointer", str(roots.journal_root / "LATEST-JOURNAL.json"),
-            "--approved-journal-root", str(roots.journal_root), "--approved-source-snapshot-root", str(roots.source_snapshot_root),
-            "--approved-receipt-root", str(roots.receipt_root), "--output-dir", str(output_dir),
-        ]
-        completed = subprocess.run(command, shell=False, capture_output=True, text=True, timeout=TIMEOUT_SECONDS, check=False)
-    except subprocess.TimeoutExpired:
-        return tool_error("Tournament audit preflight timed out; no retry was attempted.", code="audit_preflight_timeout")
-    except (OSError, ValueError) as exc:
-        return tool_error("Tournament audit preflight could not start.", code="audit_preflight_unavailable")
-    finally:
-        try:
-            request_path.unlink(missing_ok=True)
-        except UnboundLocalError:
-            pass
-
-    if completed.returncode != 0:
-        return tool_error("Tournament audit preflight rejected or failed.", code="audit_preflight_failed", exit_code=completed.returncode)
-    try:
-        result = json.loads(completed.stdout)
-        receipt_path = contained_path(roots.receipt_root, str(result.get("receipt_path") or ""))
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path else None
-    except (OSError, ValueError, TypeError, UnicodeDecodeError):
-        return tool_error("Tournament audit returned no readable trusted receipt.", code="audit_receipt_invalid")
+    request_payload = _build_request_payload(contract, candidate, request, metadata)
+    receipt_path, receipt, code = _run_preflight(contract, roots, request_payload, suffix="preflight")
+    if receipt_path is None:
+        return tool_error("Tournament audit preflight rejected or failed.", code=code)
     expires_at = _parse_expiry(receipt.get("expires_at_utc") if isinstance(receipt, Mapping) else None)
     if (
         not isinstance(receipt, Mapping)
         or receipt.get("schema_version") != AUDIT_SCHEMA_VERSION
         or receipt.get("receipt_hash") != canonical_json_sha256({k: v for k, v in receipt.items() if k != "receipt_hash"})
         or expires_at is None
-        or not contract.attach_receipt(receipt_path=receipt_path, candidate=candidate, metadata=metadata, expires_at=expires_at)
+        or not contract.attach_receipt(receipt_path=receipt_path, candidate=candidate, metadata=metadata, audit_request=request, expires_at=expires_at)
     ):
         return tool_error("Tournament audit receipt was not safely bound to this turn.", code="audit_receipt_binding_failed")
     return tool_result(

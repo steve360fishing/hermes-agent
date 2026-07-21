@@ -19,6 +19,7 @@ def test_valid_receipt_releases_existing_tool_policy_and_clear_restores_normal_t
     controller = ToolCallGuardrailController()
     contract = Contract(valid=True)
     controller.set_tournament_contract(contract)
-    assert controller.before_call("terminal", {}).action == "allow"
+    assert controller.before_call("terminal", {}).code == "tournament_receipt_required"
+    assert controller.before_call("web_search", {}).code == "tournament_receipt_required"
     controller.set_tournament_contract(None)
     assert controller.before_call("web_search", {}).action == "allow"

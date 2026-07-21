@@ -48,14 +48,31 @@ def _attach(tmp_path, monkeypatch, agent, *, task_id, candidate, intent=Tourname
     receipt["receipt_hash"] = canonical_json_sha256(receipt)
     path = receipt_root / "receipt.json"
     path.write_text(json.dumps(receipt), encoding="utf-8")
-    assert state.attach_receipt(receipt_path=path, candidate=candidate, metadata=metadata, expires_at=now + timedelta(minutes=15))
+    assert state.attach_receipt(
+        receipt_path=path, candidate=candidate, metadata=metadata, audit_request={},
+        expires_at=now + timedelta(minutes=15),
+    )
+    monkeypatch.setattr(
+        contract_module, "validate_audit_sink",
+        lambda _contract, _candidate: contract_module.TournamentReceiptDecision(True, "receipt_sink_verified"),
+    )
     return state
 
 
-def test_classifier_has_no_event_specific_exception_and_delivery_ambiguity_is_public():
-    assert classify_tournament_intent("Bermuda results") is TournamentIntent.PUBLIC
+def test_classifier_requires_identity_or_sportfish_context_and_defaults_factual_questions_private():
+    assert classify_tournament_intent("show me search results") is None
+    assert classify_tournament_intent("show me results") is None
+    assert classify_tournament_intent("marlin results") is TournamentIntent.PRIVATE
+    assert classify_tournament_intent("tournament standings") is TournamentIntent.PRIVATE
+    assert classify_tournament_intent("publish tournament standings") is TournamentIntent.PUBLIC
+    assert classify_tournament_intent("make a tournament results carousel") is TournamentIntent.PUBLIC
     assert classify_tournament_intent("audit tournament scoring") is TournamentIntent.PRIVATE
     assert classify_tournament_intent("captain scored a photo") is None
+
+
+def test_selected_current_journal_alias_is_protected_without_event_hardcoding(monkeypatch):
+    monkeypatch.setattr(contract_module, "_trusted_journal_aliases", lambda: {"blue water classic"})
+    assert classify_tournament_intent("Who won the Blue Water Classic?") is TournamentIntent.PRIVATE
 
 
 def test_missing_receipt_blocks_and_no_stream_delta_escapes():
@@ -88,3 +105,15 @@ def test_candidate_change_or_private_receipt_on_public_turn_fails_closed(tmp_pat
     state.intent = TournamentIntent.PUBLIC
     output, _telemetry, failed = finalize_tournament_output(agent, candidate="safe", messages=[])
     assert failed and output.startswith("PUBLIC_ARTIFACT_BLOCKED:")
+
+
+def test_sink_time_audit_failure_blocks_rotated_or_tampered_truth(tmp_path, monkeypatch):
+    agent = FakeAgent()
+    _attach(tmp_path, monkeypatch, agent, task_id="task-sink", candidate="safe")
+    monkeypatch.setattr(
+        contract_module, "validate_audit_sink",
+        lambda _contract, _candidate: contract_module.TournamentReceiptDecision(False, "audit_preflight_failed"),
+    )
+    output, telemetry, failed = finalize_tournament_output(agent, candidate="safe", messages=[])
+    assert failed and output.startswith("PUBLIC_ARTIFACT_BLOCKED:")
+    assert telemetry["code"] == "audit_preflight_failed"

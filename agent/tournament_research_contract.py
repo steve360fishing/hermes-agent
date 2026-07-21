@@ -13,9 +13,11 @@ from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
 import json
+import os
 from pathlib import Path
 import re
 import secrets
+import stat
 import threading
 from typing import Any, Callable, Mapping
 
@@ -44,9 +46,9 @@ class TournamentReceiptDecision:
 
 _CONTRACTS: dict[tuple[str, str], "TournamentResearchContract"] = {}
 _CONTRACTS_LOCK = threading.RLock()
-_TOURNAMENT_CUE = re.compile(
-    r"\b(?:tournaments?|results?|standings?|leaderboards?|scor(?:e|ing)|"
-    r"weigh[- ]?ins?|billfish|catchstat|release\s+points?|calcutta)\b",
+_TOURNAMENT_IDENTITY_CUE = re.compile(
+    r"\b(?:tournaments?|catchstat|leaderboards?|standings?|weigh[- ]?ins?|"
+    r"calcutta|release\s+points?)\b",
     re.IGNORECASE,
 )
 _SPORTFISH_CUE = re.compile(
@@ -55,7 +57,8 @@ _SPORTFISH_CUE = re.compile(
     re.IGNORECASE,
 )
 _PRIVATE_CUE = re.compile(r"\b(?:private|internal|draft|research|audit|review|verify)\b", re.IGNORECASE)
-_PUBLIC_CUE = re.compile(r"\b(?:public|publish|post|send|announce|release|share|artifact)\b", re.IGNORECASE)
+_RESULT_CUE = re.compile(r"\b(?:results?|scor(?:e|ing)|winner|won|placing|points?)\b", re.IGNORECASE)
+_PUBLIC_CUE = re.compile(r"\b(?:public|publish|post|send|announce|share|carousel|story|newsletter|image|caption)\b", re.IGNORECASE)
 
 
 def canonical_json_sha256(value: Mapping[str, Any]) -> str:
@@ -64,22 +67,55 @@ def canonical_json_sha256(value: Mapping[str, Any]) -> str:
     ).hexdigest()
 
 
+def _trusted_journal_aliases() -> set[str] | None:
+    """Read selected event names only from the current trusted journal pointer."""
+    roots = configured_runtime_roots()
+    if roots is None:
+        return None
+    pointer_path = contained_path(roots.journal_root, roots.journal_root / "LATEST-JOURNAL.json")
+    if pointer_path is None:
+        return None
+    try:
+        pointer_text = secure_read_contained_text(roots.journal_root, pointer_path)
+        pointer = json.loads(pointer_text) if pointer_text else None
+        journal_path = contained_path(roots.journal_root, pointer.get("canonical_journal_path", ""))
+        journal_text = secure_read_contained_text(roots.journal_root, journal_path) if journal_path else None
+        journal = json.loads(journal_text) if journal_text else None
+    except (OSError, ValueError, TypeError, UnicodeDecodeError):
+        return None
+    selected = journal.get("selected_tournaments") if isinstance(journal, Mapping) else None
+    if not isinstance(selected, list):
+        return None
+    aliases: set[str] = set()
+    for item in selected:
+        if not isinstance(item, Mapping):
+            continue
+        for key in ("tournament_key", "tournament_name", "official_name", "name"):
+            value = item.get(key)
+            if isinstance(value, str) and len(value.strip()) >= 4:
+                aliases.add(value.casefold())
+        for value in item.get("aliases", []) if isinstance(item.get("aliases"), list) else []:
+            if isinstance(value, str) and len(value.strip()) >= 4:
+                aliases.add(value.casefold())
+    return aliases
+
+
 def classify_tournament_intent(message: object) -> TournamentIntent | None:
     """Classify tournament-result intent without event-specific hardcoding.
 
-    A tournament term paired with result/scoring terminology is protected.  A
-    sportfishing result request is also protected.  Delivery ambiguity is
-    public, so uncertainty can never open a publishing path.
+    Generic "results" is ordinary chat. Protected intent needs a tournament
+    identity, sportfish entity plus results/scoring, or a selected current
+    journal alias. Ordinary factual questions default to private.
     """
     if not isinstance(message, str):
         return None
-    tournament = bool(_TOURNAMENT_CUE.search(message))
-    sportfish_result = bool(_SPORTFISH_CUE.search(message) and _TOURNAMENT_CUE.search(message))
-    if not tournament and not sportfish_result:
+    explicit_identity = bool(_TOURNAMENT_IDENTITY_CUE.search(message))
+    sportfish_result = bool(_SPORTFISH_CUE.search(message) and _RESULT_CUE.search(message))
+    aliases = _trusted_journal_aliases()
+    alias_match = bool(aliases and any(alias in message.casefold() for alias in aliases))
+    if not explicit_identity and not sportfish_result and not alias_match:
         return None
-    if _PRIVATE_CUE.search(message) and not _PUBLIC_CUE.search(message):
-        return TournamentIntent.PRIVATE
-    return TournamentIntent.PUBLIC
+    return TournamentIntent.PUBLIC if _PUBLIC_CUE.search(message) else TournamentIntent.PRIVATE
 
 
 def configured_runtime_roots() -> RuntimeRoots | None:
@@ -113,6 +149,27 @@ def contained_path(root: Path, candidate: str | Path, *, must_exist: bool = True
     return resolved
 
 
+def secure_read_contained_text(root: Path, candidate: str | Path) -> str | None:
+    """Read a contained regular file and reject symlinks or identity races."""
+    path = contained_path(root, candidate)
+    if path is None:
+        return None
+    try:
+        before = os.lstat(path)
+        if stat.S_ISLNK(before.st_mode) or not stat.S_ISREG(before.st_mode):
+            return None
+        descriptor = os.open(path, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0))
+        try:
+            after = os.fstat(descriptor)
+            if not stat.S_ISREG(after.st_mode) or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
+                return None
+            return os.read(descriptor, 16 * 1024 * 1024).decode("utf-8")
+        finally:
+            os.close(descriptor)
+    except (OSError, UnicodeDecodeError):
+        return None
+
+
 def build_artifact_payload(candidate: str, destination: str, metadata: Mapping[str, Any]) -> dict[str, Any]:
     """Keep the receipt's artifact hash independent of model-controlled routing."""
     payload = {key: value for key, value in metadata.items() if key not in {"content", "destination"}}
@@ -138,6 +195,7 @@ class TournamentResearchContract:
     receipt_path: Path | None = None
     receipt_candidate_sha256: str | None = None
     receipt_metadata: dict[str, Any] | None = None
+    audit_request: dict[str, Any] | None = None
     receipt_expires_at: datetime | None = None
     used: bool = False
     closed: bool = False
@@ -147,13 +205,14 @@ class TournamentResearchContract:
             self.stream_deltas.append(delta)
 
     def attach_receipt(
-        self, *, receipt_path: Path, candidate: str, metadata: Mapping[str, Any], expires_at: datetime
+        self, *, receipt_path: Path, candidate: str, metadata: Mapping[str, Any], audit_request: Mapping[str, Any], expires_at: datetime
     ) -> bool:
         if self.closed or self.used or expires_at <= datetime.now(timezone.utc):
             return False
         self.receipt_path = receipt_path
         self.receipt_candidate_sha256 = hashlib.sha256(candidate.encode("utf-8")).hexdigest()
         self.receipt_metadata = dict(metadata)
+        self.audit_request = dict(audit_request)
         self.receipt_expires_at = expires_at
         return True
 
@@ -164,6 +223,7 @@ class TournamentResearchContract:
             and self.receipt_path
             and self.receipt_candidate_sha256
             and self.receipt_metadata is not None
+            and self.audit_request is not None
             and self.receipt_expires_at
             and self.receipt_expires_at > datetime.now(timezone.utc)
         )
@@ -269,7 +329,8 @@ def _load_receipt(contract: TournamentResearchContract) -> tuple[Mapping[str, An
     if receipt_path is None or not receipt_path.is_file():
         return None, "receipt_path_untrusted"
     try:
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        receipt_text = secure_read_contained_text(roots.receipt_root, receipt_path)
+        receipt = json.loads(receipt_text) if receipt_text else None
     except (OSError, ValueError, UnicodeDecodeError):
         return None, "receipt_unreadable"
     if not isinstance(receipt, Mapping):
@@ -285,6 +346,17 @@ def _parse_utc(value: object) -> datetime | None:
     except ValueError:
         return None
     return parsed.astimezone(timezone.utc) if parsed.tzinfo else None
+
+
+def validate_audit_sink(contract: TournamentResearchContract, candidate: str) -> TournamentReceiptDecision:
+    """Delegate current journal/snapshot validation to the audit command."""
+    try:
+        from tools.tournament_truth_gate_tool import validate_tournament_sink
+
+        accepted, code = validate_tournament_sink(contract, candidate)
+        return TournamentReceiptDecision(accepted, code)
+    except Exception:
+        return TournamentReceiptDecision(False, "audit_sink_validator_unavailable")
 
 
 def _verify_receipt(contract: TournamentResearchContract, candidate: str) -> TournamentReceiptDecision:
@@ -312,7 +384,10 @@ def _verify_receipt(contract: TournamentResearchContract, candidate: str) -> Tou
     payload = build_artifact_payload(candidate, contract.destination, contract.receipt_metadata)
     if receipt.get("artifact_payload_hash") != canonical_json_sha256(payload):
         return TournamentReceiptDecision(False, "receipt_payload_mismatch")
-    return TournamentReceiptDecision(True, "receipt_verified")
+    # Re-run the audit-owned preflight at the sink. This detects pointer
+    # rotation and snapshot changes after the tool call without reimplementing
+    # the audit repository's truth rules in Hermes.
+    return validate_audit_sink(contract, candidate)
 
 
 def _redact_current_turn(messages: list[dict[str, Any]], replacement: str) -> None:

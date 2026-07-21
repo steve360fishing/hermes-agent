@@ -249,7 +249,9 @@ class ToolCallGuardrailController:
             authorized = bool(contract.has_valid_receipt())
         except Exception:
             authorized = False
-        if authorized or tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
+        # A receipt only authorizes final text release. It never opens a
+        # mutable/provider/public tool lane during a protected turn.
+        if tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
             return None
         return ToolGuardrailDecision(
             action="deny", code="tournament_receipt_required",

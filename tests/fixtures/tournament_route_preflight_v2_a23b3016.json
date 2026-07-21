@@ -1,6 +1,7 @@
 {
-  "contract_commit": "a23b30167011d888900630eb2c0412a94634035d",
+  "contract_commit": "271141abc8fd63cee3c9773fc800bdd786d871ef",
   "schema_version": "tournament_route_preflight.v2",
   "source_repository": "sportfishhub-audit",
-  "notes": "Pinned cross-repository v2 fixture identity; generated receipts are validated at runtime."
+  "audit_re_review": "pending",
+  "notes": "Pinned repair-head identity; not frozen until audit re-review passes."
 }
