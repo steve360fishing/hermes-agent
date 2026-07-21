@@ -5,12 +5,18 @@ description: >-
   conditionally call only the sub-workflows a change can affect. Outputs fail
   open (everything "true") whenever a trustworthy diff cannot be computed.
 
+inputs:
+  github-token:
+    description: Token for the GitHub API (gh CLI). Pass secrets.AUTOFIX_BOT_PAT from the calling workflow.
+    required: false
+    default: ${{ github.token }}
+
 outputs:
   python:
     description: Run Python tests / ruff / ty / windows-footguns.
     value: ${{ steps.classify.outputs.python }}
   frontend:
-    description: Run the TypeScript typecheck matrix + desktop build.
+    description: Run the TypeScript testing matrix + desktop build.
     value: ${{ steps.classify.outputs.frontend }}
   docker_meta:
     description: Docker setup and meta files have changed.
@@ -24,9 +30,15 @@ outputs:
   deps:
     description: Check pyproject.toml dependency upper bounds.
     value: ${{ steps.classify.outputs.deps }}
+  npm_lock:
+    description: Post/update the semantic package-lock.json diff PR comment.
+    value: ${{ steps.classify.outputs.npm_lock }}
   mcp_catalog:
     description: Require MCP catalog security review label.
     value: ${{ steps.classify.outputs.mcp_catalog }}
+  ci_review:
+    description: Require CI-sensitive file review label.
+    value: ${{ steps.classify.outputs.ci_review }}
 
 runs:
   using: composite
@@ -35,7 +47,12 @@ runs:
       id: classify
       shell: bash
       env:
-        GH_TOKEN: ${{ github.token }}
+        # Fall back to the built-in read-only token when the caller passes an
+        # empty value. Fork PRs get no repo secrets, so AUTOFIX_BOT_PAT is ""
+        # there, and an input `default:` only applies when the input is omitted,
+        # not when it's passed empty. Without this fallback the compare API
+        # fails on forks and the classifier fails open (every lane forced on).
+        GH_TOKEN: ${{ inputs.github-token || github.token }}
         REPO: ${{ github.repository }}
         EVENT_NAME: ${{ github.event_name }}
         PR_BASE_SHA: ${{ github.event.pull_request.base.sha }}
@@ -62,15 +79,38 @@ runs:
         esac
 
         CHANGED=""
+        COMPARE_OK="false"
         ZERO_SHA="0000000000000000000000000000000000000000"
         if [ -n "$BASE_SHA" ] && [ -n "$HEAD_SHA" ] \
           && [ "$BASE_SHA" != "$ZERO_SHA" ] && [ "$HEAD_SHA" != "$ZERO_SHA" ]; then
-          if ! CHANGED="$(gh api \
-            --paginate \
-            "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
-            --jq '.files[].filename')"; then
-            echo "Could not compute changed files; running all lanes." >&2
-            CHANGED=""
+          # Retry transient API failures while preserving deterministic,
+          # event-pinned compare anchors. `.files[]?` is null-safe on later
+          # pagination pages whose `files` member is null.
+          for i in 1 2 3; do
+            if CHANGED="$(gh api \
+              --paginate \
+              "repos/${REPO}/compare/${BASE_SHA}...${HEAD_SHA}" \
+              --jq '.files[]?.filename')"; then
+              COMPARE_OK="true"
+              break
+            fi
+            if [ "$i" = 3 ]; then
+              echo "::warning::compare API failed after 3 attempts — failing open"
+              CHANGED=""
+              break
+            fi
+            echo "::warning::compare API failed (attempt $i); retrying in 10s"
+            sleep 10
+          done
+
+          # GitHub's compare API caps the file list at 300. A capped list is
+          # incomplete and must not suppress any CI lane.
+          if [ "$COMPARE_OK" = "true" ]; then
+            CHANGED_COUNT="$(printf '%s\n' "$CHANGED" | sed '/^$/d' | wc -l | tr -d ' ')"
+            if [ "$CHANGED_COUNT" -ge 300 ]; then
+              echo "::warning::compare file list reached the 300-file cap — failing open"
+              CHANGED=""
+            fi
           fi
         else
           echo "No trustworthy diff anchors; running all lanes." >&2

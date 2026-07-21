@@ -366,6 +366,23 @@ def test_artifact_contract_suppresses_background_skill_review():
     assert agent.background_review_calls == 0
 
 
+def test_report_only_surface_suppresses_background_skill_review():
+    agent = _StubAgent(raise_in=())
+    agent._background_review_enabled = False
+    agent._skill_nudge_interval = 1
+    agent._iters_since_skill = 1
+    agent.valid_tool_names = {"skill_manage"}
+
+    _run(
+        agent,
+        final_response="report-only result",
+        api_call_count=1,
+        turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert agent.background_review_calls == 0
+
+
 def test_normal_turn_blocks_expired_artifact_media_reference(monkeypatch):
     monkeypatch.setenv("HERMES_ARTIFACT_ROOT", "/opt/data/hermes-artifacts")
     agent = _StubAgent(raise_in=())

@@ -8,6 +8,7 @@ and the assignee-fallback logic.
 from __future__ import annotations
 
 import json as jsonlib
+from contextlib import contextmanager
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -41,18 +42,29 @@ def _mock_client_returning(content: str):
 
 
 def _patch_aux_client(content: str, *, model: str = "test-model"):
-    client = _mock_client_returning(content)
-    return patch(
-        "agent.auxiliary_client.get_text_auxiliary_client",
-        return_value=(client, model),
-    )
+    # decompose_task now routes through call_llm (see #35566) — mock it at
+    # the source module so task config, extra_body, and retries stay out of
+    # unit-test scope.
+    mock_fn = MagicMock(return_value=_fake_aux_response(content))
+
+    @contextmanager
+    def _patched():
+        from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+        binding = TextAuxiliaryClientBinding(MagicMock(), model, MagicMock())
+        with patch(
+            "agent.auxiliary_client.get_text_auxiliary_client",
+            return_value=binding,
+        ), patch("agent.auxiliary_client.call_llm", mock_fn):
+            yield
+
+    return _patched()
 
 
 def _patch_extra_body():
-    return patch(
-        "agent.auxiliary_client.get_auxiliary_extra_body",
-        return_value={},
-    )
+    # No-op shim retained for call-site compatibility: extra_body plumbing
+    # now lives inside call_llm, which _patch_aux_client already mocks.
+    return patch("agent.auxiliary_client.get_auxiliary_extra_body", return_value={})
 
 
 def _patch_list_profiles(names: list[str]):
@@ -123,7 +135,7 @@ def test_decomposer_real_caller_receives_canonical_gpt56_effort(kanban_home):
             "body": "Concrete work",
         }
     )
-    client = _mock_client_returning(payload)
+    call = MagicMock(return_value=_fake_aux_response(payload))
     profiles = _patch_list_profiles(["orchestrator"])
     config = {
         "delegation": {
@@ -139,20 +151,29 @@ def test_decomposer_real_caller_receives_canonical_gpt56_effort(kanban_home):
     for item in profiles:
         item.start()
     try:
+        from agent.auxiliary_client import (
+            TextAuxiliaryClientBinding,
+            resolve_auxiliary_route_decision,
+        )
+        decision = resolve_auxiliary_route_decision(
+            "kanban_decomposer", _config=config
+        )
+        binding = TextAuxiliaryClientBinding(
+            MagicMock(), "gpt-5.6-terra", decision
+        )
         with patch(
             "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(client, "gpt-5.6-terra"),
-        ), patch("hermes_cli.config.load_config", return_value=config):
+            return_value=binding,
+        ), patch("agent.auxiliary_client.call_llm", call), patch(
+            "hermes_cli.config.load_config", return_value=config
+        ):
             outcome = decomp.decompose_task(tid)
     finally:
         for item in profiles:
             item.stop()
 
     assert outcome.ok, outcome.reason
-    assert client.chat.completions.create.call_args.kwargs["extra_body"]["reasoning"] == {
-        "enabled": True,
-        "effort": "high",
-    }
+    assert call.call_args.kwargs["_route_decision"].policy_spec.effort == "high"
 
 
 def test_decompose_fanout_false_assigns_default_when_unassigned(kanban_home):
@@ -377,9 +398,17 @@ def test_decompose_no_aux_client_configured(kanban_home):
     for p in patches:
         p.start()
     try:
+        # call_llm raises RuntimeError when no provider is configured; the
+        # decomposer must convert that into a failed outcome, not a crash.
+        from agent.auxiliary_client import TextAuxiliaryClientBinding
+
+        binding = TextAuxiliaryClientBinding(MagicMock(), "test-model", MagicMock())
         with patch(
             "agent.auxiliary_client.get_text_auxiliary_client",
-            return_value=(None, ""),
+            return_value=binding,
+        ), patch(
+            "agent.auxiliary_client.call_llm",
+            side_effect=RuntimeError("No LLM provider configured"),
         ):
             outcome = decomp.decompose_task(tid, author="me")
     finally:
@@ -387,4 +416,5 @@ def test_decompose_no_aux_client_configured(kanban_home):
             p.stop()
 
     assert outcome.ok is False
-    assert "no auxiliary client" in outcome.reason
+    # call_llm's no-provider RuntimeError surfaces via the LLM-error branch.
+    assert "LLM error" in outcome.reason

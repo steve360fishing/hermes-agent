@@ -590,6 +590,15 @@
       "rationale": "validation boundary for the artifact delivery contract."
     },
     {
+      "id": "gateway/platforms/base.py:_path_lacks_deliverable_extension",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "gateway/platforms/base.py",
+      "symbol": "_path_lacks_deliverable_extension",
+      "disposition": "covered",
+      "rationale": "Classifies extensionless and uncommon file types before the validated media-delivery path handles them."
+    },
+    {
       "id": "gateway/platforms/base.py:_strip_media_directives",
       "contract": "artifact_delivery",
       "role": "delivery",
@@ -840,6 +849,15 @@
       "symbol": "GatewayRunner._run_background_task",
       "disposition": "covered",
       "rationale": "delivery boundary for the artifact delivery contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task_inner",
+      "contract": "artifact_delivery",
+      "role": "delivery",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task_inner",
+      "disposition": "covered",
+      "rationale": "Owns background-task result delivery after the profile-scoping wrapper selects the active runtime."
     },
     {
       "id": "gateway/stream_consumer.py:GatewayStreamConsumer",
@@ -1823,13 +1841,22 @@
       "rationale": "propagation boundary for the cron restrictions contract."
     },
     {
-      "id": "gateway/run.py:GatewayRunner._run_background_task.run_sync",
+      "id": "gateway/run.py:GatewayRunner._run_background_task_inner",
       "contract": "cron_restrictions",
       "role": "propagation",
       "path": "gateway/run.py",
-      "symbol": "GatewayRunner._run_background_task.run_sync",
+      "symbol": "GatewayRunner._run_background_task_inner",
       "disposition": "covered",
-      "rationale": "propagation boundary for the cron restrictions contract."
+      "rationale": "Executes background tasks with the resolved enabled and disabled toolsets after the profile-scoping wrapper delegates inward."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task_inner.run_sync",
+      "contract": "cron_restrictions",
+      "role": "propagation",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task_inner.run_sync",
+      "disposition": "covered",
+      "rationale": "Constructs the background agent using the propagated enabled and disabled toolsets."
     },
     {
       "id": "gateway/slash_commands.py:GatewaySlashCommandsMixin",
@@ -2118,6 +2145,15 @@
       "symbol": "_build_child_agent",
       "disposition": "covered",
       "rationale": "propagation boundary for the cron restrictions contract."
+    },
+    {
+      "id": "tools/delegate_tool.py:_blocked_toolsets_for_role",
+      "contract": "cron_restrictions",
+      "role": "enforcement",
+      "path": "tools/delegate_tool.py",
+      "symbol": "_blocked_toolsets_for_role",
+      "disposition": "covered",
+      "rationale": "Builds exact disabled toolsets for delegated roles so restricted tools remain blocked after composite expansion and registry refresh."
     },
     {
       "id": "tools/delegate_tool.py:_dump_subagent_timeout_diagnostic",
