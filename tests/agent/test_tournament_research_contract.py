@@ -76,6 +76,27 @@ def test_classifier_requires_identity_or_sportfish_context_and_defaults_factual_
     assert classify_tournament_intent("add tournament standings to the website") is TournamentIntent.PUBLIC
 
 
+def test_classifier_ignores_public_terms_inside_negated_private_canary_directive():
+    prompt = (
+        "Privately answer this question in this Telegram chat: What are the current 2026 Bermuda "
+        "Big Game Classic standings? Use only the stored 2026 tournament route and current trusted "
+        "evidence. For every reported row, include the source URL, source pull time, confidence, and "
+        "separate displayed, standings_final, and payout_final status. If the required current-year "
+        "route receipt is unavailable, reply with ROUTE_HOLD. Do not create a file, public artifact, "
+        "newsletter copy, post, publish, or send anything outside this chat."
+    )
+    assert classify_tournament_intent(prompt) is TournamentIntent.PRIVATE
+    assert classify_tournament_intent("Do not publish tournament standings.") is TournamentIntent.PRIVATE
+    assert classify_tournament_intent("Do not use stale data; publish tournament standings.") is TournamentIntent.PUBLIC
+    assert classify_tournament_intent("Do not publish stale data, then publish tournament standings.") is TournamentIntent.PUBLIC
+    assert classify_tournament_intent(
+        "Do not publish the tournament standings, please post them to the website."
+    ) is TournamentIntent.PUBLIC
+    assert classify_tournament_intent(
+        "Without publishing the standings - create a tournament newsletter for sponsors."
+    ) is TournamentIntent.PUBLIC
+
+
 def test_selected_current_journal_alias_is_protected_without_event_hardcoding(monkeypatch):
     monkeypatch.setattr(contract_module, "_trusted_journal_aliases", lambda: {"blue water classic"})
     assert classify_tournament_intent("Who won the Blue Water Classic?") is TournamentIntent.PRIVATE
@@ -112,6 +133,28 @@ def test_missing_receipt_blocks_and_no_stream_delta_escapes():
     output, telemetry, failed = finalize_tournament_output(agent, candidate="unverified", messages=[])
     assert output.startswith("PUBLIC_ARTIFACT_BLOCKED:")
     assert failed and agent.streamed == [] and telemetry["accepted"] is False
+
+
+def test_private_missing_receipt_returns_exact_route_hold_and_redacts_candidate():
+    agent = FakeAgent()
+    begin_tournament_research_contract(
+        agent,
+        message="Privately answer the tournament standings. Do not publish or create a public artifact.",
+        task_id="task-private-hold",
+    )
+    messages = [
+        {"role": "user", "content": "private tournament standings"},
+        {"role": "assistant", "content": "unverified private candidate"},
+    ]
+    output, telemetry, failed = finalize_tournament_output(
+        agent,
+        candidate="unverified private candidate",
+        messages=messages,
+    )
+    assert output == "ROUTE_HOLD"
+    assert failed and telemetry["code"] == "receipt_missing_or_consumed"
+    assert messages[-1] == {"role": "assistant", "content": "ROUTE_HOLD"}
+    assert "unverified private candidate" not in str(messages)
 
 
 def test_rejection_redacts_tool_and_intermediate_content_before_persistence_shape():
