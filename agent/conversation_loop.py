@@ -671,7 +671,12 @@ def run_conversation(
 
     # A previous exception/cancel/reload may have skipped finalization.  Never
     # let a buffered tournament candidate or persistence wrapper cross turns.
-    from agent.tournament_research_contract import clear_tournament_research_contract
+    from agent.tournament_research_contract import (
+        TournamentIntent,
+        begin_tournament_research_contract,
+        classify_tournament_intent,
+        clear_tournament_research_contract,
+    )
 
     clear_tournament_research_contract(agent)
 
@@ -688,6 +693,14 @@ def run_conversation(
     _contract_message = (
         persist_user_message if persist_user_message is not None else user_message
     )
+    if classify_tournament_intent(_contract_message) is TournamentIntent.PUBLIC:
+        begin_tournament_research_contract(
+            agent,
+            message=_contract_message,
+            task_id=task_id,
+            stream_callback=stream_callback,
+            external_action=True,
+        )
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,

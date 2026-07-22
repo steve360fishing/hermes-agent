@@ -1,7 +1,9 @@
 import hashlib
 import json
 from datetime import datetime, timedelta, timezone
+import pytest
 
+from agent import conversation_loop
 from agent import tournament_research_contract as contract_module
 from agent.tournament_research_contract import (
     TournamentIntent,
@@ -195,6 +197,59 @@ def test_private_chat_does_not_install_or_persist_a_tournament_gate():
     assert not hasattr(agent, "_tournament_research_contract")
     agent.stream_delta_callback("ordinary text")
     assert agent.streamed == ["ordinary text"]
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Publish the tournament standings to the website.",
+        "Send the tournament results to our subscribers.",
+        "Create a public tournament results carousel.",
+    ],
+)
+def test_conversation_entrypoint_installs_external_gate_for_public_tournament_actions(
+    monkeypatch, message
+):
+    captured = {}
+
+    def stop_after_turn_preparation(*args, **kwargs):
+        captured["contract"] = getattr(args[0], "_tournament_research_contract", None)
+        raise RuntimeError("turn-preparation-complete")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", stop_after_turn_preparation)
+    agent = FakeAgent()
+    agent.model = "test-model"
+    agent.provider = "test-provider"
+
+    with pytest.raises(RuntimeError, match="turn-preparation-complete"):
+        conversation_loop.run_conversation(agent, message, task_id="public-action")
+
+    assert captured["contract"] is not None
+    assert captured["contract"].intent is TournamentIntent.PUBLIC
+    assert captured["contract"].entrypoint == "direct_public"
+    assert agent._tournament_research_contract is None
+
+
+def test_conversation_entrypoint_leaves_private_tournament_chat_ungated(monkeypatch):
+    captured = {}
+
+    def stop_after_turn_preparation(*args, **kwargs):
+        captured["contract"] = getattr(args[0], "_tournament_research_contract", None)
+        raise RuntimeError("turn-preparation-complete")
+
+    monkeypatch.setattr(conversation_loop, "build_turn_context", stop_after_turn_preparation)
+    agent = FakeAgent()
+    agent.model = "test-model"
+    agent.provider = "test-provider"
+
+    with pytest.raises(RuntimeError, match="turn-preparation-complete"):
+        conversation_loop.run_conversation(
+            agent,
+            "Privately answer the tournament standings in this chat. Do not publish or send them.",
+            task_id="private-chat",
+        )
+
+    assert captured["contract"] is None
 
 
 def test_valid_receipt_is_exact_candidate_single_use_and_releases_after_finalization(tmp_path, monkeypatch):
