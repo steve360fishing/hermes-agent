@@ -36,7 +36,7 @@ def _roots(tmp_path, monkeypatch):
 
 def _attach(tmp_path, monkeypatch, agent, *, task_id, candidate, intent=TournamentIntent.PUBLIC):
     receipt_root, _journal, _snapshots = _roots(tmp_path, monkeypatch)
-    state = begin_tournament_research_contract(agent, message="private tournament standings" if intent is TournamentIntent.PRIVATE else "publish tournament standings", task_id=task_id)
+    state = begin_tournament_research_contract(agent, message="private tournament standings" if intent is TournamentIntent.PRIVATE else "publish tournament standings", task_id=task_id, external_action=True)
     metadata = {"factual_claims": [{"claim_id": "c1"}], "public_surfaces": [{"claim_ids": ["c1"]}]}
     now = datetime.now(timezone.utc)
     payload = contract_module.build_artifact_payload(candidate, state.destination, metadata)
@@ -128,7 +128,7 @@ def test_audit_fixture_is_a_compatible_isolated_repair_head_placeholder():
 
 def test_missing_receipt_blocks_and_no_stream_delta_escapes():
     agent = FakeAgent()
-    begin_tournament_research_contract(agent, message="publish tournament results", task_id="task-1")
+    begin_tournament_research_contract(agent, message="publish tournament results", task_id="task-1", external_action=True)
     agent.stream_delta_callback("unverified")
     output, telemetry, failed = finalize_tournament_output(agent, candidate="unverified", messages=[])
     assert output.startswith("PUBLIC_ARTIFACT_BLOCKED:")
@@ -140,7 +140,7 @@ def test_private_missing_receipt_returns_exact_route_hold_and_redacts_candidate(
     begin_tournament_research_contract(
         agent,
         message="Privately answer the tournament standings. Do not publish or create a public artifact.",
-        task_id="task-private-hold",
+        task_id="task-private-hold", external_action=True,
     )
     messages = [
         {"role": "user", "content": "private tournament standings"},
@@ -159,7 +159,7 @@ def test_private_missing_receipt_returns_exact_route_hold_and_redacts_candidate(
 
 def test_rejection_redacts_tool_and_intermediate_content_before_persistence_shape():
     agent = FakeAgent()
-    begin_tournament_research_contract(agent, message="publish tournament results", task_id="task-redact")
+    begin_tournament_research_contract(agent, message="publish tournament results", task_id="task-redact", external_action=True)
     messages = [
         {"role": "user", "content": "publish tournament results"},
         {"role": "assistant", "content": "intermediate", "tool_calls": [{"id": "x"}]},
@@ -174,7 +174,7 @@ def test_protected_turn_adds_gate_only_temporarily_and_stale_cleanup_is_duck_typ
     agent = FakeAgent()
     agent.tools = [{"type": "function", "function": {"name": "terminal"}}]
     agent.valid_tool_names = {"terminal"}
-    begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task-schema")
+    begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task-schema", external_action=True)
     assert "tournament_truth_gate" in agent.valid_tool_names
     clear_tournament_research_contract(agent)
     assert [tool["function"]["name"] for tool in agent.tools] == ["terminal"]
@@ -183,6 +183,18 @@ def test_protected_turn_adds_gate_only_temporarily_and_stale_cleanup_is_duck_typ
     agent._tournament_research_contract = type("Stale", (), {"cleanup": lambda self, _agent: cleaned.append(True)})()
     clear_tournament_research_contract(agent)
     assert cleaned == [True]
+
+
+def test_private_chat_does_not_install_or_persist_a_tournament_gate():
+    agent = FakeAgent()
+    assert begin_tournament_research_contract(
+        agent,
+        message="Privately answer the tournament standings in this chat.",
+        task_id="ordinary-chat",
+    ) is None
+    assert not hasattr(agent, "_tournament_research_contract")
+    agent.stream_delta_callback("ordinary text")
+    assert agent.streamed == ["ordinary text"]
 
 
 def test_valid_receipt_is_exact_candidate_single_use_and_releases_after_finalization(tmp_path, monkeypatch):

@@ -1,4 +1,4 @@
-"""End-to-end conversation regression coverage for tournament stream containment."""
+"""End-to-end conversation coverage for non-sticky tournament chat handling."""
 
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
@@ -33,7 +33,7 @@ def _agent():
     return agent
 
 
-def test_tournament_blocked_candidate_never_streams_or_persists_and_next_normal_turn_is_normal():
+def test_tournament_chat_remains_normal_and_next_turn_has_no_sticky_contract():
     agent = _agent()
     agent.client.chat.completions.create.side_effect = [_response("unverified standings"), _response("normal answer")]
     streamed, persisted = [], []
@@ -42,17 +42,17 @@ def test_tournament_blocked_candidate_never_streams_or_persists_and_next_normal_
     agent._save_trajectory = lambda *_args: None
     agent._cleanup_task_resources = lambda *_args: None
 
-    blocked = agent.run_conversation("publish tournament standings")
-    assert blocked["final_response"].startswith("PUBLIC_ARTIFACT_BLOCKED:")
-    assert "unverified standings" not in streamed
-    assert "unverified standings" not in str(persisted[-1])
+    first = agent.run_conversation("publish tournament standings")
+    assert first["final_response"] == "unverified standings"
+    assert first.get("tournament_research") is None
+    assert "unverified standings" in str(persisted[-1])
 
     normal = agent.run_conversation("show me search results")
     assert normal["final_response"] == "normal answer"
     assert agent._tool_guardrails.before_call("terminal", {}).action == "allow"
 
 
-def test_private_canary_negated_public_terms_return_exact_route_hold_without_leakage():
+def test_private_tournament_chat_does_not_require_an_external_action_receipt():
     agent = _agent()
     agent.client.chat.completions.create.return_value = _response("unverified private standings")
     streamed, persisted = [], []
@@ -68,14 +68,12 @@ def test_private_canary_negated_public_terms_return_exact_route_hold_without_lea
 
     result = agent.run_conversation(prompt)
 
-    assert result["final_response"] == "ROUTE_HOLD"
-    assert result["tournament_research"]["code"] == "receipt_missing_or_consumed"
-    assert streamed == []
-    assert "unverified private standings" not in str(persisted[-1])
-    assert persisted[-1][-1]["content"] == "ROUTE_HOLD"
+    assert result["final_response"] == "unverified private standings"
+    assert result.get("tournament_research") is None
+    assert "unverified private standings" in str(persisted[-1])
 
 
-def test_affirmative_public_action_after_negation_uses_public_blocker():
+def test_public_wording_in_chat_does_not_impersonate_a_real_external_action():
     agent = _agent()
     agent.client.chat.completions.create.return_value = _response("unverified public standings")
     persisted = []
@@ -87,5 +85,6 @@ def test_affirmative_public_action_after_negation_uses_public_blocker():
         "Do not publish the stale tournament standings, please post the current standings to the website."
     )
 
-    assert result["final_response"].startswith("PUBLIC_ARTIFACT_BLOCKED:")
-    assert "unverified public standings" not in str(persisted[-1])
+    assert result["final_response"] == "unverified public standings"
+    assert result.get("tournament_research") is None
+    assert "unverified public standings" in str(persisted[-1])

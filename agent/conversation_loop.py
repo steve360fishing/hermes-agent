@@ -688,23 +688,11 @@ def run_conversation(
     _contract_message = (
         persist_user_message if persist_user_message is not None else user_message
     )
-    # Install the tournament buffer before turn-context setup assigns the
-    # request-local callback, so both that callback and gateway preview output
-    # are guarded by the same request-local contract.
-    from agent.tournament_research_contract import begin_tournament_research_contract
-
-    _tournament_contract = begin_tournament_research_contract(
-        agent,
-        message=_contract_message,
-        task_id=task_id,
-        stream_callback=stream_callback,
-    )
-    if _tournament_contract is not None:
-        stream_callback = _tournament_contract.buffer_callback
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,
         platform=getattr(agent, "platform", None),
+        conversation_history=conversation_history,
     )
     if _prebuilt_task_contract.preflight_error:
         _preflight_response = (

@@ -133,6 +133,32 @@ def _finalize_turn_impl(
     elif artifact_only and getattr(task_contract, "artifact_file_requested", False):
         artifact_path = getattr(task_contract, "artifact_output_path", "")
         landed_paths = getattr(agent, "_turn_file_mutation_paths", None) or set()
+        # The obligation is finalized here, after model output but before any
+        # persistence or Telegram delivery. A handoff must become a verified
+        # document even when the model answered inline instead of calling the
+        # constrained writer itself.
+        if not landed_paths and getattr(task_contract, "artifact_owed", False):
+            artifact_content = final_response or getattr(task_contract, "artifact_content_hint", "")
+            if isinstance(artifact_content, str) and artifact_content.startswith("MEDIA:"):
+                artifact_content = getattr(task_contract, "artifact_content_hint", "")
+            if isinstance(artifact_content, str) and artifact_content.strip():
+                try:
+                    from tools.file_tools import write_file_tool
+                    import json
+
+                    write_result = json.loads(
+                        write_file_tool(
+                            artifact_path,
+                            artifact_content,
+                            task_id=effective_task_id,
+                            session_id=getattr(agent, "session_id", None),
+                        )
+                    )
+                    if not write_result.get("error"):
+                        landed_paths = {artifact_path}
+                        agent._turn_file_mutation_paths = landed_paths
+                except Exception:
+                    logger.warning("Artifact obligation writer failed", exc_info=True)
         try:
             artifact_real = os.path.realpath(artifact_path)
             landed_reals = {os.path.realpath(str(path)) for path in landed_paths}
@@ -168,6 +194,12 @@ def _finalize_turn_impl(
                 state="failed_preflight",
                 error_code="artifact_write_not_verified",
             )
+            final_response = (
+                "I could not create the requested attachment. No file was sent, "
+                "and normal capabilities remain available."
+            )
+            failed = True
+            _turn_exit_reason = "artifact_obligation_unfulfilled"
 
     tournament_telemetry = None
 

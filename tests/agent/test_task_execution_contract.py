@@ -36,7 +36,7 @@ def test_classifier_selects_artifact_only_for_explicit_text_artifacts(message):
     contract = _contract(message)
 
     assert contract.lane == ARTIFACT_ONLY
-    assert contract.policy_version == "artifact-only-v3"
+    assert contract.policy_version == "artifact-only-v4"
 
 
 @pytest.mark.parametrize(
@@ -130,6 +130,44 @@ def test_emergency_disable_fails_closed_when_config_cannot_be_read(monkeypatch):
 )
 def test_common_direct_artifact_requests_remain_supported(message):
     assert _contract(message).lane == ARTIFACT_ONLY
+
+
+def test_handoff_to_another_model_defaults_to_a_txt_attachment(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = _contract("Give me a prompt for Claude to review this deployment.")
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.artifact_file_requested is True
+    assert contract.artifact_owed is True
+    assert contract.artifact_extension == ".txt"
+    assert contract.artifact_mime_type == "text/plain"
+
+
+def test_explicit_inline_handoff_does_not_create_an_attachment():
+    contract = _contract("Give me a prompt for Claude in this chat, no attachment.")
+
+    assert contract.artifact_file_requested is False
+
+
+def test_file_correction_reuses_the_last_assistant_text(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = build_task_execution_contract(
+        "You should have made that a file.",
+        task_id="repair-artifact",
+        platform="telegram",
+        conversation_history=[
+            {"role": "user", "content": "Give me a handoff."},
+            {"role": "assistant", "content": "Use this exact handoff content."},
+        ],
+    )
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.decision_reason == "artifact_correction_attachment"
+    assert contract.artifact_content_hint == "Use this exact handoff content."
 
 
 def test_normal_txt_normal_sequence_has_no_sticky_lane(

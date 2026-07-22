@@ -314,9 +314,22 @@ class TournamentResearchContract:
             self.original_persist_session(*pending)
 
 
-def begin_tournament_research_contract(agent, *, message: object, task_id: str, stream_callback=None) -> TournamentResearchContract | None:
+def begin_tournament_research_contract(
+    agent,
+    *,
+    message: object,
+    task_id: str,
+    stream_callback=None,
+    external_action: bool = False,
+) -> TournamentResearchContract | None:
+    """Bind a receipt only at a real external tournament-action boundary.
+
+    Ordinary private chat, research, drafts, and internal handoffs must retain
+    normal streaming and persistence. Callers that publish, send, or otherwise
+    make an external factual claim must explicitly pass ``external_action``.
+    """
     intent = classify_tournament_intent(message)
-    if intent is None:
+    if intent is None or not external_action:
         return None
     session_id = str(getattr(agent, "session_id", "") or "")
     # This is created before build_turn_context assigns its provider request ID;
