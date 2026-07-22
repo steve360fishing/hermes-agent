@@ -28,7 +28,7 @@ from agent.file_safety import get_safe_write_roots, is_write_denied
 
 NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
-POLICY_VERSION = "artifact-only-v3"
+POLICY_VERSION = "artifact-only-v4"
 MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
 MAX_PENDING_ARTIFACTS = 16
 MAX_PENDING_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -42,6 +42,22 @@ _ALLOWED_RECEIPT_TRANSITIONS = {
     "allocated": frozenset({"allocated", "written", "failed_preflight", "ambiguous"}),
     "written": frozenset({"written", "dispatching", "failed_preflight", "ambiguous"}),
     "dispatching": frozenset({"dispatching", "delivered", "ambiguous"}),
+}
+_LIFECYCLE_STATE = {
+    "allocated": "REQUESTED",
+    "written": "READ_BACK_VERIFIED",
+    "dispatching": "DELIVERY_REFERENCED",
+    "delivered": "COMPLETE",
+    "failed_preflight": "FAILED",
+    "ambiguous": "AMBIGUOUS",
+}
+_LIFECYCLE_STEPS = {
+    "allocated": ("REQUESTED",),
+    "written": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED"),
+    "dispatching": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "DELIVERY_REFERENCED"),
+    "delivered": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "DELIVERY_REFERENCED", "COMPLETE"),
+    "failed_preflight": ("REQUESTED", "FAILED"),
+    "ambiguous": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "AMBIGUOUS"),
 }
 _WINDOWS_FILE_ATTRIBUTE_REPARSE_POINT = 0x400
 
@@ -120,6 +136,25 @@ _EXPLICIT_ONLY = re.compile(
     r"\b(?:prompt[- ]only|return\s+only|give\s+me\s+only|paste[- ]ready)\b",
     re.IGNORECASE,
 )
+_HANDOFF_TARGET = re.compile(
+    r"\b(?:codex|claude|another\s+(?:model|agent|person)|a\s+(?:model|person))\b",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT = re.compile(
+    r"\b(?:prompt|brief|handoff|report|checklist|caption\s+package|copy)\b",
+    re.IGNORECASE,
+)
+_INLINE_ONLY = re.compile(
+    r"\b(?:inline|in\s+(?:this\s+)?chat|do\s+not\s+(?:attach|create)\s+(?:a\s+)?file|"
+    r"don't\s+(?:attach|create)\s+(?:a\s+)?file|no\s+(?:file|attachment))\b",
+    re.IGNORECASE,
+)
+_FILE_CORRECTION = re.compile(
+    r"\b(?:should\s+have\s+(?:made|sent|attached)|make|send|attach|turn)\b"
+    r"(?:(?![.!?\n]).){0,80}\b(?:it|that|this|the\s+(?:prompt|brief|report|handoff|copy))\b"
+    r"(?:(?![.!?\n]).){0,48}\b(?:file|attachment|\.txt|text\s+document)\b",
+    re.IGNORECASE,
+)
 _OPERATIONAL_REQUEST = re.compile(
     r"\b(?:research|search|look\s*up|browse|render|export|build|implement|"
     r"execute|run|reconcile|sync|publish|post|send|deploy|restart|install|"
@@ -188,6 +223,8 @@ class TaskExecutionContract:
     artifact_mime_type: str = ""
     artifact_route: str = "none"
     artifact_file_requested: bool = False
+    artifact_owed: bool = False
+    artifact_content_hint: str = ""
     preflight_error: str = ""
     explicit_urls: frozenset[str] = field(default_factory=frozenset)
     policy_version: str = POLICY_VERSION
@@ -509,7 +546,11 @@ class TaskExecutionContract:
 
 
 def build_task_execution_contract(
-    message: Any, *, task_id: str, platform: Any = None
+    message: Any,
+    *,
+    task_id: str,
+    platform: Any = None,
+    conversation_history: Any = None,
 ) -> TaskExecutionContract:
     text = message if isinstance(message, str) else str(message or "")
     correlation_id = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:16]
@@ -518,7 +559,24 @@ def build_task_execution_contract(
     file_requested, requested_filename, requested_extension = _requested_artifact_file(
         affirmative_text
     )
+    handoff_artifact = bool(
+        _HANDOFF_TARGET.search(affirmative_text)
+        and _HANDOFF_ARTIFACT.search(affirmative_text)
+        and not _INLINE_ONLY.search(affirmative_text)
+    )
+    recovery_content = ""
+    correction_artifact = False
+    if not file_requested and _FILE_CORRECTION.search(affirmative_text):
+        recovery_content = _last_assistant_text(conversation_history)
+        correction_artifact = bool(recovery_content)
+    if handoff_artifact or correction_artifact:
+        file_requested = True
+        requested_extension = ".txt"
     lane, reason = _classify(trusted_text, file_requested=file_requested)
+    if handoff_artifact:
+        lane, reason = ARTIFACT_ONLY, "handoff_text_attachment"
+    elif correction_artifact:
+        lane, reason = ARTIFACT_ONLY, "artifact_correction_attachment"
     if lane == ARTIFACT_ONLY:
         if _artifact_only_disabled():
             lane = NORMAL
@@ -584,6 +642,8 @@ def build_task_execution_contract(
         artifact_mime_type=artifact_mime_type,
         artifact_route=artifact_route,
         artifact_file_requested=file_requested,
+        artifact_owed=file_requested,
+        artifact_content_hint=recovery_content,
         preflight_error=preflight_error,
         explicit_urls=explicit_urls,
         _artifact_parent_chain=artifact_parent_chain,
@@ -606,6 +666,20 @@ def build_task_execution_contract(
     if contract.preflight_error and contract.artifact_root:
         _cleanup_task_owned_artifact(contract)
     return contract
+
+
+def _last_assistant_text(history: Any) -> str:
+    """Return the latest ordinary assistant text for a user-requested file repair."""
+    for message in reversed(list(history or [])):
+        if not isinstance(message, Mapping) or message.get("role") != "assistant":
+            continue
+        content = message.get("content")
+        if not isinstance(content, str):
+            continue
+        value = content.strip()
+        if value and not value.startswith("MEDIA:"):
+            return value
+    return ""
 
 
 def platform_supports_document_delivery(platform: Any) -> bool:
@@ -1195,6 +1269,8 @@ def _write_artifact_receipt_locked(
         "bytes": size if size is not None else prior.get("bytes", 0),
         "mime": contract.artifact_mime_type,
         "state": state,
+        "lifecycle_state": _LIFECYCLE_STATE[state],
+        "lifecycle": list(_LIFECYCLE_STEPS[state]),
         "attempt_count": int(prior.get("attempt_count", 0))
         + (1 if state == "dispatching" and transport_attempt else 0),
         "platform_message_id": str(message_id) if message_id is not None else prior.get("platform_message_id", ""),

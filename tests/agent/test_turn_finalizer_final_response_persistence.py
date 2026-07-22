@@ -1,3 +1,5 @@
+import json
+from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -80,6 +82,57 @@ class FakeAgent:
 
     def _sync_external_memory_for_turn(self, **_kwargs):
         pass
+
+
+def test_inline_handoff_is_written_and_referenced_before_persistence(monkeypatch, tmp_path):
+    """The final gate cannot let an owed handoff remain inline chat text."""
+    from agent.task_execution_contract import build_task_execution_contract
+
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    agent = FakeAgent()
+    agent._turn_file_mutation_paths = set()
+    agent._task_execution_contract = build_task_execution_contract(
+        "Give me a prompt for Claude to review this deployment.",
+        task_id="inline-handoff",
+        platform="telegram",
+    )
+
+    def write_registered(path, content, **_kwargs):
+        Path(path).write_text(content, encoding="utf-8")
+        return json.dumps({"bytes_written": len(content.encode("utf-8"))})
+
+    monkeypatch.setattr("tools.file_tools.write_file_tool", write_registered)
+    messages = [
+        {"role": "user", "content": "Give me a prompt for Claude."},
+        {"role": "assistant", "content": "Review the deployment carefully."},
+    ]
+
+    contract = agent._task_execution_contract
+    result = finalize_turn(
+        agent,
+        final_response="Review the deployment carefully.",
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="inline-handoff",
+        turn_id="turn-inline-handoff",
+        user_message=messages[0]["content"],
+        original_user_message=messages[0]["content"],
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(stop)",
+    )
+
+    assert result["final_response"] == f"MEDIA:{contract.artifact_output_path}"
+    assert Path(contract.artifact_output_path).read_text(encoding="utf-8") == "Review the deployment carefully."
+    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
+    assert receipt["state"] == "written"
+    assert receipt["lifecycle_state"] == "READ_BACK_VERIFIED"
+    assert receipt["lifecycle"] == ["REQUESTED", "CREATED", "READ_BACK_VERIFIED"]
+    assert result["messages"][-1]["content"] == result["final_response"]
 
 
 def test_finalizer_restores_clean_api_local_text_before_return(monkeypatch):
@@ -203,7 +256,7 @@ def test_public_tournament_rejection_replaces_candidate_before_persistence(monke
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
     agent = FakeAgent()
     begin_tournament_research_contract(
-        agent, message="publish tournament standings", task_id="task-tournament"
+        agent, message="publish tournament standings", task_id="task-tournament", external_action=True
     )
     messages = [
         {"role": "user", "content": "publish tournament standings"},

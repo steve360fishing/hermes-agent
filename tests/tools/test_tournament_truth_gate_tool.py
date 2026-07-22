@@ -31,7 +31,7 @@ def test_tool_requires_read_only_trusted_source_snapshot_before_running_provider
     roots = _roots(tmp_path)
     monkeypatch.setattr(tool, "configured_runtime_roots", lambda: roots)
     agent = Agent()
-    begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task")
+    begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task", external_action=True)
     result = json.loads(tool.run_tournament_truth_gate({"candidate": "answer", "request": {}, "artifact_metadata": {}}, task_id="task", session_id="session"))
     assert result["code"] == "trusted_source_snapshot_required"
 
@@ -43,7 +43,7 @@ def test_tool_runs_argument_list_once_and_binds_only_trusted_v2_receipt(tmp_path
     monkeypatch.setattr(tool, "configured_runtime_roots", lambda: roots)
     monkeypatch.setattr(contract_module, "configured_runtime_roots", lambda: roots)
     agent = Agent()
-    contract = begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task")
+    contract = begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task", external_action=True)
     request = {"evidence_manifest": [{"source_snapshot_path": str(snapshot), "source_snapshot_sha256": "0" * 64}]}
     metadata = {"factual_claims": [], "public_surfaces": []}
 
@@ -75,7 +75,7 @@ def test_tool_rejects_a_receipt_path_other_than_its_nonce_output_dir(tmp_path, m
     snapshot.write_text("{}", encoding="utf-8")
     monkeypatch.setattr(tool, "configured_runtime_roots", lambda: roots)
     agent = Agent()
-    begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task")
+    begin_tournament_research_contract(agent, message="publish tournament standings", task_id="task", external_action=True)
     request = {"evidence_manifest": [{"source_snapshot_path": str(snapshot), "source_snapshot_sha256": "0" * 64}]}
 
     def fake_run(_command, **_kwargs):
