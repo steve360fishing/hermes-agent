@@ -13,6 +13,7 @@ from agent.tournament_research_contract import (
     classify_tournament_intent,
     finalize_tournament_output,
 )
+from agent.turn_context import install_turn_stream_callback
 
 
 class Guardrails:
@@ -250,6 +251,42 @@ def test_conversation_entrypoint_leaves_private_tournament_chat_ungated(monkeypa
         )
 
     assert captured["contract"] is None
+
+
+def test_turn_setup_cannot_overwrite_public_receipt_gate_stream_buffer(
+    tmp_path, monkeypatch
+):
+    agent = FakeAgent()
+    caller_stream = []
+    _attach(
+        tmp_path,
+        monkeypatch,
+        agent,
+        task_id="stream-boundary",
+        candidate="verified standings",
+    )
+    contract = agent._tournament_research_contract
+    contract.callbacks.append(caller_stream.append)
+
+    install_turn_stream_callback(agent, caller_stream.append)
+    agent.stream_delta_callback("UNVERIFIED_PUBLIC_TOURNAMENT_OUTPUT")
+    agent._stream_callback("UNVERIFIED_PUBLIC_TOURNAMENT_OUTPUT")
+
+    assert agent.streamed == []
+    assert agent.tts == []
+    assert caller_stream == []
+
+    output, _telemetry, failed = finalize_tournament_output(
+        agent,
+        candidate="verified standings",
+        messages=[],
+    )
+
+    assert not failed
+    assert output == "verified standings"
+    assert agent.streamed == ["verified standings", None]
+    assert agent.tts == ["verified standings", None]
+    assert caller_stream == ["verified standings", None]
 
 
 def test_valid_receipt_is_exact_candidate_single_use_and_releases_after_finalization(tmp_path, monkeypatch):

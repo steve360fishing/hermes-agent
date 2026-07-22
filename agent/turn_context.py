@@ -47,6 +47,15 @@ from agent.task_execution_contract import (
 logger = logging.getLogger(__name__)
 
 
+def install_turn_stream_callback(agent, stream_callback) -> None:
+    """Preserve receipt-gate buffering across per-turn callback setup."""
+    tournament_contract = getattr(agent, "_tournament_research_contract", None)
+    buffer_callback = getattr(tournament_contract, "buffer_callback", None)
+    agent._stream_callback = (
+        buffer_callback if callable(buffer_callback) else stream_callback
+    )
+
+
 def compose_user_api_content(
     content: Any,
     ext_prefetch_cache: str,
@@ -371,8 +380,9 @@ def build_turn_context(
     if isinstance(persist_user_message, str):
         persist_user_message = sanitize_surrogates(persist_user_message)
 
-    # Store stream callback for _interruptible_api_call to pick up.
-    agent._stream_callback = stream_callback
+    # Store stream callback for _interruptible_api_call to pick up. Protected
+    # tournament turns keep the receipt-gate buffer installed until finalization.
+    install_turn_stream_callback(agent, stream_callback)
     agent._persist_user_message_idx = None
     agent._persist_user_message_override = persist_user_message
     agent._persist_user_message_timestamp = persist_user_timestamp
