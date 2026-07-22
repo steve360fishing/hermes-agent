@@ -289,6 +289,33 @@ def test_turn_setup_cannot_overwrite_public_receipt_gate_stream_buffer(
     assert caller_stream == ["verified standings", None]
 
 
+def test_unreceipted_public_stream_is_blocked_before_every_callback():
+    agent = FakeAgent()
+    caller_stream = []
+    begin_tournament_research_contract(
+        agent,
+        message="Publish the tournament standings to the website.",
+        task_id="blocked-stream-boundary",
+        stream_callback=caller_stream.append,
+        external_action=True,
+    )
+
+    install_turn_stream_callback(agent, caller_stream.append)
+    agent.stream_delta_callback("UNVERIFIED_PUBLIC_TOURNAMENT_OUTPUT")
+    agent._stream_callback("UNVERIFIED_PUBLIC_TOURNAMENT_OUTPUT")
+    output, _telemetry, failed = finalize_tournament_output(
+        agent,
+        candidate="UNVERIFIED_PUBLIC_TOURNAMENT_OUTPUT",
+        messages=[],
+    )
+
+    assert failed
+    assert output.startswith("PUBLIC_ARTIFACT_BLOCKED:")
+    assert agent.streamed == []
+    assert agent.tts == []
+    assert caller_stream == []
+
+
 def test_valid_receipt_is_exact_candidate_single_use_and_releases_after_finalization(tmp_path, monkeypatch):
     agent = FakeAgent()
     _attach(tmp_path, monkeypatch, agent, task_id="task-2", candidate="verified standings")
