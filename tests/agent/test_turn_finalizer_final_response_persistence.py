@@ -167,6 +167,39 @@ def test_finalizer_restores_clean_api_local_text_before_return(monkeypatch):
     assert result["messages"][0]["content"] == "clean prompt"
 
 
+def test_finalizer_preserves_a_10000_character_tournament_response_without_receipt(monkeypatch):
+    """Topic vocabulary cannot replace or fail a completed response."""
+    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
+    agent = FakeAgent()
+    candidate = "tournament-audit-payload-" + ("x" * 10_000)
+    messages = [
+        {"role": "user", "content": "Create a private tournament audit for Codex."},
+        {"role": "assistant", "content": candidate},
+    ]
+
+    result = finalize_turn(
+        agent,
+        final_response=candidate,
+        api_call_count=1,
+        interrupted=False,
+        failed=False,
+        messages=messages,
+        conversation_history=[],
+        effective_task_id="task",
+        turn_id="turn",
+        user_message=messages[0]["content"],
+        original_user_message=messages[0]["content"],
+        _should_review_memory=False,
+        _turn_exit_reason="text_response(finish_reason=stop)",
+    )
+
+    assert result["failed"] is False
+    assert result["final_response"] == candidate
+    assert result["messages"][-1]["content"] == candidate
+    assert agent.persisted_messages is not None
+    assert agent.persisted_messages[-1]["content"] == candidate
+
+
 def test_finalizer_restores_clean_api_local_multimodal_before_return(monkeypatch):
     """A queued note does not remain in the next-turn native image payload."""
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
