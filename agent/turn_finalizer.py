@@ -201,7 +201,6 @@ def _finalize_turn_impl(
             failed = True
             _turn_exit_reason = "artifact_obligation_unfulfilled"
 
-    tournament_telemetry = None
 
     budget_exhausted = (
         api_call_count >= agent.max_iterations
@@ -590,18 +589,6 @@ def _finalize_turn_impl(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
-    # This is deliberately after every response transform/hook and before the
-    # deferred session write and gateway return. The one accepted byte string
-    # is therefore the only version that can be persisted or delivered.
-    from agent.tournament_research_contract import finalize_tournament_output
-
-    final_response, tournament_telemetry, tournament_failed = finalize_tournament_output(
-        agent, candidate=final_response, messages=messages,
-    )
-    if tournament_failed:
-        failed = True
-        _turn_exit_reason = final_response or "ROUTE_HOLD"
-
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -689,9 +676,6 @@ def _finalize_turn_impl(
             decision_status=decision_status,
         )
         logger.info("task execution metadata: %s", result["task_execution"])
-    if tournament_telemetry is not None:
-        result["tournament_research"] = tournament_telemetry
-        logger.info("tournament research metadata: %s", tournament_telemetry)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).

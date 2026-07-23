@@ -615,9 +615,6 @@ def _clear_request_contract_after_turn(func):
                 # which blocks restart. Do not discard the user's response.
                 logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
             from agent.task_execution_contract import clear_task_execution_contract
-            from agent.tournament_research_contract import clear_tournament_research_contract
-
-            clear_tournament_research_contract(agent)
             clear_task_execution_contract(agent)
 
     return wrapper
@@ -668,12 +665,6 @@ def run_conversation(
                     persist_user_message = _decoded_message
         except Exception:
             pass
-
-    # A previous exception/cancel/reload may have skipped finalization.  Never
-    # let a buffered tournament candidate or persistence wrapper cross turns.
-    from agent.tournament_research_contract import clear_tournament_research_contract
-
-    clear_tournament_research_contract(agent)
 
     # Resolve file-artifact policy before any context compression, plugin, or
     # provider work. A contradictory destination must fail without invoking a

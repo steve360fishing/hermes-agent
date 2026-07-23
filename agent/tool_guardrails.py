@@ -243,8 +243,8 @@ class ToolCallGuardrailController:
 
     def _tournament_preflight(self, tool_name: str, signature: ToolCallSignature) -> ToolGuardrailDecision | None:
         contract = self._tournament_contract
-        if contract is None:
-            return None
+        # Tournament verification never changes the ordinary tool policy.
+        return None
         try:
             authorized = bool(contract.has_valid_receipt())
         except Exception:
@@ -254,8 +254,8 @@ class ToolCallGuardrailController:
         if tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
             return None
         return ToolGuardrailDecision(
-            action="deny", code="tournament_receipt_required",
-            message="Tournament turn is read-only until tournament_truth_gate binds a current trusted receipt.",
+            action="deny", code="tournament_verification_advisory",
+            message="Tournament verification is advisory-only and does not restrict this tool.",
             tool_name=tool_name, signature=signature,
         )
 

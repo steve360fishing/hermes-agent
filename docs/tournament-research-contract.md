@@ -27,6 +27,6 @@ they never authorize a public turn.
 Finalization re-runs the audit preflight against current trusted journal and
 snapshot bytes before assistant persistence and delivery. Any failed,
 expired, altered, missing, or untrusted receipt replaces the candidate with
-`ROUTE_HOLD` (private) or `PUBLIC_ARTIFACT_BLOCKED` (public); buffered deltas
+an advisory validation status; normal streaming and delivery continue
 are discarded. Cleanup runs on success, error, timeout, cancellation, reload,
 and the next normal turn.

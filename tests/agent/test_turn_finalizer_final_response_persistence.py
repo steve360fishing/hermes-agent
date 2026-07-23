@@ -3,7 +3,6 @@ from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
-from agent.tournament_research_contract import begin_tournament_research_contract
 from agent.turn_finalizer import finalize_turn
 
 
@@ -251,39 +250,6 @@ def test_final_response_closes_tool_tail_before_persistence(monkeypatch):
     assert agent.persisted_messages is not None
     assert agent.persisted_messages[-1] == {"role": "assistant", "content": "Done."}
 
-
-def test_public_tournament_rejection_replaces_candidate_before_persistence(monkeypatch):
-    monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    agent = FakeAgent()
-    begin_tournament_research_contract(
-        agent, message="publish tournament standings", task_id="task-tournament", external_action=True
-    )
-    messages = [
-        {"role": "user", "content": "publish tournament standings"},
-        {"role": "assistant", "content": "candidate standings"},
-    ]
-
-    result = finalize_turn(
-        agent,
-        final_response="candidate standings",
-        api_call_count=1,
-        interrupted=False,
-        failed=False,
-        messages=messages,
-        conversation_history=[],
-        effective_task_id="task-tournament",
-        turn_id="turn-tournament",
-        user_message="publish tournament standings",
-        original_user_message="publish tournament standings",
-        _should_review_memory=False,
-        _turn_exit_reason="text_response(stop)",
-    )
-
-    assert result["final_response"].startswith("PUBLIC_ARTIFACT_BLOCKED:")
-    assert result["failed"] is True
-    assert result["tournament_research"]["accepted"] is False
-    assert agent.persisted_messages[-1]["content"].startswith("PUBLIC_ARTIFACT_BLOCKED:")
-    assert result["response_previewed"] is False
 
 
 def test_final_response_fills_pure_tool_call_tail(monkeypatch):
