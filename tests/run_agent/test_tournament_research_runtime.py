@@ -62,7 +62,7 @@ def test_private_tournament_chat_does_not_require_an_external_action_receipt():
     agent._cleanup_task_resources = lambda *_args: None
     prompt = (
         "Privately answer the current tournament standings. If the current-year route receipt is "
-        "unavailable, reply with ROUTE_HOLD. Do not create a file, public artifact, newsletter copy, "
+        "unavailable, state the missing evidence precisely. Do not create a file, public artifact, newsletter copy, "
         "post, publish, or send anything outside this chat."
     )
 
