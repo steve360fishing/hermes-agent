@@ -20,12 +20,6 @@ def test_private_codex_handoff_never_installs_a_tournament_release_contract():
     assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
 
 
-def test_distinctive_10000_byte_response_is_an_ordinary_value():
-    candidate = "distinctive-payload-" + ("x" * 10_000)
-    assert len(candidate) > 10_000
-    assert candidate == candidate
-
-
 def test_tournament_contract_cannot_restrict_normal_tools():
     controller = ToolCallGuardrailController()
     contract = SimpleNamespace(has_valid_receipt=lambda: False)
