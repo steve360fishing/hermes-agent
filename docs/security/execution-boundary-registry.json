@@ -2426,6 +2426,15 @@
       "rationale": "enforcement boundary for the incident fallback contract."
     },
     {
+      "id": "gateway/run.py:_apply_pre_agent_route_provenance",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "_apply_pre_agent_route_provenance",
+      "disposition": "covered",
+      "rationale": "Enforces configured-primary provenance and visible fallback state when fallback is selected before agent construction."
+    },
+    {
       "id": "gateway/run.py:_apply_openrouter_fallback_notice_to_result",
       "contract": "incident_fallback",
       "role": "enforcement",

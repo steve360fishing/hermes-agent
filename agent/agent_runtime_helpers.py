@@ -1310,6 +1310,17 @@ def restore_primary_runtime(agent) -> bool:
     The gateway caches agents across messages (``_agent_cache`` in
     ``gateway/run.py``), so this restoration IS needed there too.
     """
+    if getattr(agent, "_pre_agent_fallback", False) is True:
+        # The gateway already retried and rejected the primary before this
+        # agent was constructed.  ``_primary_runtime`` carries identity-only
+        # provenance for truthful policy/reporting; its transport credentials
+        # intentionally remain unavailable.  A later successful gateway
+        # resolution has a different route signature and creates a fresh
+        # primary agent, so never combine this fallback transport with the
+        # configured primary identity here.
+        agent._fallback_index = 0
+        return False
+
     if not agent._fallback_activated:
         # Reset the chain index even when no fallback was activated this
         # turn.  Without this, a turn where _try_activate_fallback() was

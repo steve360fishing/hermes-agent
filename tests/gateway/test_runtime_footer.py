@@ -137,6 +137,20 @@ def test_format_footer_custom_field_order():
     assert out == "50% · gpt-5.4"
 
 
+def test_format_footer_optional_route_truth_fields():
+    out = format_runtime_footer(
+        model="gpt-5.6-sol",
+        provider="openai-codex",
+        requested_reasoning="high",
+        route_state="primary",
+        context_tokens=0,
+        context_length=None,
+        cwd="",
+        fields=("model", "provider", "requested_reasoning", "route_state"),
+    )
+    assert out == "gpt-5.6-sol · openai-codex · reasoning:high · primary"
+
+
 def test_format_footer_unknown_field_silently_ignored():
     out = format_runtime_footer(
         model="openai/gpt-5.4",

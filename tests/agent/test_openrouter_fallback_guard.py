@@ -5,6 +5,7 @@ from types import SimpleNamespace
 from agent.error_classifier import FailoverReason
 from agent.openrouter_fallback_guard import (
     OPENROUTER_FALLBACK_MODEL,
+    PRIMARY_ROUTE_RESTORED_NOTICE,
     apply_openrouter_fallback_notice,
     fallback_cap_message_if_exhausted,
     openrouter_fallback_activation_allowed,
@@ -30,8 +31,8 @@ def _agent(**overrides):
     return SimpleNamespace(**values)
 
 
-def test_incident_fallback_is_exactly_grok_45_via_openrouter() -> None:
-    assert OPENROUTER_FALLBACK_MODEL == "x-ai/grok-4.5"
+def test_incident_fallback_is_exactly_minimax_m3_via_openrouter() -> None:
+    assert OPENROUTER_FALLBACK_MODEL == "minimax/minimax-m3"
 
 
 def test_cached_fallback_cap_rechecks_primary_before_blocking() -> None:
@@ -66,7 +67,7 @@ def test_incident_grok_fallback_rejects_transport_timeout() -> None:
     assert "timeout" in message.lower()
 
 
-def test_gpt55_is_blocked_while_configured_openrouter_fallbacks_remain_compatible(
+def test_gpt56_primary_rejects_every_unexpected_openrouter_fallback(
     tmp_path, monkeypatch
 ) -> None:
     monkeypatch.setenv("HERMES_GATEWAY_HEALTH_PATH", str(tmp_path / "health.json"))
@@ -81,8 +82,8 @@ def test_gpt55_is_blocked_while_configured_openrouter_fallbacks_remain_compatibl
     allowed, message = openrouter_fallback_activation_allowed(
         agent, "openrouter", "anthropic/claude-sonnet-4.6"
     )
-    assert allowed is True
-    assert message == ""
+    assert allowed is False
+    assert "only minimax/minimax-m3" in message
 
     allowed, message = openrouter_fallback_activation_allowed(
         agent, "openrouter", OPENROUTER_FALLBACK_MODEL
@@ -103,7 +104,7 @@ def test_fallback_is_visible_and_stops_at_turn_cap(tmp_path, monkeypatch) -> Non
     response, changed = apply_openrouter_fallback_notice(agent, "continuity response")
     assert changed is True
     assert response.startswith("OPENROUTER FALLBACK ACTIVE")
-    assert "x-ai/grok-4.5" in response
+    assert "minimax/minimax-m3" in response
     assert "GPT-5.6 subscription access failed" in response
 
     health = __import__("json").loads(
@@ -111,8 +112,8 @@ def test_fallback_is_visible_and_stops_at_turn_cap(tmp_path, monkeypatch) -> Non
     )
     assert health["status"] == "degraded"
     assert health["active_provider"] == "openrouter"
-    assert health["active_model"] == "x-ai/grok-4.5"
-    assert "Grok 4.5" in health["last_failure"]["safe_summary"]
+    assert health["active_model"] == "minimax/minimax-m3"
+    assert "MiniMax M3" in health["last_failure"]["safe_summary"]
 
     cap_message = fallback_cap_message_if_exhausted(agent)
     assert cap_message is not None
@@ -219,6 +220,28 @@ def test_primary_success_clears_local_cap_when_other_session_owns_health(
         first, "openrouter", OPENROUTER_FALLBACK_MODEL
     )
     assert allowed is True
+
+
+def test_primary_restoration_notice_emits_once_for_same_session(
+    tmp_path, monkeypatch
+) -> None:
+    monkeypatch.setenv("HERMES_GATEWAY_HEALTH_PATH", str(tmp_path / "health.json"))
+    fallback = _agent()
+    record_openrouter_fallback_activation(fallback)
+    apply_openrouter_fallback_notice(fallback, "continuity response")
+
+    fallback.provider = "openai-codex"
+    fallback.model = "gpt-5.6-sol"
+    fallback._fallback_activated = False
+    fallback._openrouter_fallback_notice_required = False
+
+    response, changed = apply_openrouter_fallback_notice(fallback, "primary response")
+    assert changed is True
+    assert response.startswith(PRIMARY_ROUTE_RESTORED_NOTICE)
+
+    response, changed = apply_openrouter_fallback_notice(fallback, "next response")
+    assert changed is False
+    assert response == "next response"
 
 
 def test_runtime_integration_points_remain_wired() -> None:
