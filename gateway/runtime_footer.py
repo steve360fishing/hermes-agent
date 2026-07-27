@@ -91,6 +91,9 @@ def resolve_footer_config(
 def format_runtime_footer(
     *,
     model: Optional[str],
+    provider: Optional[str] = None,
+    requested_reasoning: Optional[str] = None,
+    route_state: Optional[str] = None,
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
@@ -107,6 +110,15 @@ def format_runtime_footer(
             m = _model_short(model)
             if m:
                 parts.append(m)
+        elif field == "provider":
+            if provider:
+                parts.append(str(provider))
+        elif field == "requested_reasoning":
+            if requested_reasoning:
+                parts.append(f"reasoning:{requested_reasoning}")
+        elif field == "route_state":
+            if route_state:
+                parts.append(str(route_state))
         elif field == "context_pct":
             if context_length and context_length > 0 and context_tokens >= 0:
                 pct = max(0, min(100, round((context_tokens / context_length) * 100)))
@@ -127,6 +139,9 @@ def build_footer_line(
     user_config: dict[str, Any] | None,
     platform_key: str | None,
     model: Optional[str],
+    provider: Optional[str] = None,
+    requested_reasoning: Optional[str] = None,
+    route_state: Optional[str] = None,
     context_tokens: int,
     context_length: Optional[int],
     cwd: Optional[str] = None,
@@ -142,6 +157,9 @@ def build_footer_line(
         return ""
     return format_runtime_footer(
         model=model,
+        provider=provider,
+        requested_reasoning=requested_reasoning,
+        route_state=route_state,
         context_tokens=context_tokens,
         context_length=context_length,
         cwd=cwd,

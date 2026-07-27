@@ -19,6 +19,7 @@ import asyncio
 import dataclasses
 import hashlib
 import inspect
+import json
 import logging
 import os
 import re
@@ -604,11 +605,10 @@ class GatewaySlashCommandsMixin:
         context_used = context_used or _int_value(getattr(session_entry, "last_prompt_tokens", 0))
 
         user_config: dict[str, Any] = {}
-        if not model_name or not provider_name or not context_total:
-            try:
-                user_config = _load_gateway_config()
-            except Exception:
-                user_config = {}
+        try:
+            user_config = _load_gateway_config()
+        except Exception:
+            user_config = {}
         if not model_name:
             model_name = _resolve_gateway_model(user_config)
         if not provider_name:
@@ -620,6 +620,38 @@ class GatewaySlashCommandsMixin:
             configured_context = model_cfg.get("context_length") if isinstance(model_cfg, dict) else None
             if isinstance(configured_context, int) and configured_context > 0:
                 context_total = configured_context
+
+        configured_model = ""
+        configured_provider = ""
+        configured_reasoning = ""
+        configured_model_cfg = (
+            user_config.get("model", {}) if isinstance(user_config, dict) else {}
+        )
+        if isinstance(configured_model_cfg, dict):
+            configured_model = _clean_str(
+                configured_model_cfg.get("default")
+                or configured_model_cfg.get("model")
+            )
+            configured_provider = _clean_str(configured_model_cfg.get("provider"))
+            configured_reasoning = _clean_str(
+                configured_model_cfg.get("reasoning_effort")
+                or configured_model_cfg.get("reasoning")
+            )
+
+        last_completed: dict[str, Any] = {}
+        try:
+            raw_model_config = session_row.get("model_config")
+            parsed_model_config = (
+                json.loads(raw_model_config)
+                if isinstance(raw_model_config, str) and raw_model_config
+                else raw_model_config
+            )
+            if isinstance(parsed_model_config, dict):
+                candidate = parsed_model_config.get("gateway_runtime")
+                if isinstance(candidate, dict):
+                    last_completed = candidate
+        except (TypeError, ValueError, json.JSONDecodeError):
+            last_completed = {}
 
         model_line = ""
         if model_name:
@@ -653,6 +685,29 @@ class GatewaySlashCommandsMixin:
         ])
         if model_line:
             lines.append(model_line)
+        if configured_model:
+            configured_bits = [
+                configured_model,
+                configured_provider or "provider-unresolved",
+            ]
+            if configured_reasoning:
+                configured_bits.append(f"reasoning {configured_reasoning}")
+            lines.append("Configured next turn: " + " · ".join(configured_bits))
+        if last_completed:
+            completed_bits = [
+                _clean_str(session_row.get("model")) or "model-unrecorded",
+                _clean_str(last_completed.get("provider")) or "provider-unrecorded",
+                _clean_str(last_completed.get("route_state")) or "route-unrecorded",
+            ]
+            completed_reasoning = _clean_str(
+                last_completed.get("requested_reasoning")
+            )
+            if completed_reasoning:
+                completed_bits.append(f"reasoning {completed_reasoning}")
+            completed_at = _clean_str(last_completed.get("completed_at"))
+            if completed_at:
+                completed_bits.append(completed_at)
+            lines.append("Last completed turn: " + " · ".join(completed_bits))
         if context_line:
             lines.append(context_line)
         lines.extend([

@@ -94,7 +94,7 @@ class TestFormatSessionInfo:
                                   {"provider": "openrouter", "base_url": "", "api_key": ""})
         with p1, p2, p3:
             info = runner._format_session_info()
-        assert "Model" in info
+        assert "model" in info.lower()
         assert "Context" in info
 
     def test_runtime_resolution_failure_doesnt_crash(self, runner, tmp_path):

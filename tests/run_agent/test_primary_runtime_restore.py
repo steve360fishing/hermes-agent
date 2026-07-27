@@ -147,7 +147,7 @@ class TestRestorePrimaryRuntime:
         assert agent.model == original_model
         assert agent.provider == original_provider
 
-    def test_restores_output_cap_after_capped_grok_fallback(
+    def test_restores_output_cap_after_capped_minimax_fallback(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv(
@@ -156,7 +156,7 @@ class TestRestorePrimaryRuntime:
         agent = _make_agent(
             fallback_model={
                 "provider": "openrouter",
-                "model": "x-ai/grok-4.5",
+                "model": "minimax/minimax-m3",
             },
             provider="openai-codex",
         )

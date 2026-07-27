@@ -7,10 +7,13 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any
 
-OPENROUTER_FALLBACK_MODEL = "x-ai/grok-4.5"
+OPENROUTER_FALLBACK_MODEL = "minimax/minimax-m3"
 OPENROUTER_FALLBACK_NOTICE = (
-    "OPENROUTER FALLBACK ACTIVE: using x-ai/grok-4.5 because "
+    "OPENROUTER FALLBACK ACTIVE: using minimax/minimax-m3 because "
     "GPT-5.6 subscription access failed."
+)
+PRIMARY_ROUTE_RESTORED_NOTICE = (
+    "PRIMARY ROUTE RESTORED: gpt-5.6-sol · openai-codex"
 )
 _OPENROUTER_GPT55_MODELS = {"openai/gpt-5.5", "openai/gpt-5.5-pro"}
 
@@ -35,12 +38,16 @@ def openrouter_fallback_activation_allowed(
     if not _is_gpt56_subscription_primary(agent):
         return True, ""
     if model_norm != OPENROUTER_FALLBACK_MODEL:
-        return True, ""
+        return (
+            False,
+            "Automatic OpenRouter fallback policy rejected unexpected model "
+            f"{model or '<empty>'}; only minimax/minimax-m3 is allowed.",
+        )
     reason_norm = _norm(getattr(reason, "value", reason))
     if reason_norm == "timeout":
         return (
             False,
-            "Automatic Grok incident fallback is blocked for transport timeout.",
+            "Automatic MiniMax M3 incident fallback is blocked for transport timeout.",
         )
     cap_message = fallback_cap_message_if_exhausted(
         agent, provider=provider_norm, model=model
@@ -92,7 +99,7 @@ def record_openrouter_fallback_activation(
                 "category": str(reason or "primary_failed"),
                 "safe_summary": (
                     "GPT-5.6 subscription route failed; Hermes entered visible "
-                    "capped OpenRouter Grok 4.5 fallback."
+                    "capped OpenRouter MiniMax M3 fallback."
                 ),
             },
         }
@@ -128,7 +135,23 @@ def apply_openrouter_fallback_notice(
     agent: Any, final_response: str
 ) -> tuple[str, bool]:
     if not is_emergency_openrouter_fallback_active(agent):
+        existing = _load_health(gateway_health_path())
+        restored = (
+            _is_gpt56_subscription_primary(agent)
+            and _norm(getattr(agent, "provider", "")) == "openai-codex"
+            and _norm(getattr(agent, "model", "")) == "gpt-5.6-sol"
+            and existing.get("fallback_active") is True
+            and existing.get("fallback_owner") == _fallback_owner(agent)
+        )
         record_gateway_primary_route(agent)
+        if restored:
+            body = str(final_response or "").strip()
+            if body.startswith(PRIMARY_ROUTE_RESTORED_NOTICE):
+                return body, False
+            return (
+                f"{PRIMARY_ROUTE_RESTORED_NOTICE}\n\n{body}".rstrip(),
+                True,
+            )
         return final_response, False
 
     cap_message = fallback_cap_message_if_exhausted(agent)
