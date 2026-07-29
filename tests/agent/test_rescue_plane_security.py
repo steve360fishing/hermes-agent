@@ -127,6 +127,109 @@ def _write_recovery_authorization(
     path.chmod(0o400)
 
 
+def _write_stale_recovery_authorization(
+    path: Path,
+    *,
+    reporter,
+    stale_before: float,
+    authorization_id: str = "d1af8e64-0b4e-4ec9-9ae6-19fbc25ebdcb",
+    expected_state_hash: str | None = None,
+    expected_stale_records: dict[str, list[str]] | None = None,
+    prior_source_sha: str = "a" * 40,
+    prior_image_id: str = "sha256:" + "b" * 64,
+    target_source_sha: str = "a" * 40,
+    target_image_id: str = "sha256:" + "b" * 64,
+    issued_at: float = 0.0,
+    expires_at: float = 300.0,
+) -> None:
+    path.parent.mkdir(mode=0o750, exist_ok=True)
+    path.parent.chmod(0o750)
+    path.unlink(missing_ok=True)
+    path.write_text(
+        json.dumps(
+            {
+                "schema_version": "hermes-rescue-recovery-authorization-v2",
+                "authorization_id": authorization_id,
+                "expected_reasons": [
+                    "background_unknown",
+                    "gateway_unknown",
+                    "worker_crash",
+                ],
+                "expected_producer_epoch": reporter.producer_epoch,
+                "expected_state_hash": (
+                    expected_state_hash or reporter._recovery_subject_hash()
+                ),
+                "expected_prior_source_sha": prior_source_sha,
+                "expected_prior_image_id": prior_image_id,
+                "expected_target_source_sha": target_source_sha,
+                "expected_target_image_id": target_image_id,
+                "expected_stale_before": stale_before,
+                "expected_stale_records": (
+                    expected_stale_records
+                    or reporter.state.stale_record_ids(stale_before=stale_before)
+                ),
+                "issued_at": issued_at,
+                "expires_at": expires_at,
+            },
+            sort_keys=True,
+            separators=(",", ":"),
+        ),
+        encoding="ascii",
+    )
+    path.chmod(0o400)
+
+
+def _seed_stale_recovery_state(reporter, *, peer_pid: int = 987654) -> None:
+    events = [
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "turn_start",
+            "event_id": "stale-turn-start",
+            "turn_id": "stale-turn",
+            "lane": "normal",
+            "artifact_requested": False,
+        },
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "tool_start",
+            "event_id": "stale-tool-start",
+            "turn_id": "stale-tool-turn",
+            "work_id": "stale-tool",
+        },
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "provider_start",
+            "event_id": "stale-provider-start",
+            "turn_id": "stale-turn",
+            "work_id": "stale-provider",
+        },
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "background_start",
+            "event_id": "stale-background-start",
+            "turn_id": "stale-background-turn",
+            "work_id": "stale-background",
+        },
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "background_unknown",
+            "event_id": "stale-background-unknown",
+            "turn_id": "stale-background-turn",
+            "work_id": "stale-background",
+        },
+    ]
+    for offset, event in enumerate(events, start=1):
+        reporter.state.apply_event(
+            event,
+            peer_pid=peer_pid,
+            peer_uid=os.getuid(),
+            now=float(offset),
+        )
+    reporter.state.degrade("gateway_unknown")
+    reporter.state.degrade("worker_crash")
+    reporter._persist_state()
+
+
 def _downgrade_continuity_to_legacy_degraded(reporter) -> None:
     payload = json.loads(reporter.continuity_state_path.read_text(encoding="ascii"))
     aggregate = payload["aggregate"]
@@ -580,6 +683,205 @@ def test_authorization_never_clears_nonrecoverable_degradation(
     )
     for now in range(20, 40):
         assert restarted.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+def test_stale_recovery_v2_removes_only_exact_pre_container_records(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    _seed_stale_recovery_state(reporter)
+    reporter.state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "turn_start",
+            "event_id": "completed-turn-start",
+            "turn_id": "completed-turn",
+            "lane": "normal",
+            "artifact_requested": False,
+        },
+        peer_pid=444444,
+        peer_uid=os.getuid(),
+        now=6.0,
+    )
+    reporter.state.apply_event(
+        {
+            "schema_version": "hermes-rescue-event-v1",
+            "event": "turn_end",
+            "event_id": "completed-turn-end",
+            "turn_id": "completed-turn",
+        },
+        peer_pid=444444,
+        peer_uid=os.getuid(),
+        now=7.0,
+    )
+    reporter.state.consumed_recovery_ids.append(
+        "7be0bc9c-76df-4a19-9b19-970f58353328"
+    )
+    reporter._persist_state()
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    monkeypatch.setattr(reporter_module, "_pid_alive", lambda _pid: False)
+    reporter.emit_snapshot(now=10.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v2.json"
+    _write_stale_recovery_authorization(
+        authorization,
+        reporter=reporter,
+        stale_before=100.0,
+    )
+
+    recovering = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    assert recovering.emit_snapshot(now=20.0)["telemetry_health"] == "degraded"
+    assert recovering.emit_snapshot(now=21.0)["telemetry_health"] == "degraded"
+    assert recovering.emit_snapshot(now=22.0)["telemetry_health"] == "degraded"
+    assert recovering.state.telemetry_health == "healthy"
+    assert recovering.state.active_counts() == (0, 0, 0)
+    assert recovering.state.reconciled_crashes == 0
+    assert recovering.state.consumed_recovery_ids == [
+        "7be0bc9c-76df-4a19-9b19-970f58353328",
+        "d1af8e64-0b4e-4ec9-9ae6-19fbc25ebdcb"
+    ]
+    assert recovering.state.turns["completed-turn"]["completed_at"] == 7.0
+    assert recovering.sequence > 0
+    assert recovering.emit_snapshot(now=23.0)["telemetry_health"] == "healthy"
+
+    recovering.state.degrade("background_unknown")
+    recovering.state.degrade("gateway_unknown")
+    recovering.state.degrade("worker_crash")
+    recovering._persist_state()
+    replayed = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(30, 35):
+        assert replayed.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+
+
+@linux_only
+@pytest.mark.parametrize(
+    "failure",
+    [
+        "pid_reused",
+        "current_work",
+        "state_drift",
+        "source_drift",
+        "record_drift",
+        "gateway_unknown",
+        "expired",
+    ],
+)
+def test_stale_recovery_v2_blocks_unsafe_or_drifted_state(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    failure: str,
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    _seed_stale_recovery_state(reporter)
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    monkeypatch.setattr(
+        reporter_module,
+        "_pid_alive",
+        lambda pid: failure == "pid_reused" and pid == 987654,
+    )
+    if failure == "current_work":
+        reporter.state.apply_event(
+            {
+                "schema_version": "hermes-rescue-event-v1",
+                "event": "provider_start",
+                "event_id": "current-provider-start",
+                "turn_id": "current-turn",
+                "work_id": "current-provider",
+            },
+            peer_pid=222222,
+            peer_uid=os.getuid(),
+            now=150.0,
+        )
+        reporter._persist_state()
+    reporter.emit_snapshot(now=10.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v2.json"
+    _write_stale_recovery_authorization(
+        authorization,
+        reporter=reporter,
+        stale_before=100.0,
+        expected_stale_records=(
+            {
+                "turns": [],
+                "tools": [],
+                "providers": [],
+                "backgrounds": [],
+            }
+            if failure == "record_drift"
+            else None
+        ),
+        target_source_sha="c" * 40 if failure == "source_drift" else "a" * 40,
+        expires_at=15.0 if failure == "expired" else 300.0,
+    )
+    if failure == "state_drift":
+        reporter.state.apply_event(
+            {
+                "schema_version": "hermes-rescue-event-v1",
+                "event": "provider_start",
+                "event_id": "drift-provider-start",
+                "turn_id": "drift-turn",
+                "work_id": "drift-provider",
+            },
+            peer_pid=333333,
+            peer_uid=os.getuid(),
+            now=12.0,
+        )
+        reporter.state.apply_event(
+            {
+                "schema_version": "hermes-rescue-event-v1",
+                "event": "provider_end",
+                "event_id": "drift-provider-end",
+                "turn_id": "drift-turn",
+                "work_id": "drift-provider",
+            },
+            peer_pid=333333,
+            peer_uid=os.getuid(),
+            now=13.0,
+        )
+        reporter._persist_state()
+    if failure == "gateway_unknown":
+        monkeypatch.setattr(
+            reporter_module,
+            "discover_gateway_state",
+            lambda **_kwargs: ([], "unknown"),
+        )
+
+    blocked = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in range(20, 26):
+        assert blocked.emit_snapshot(now=float(now))["telemetry_health"] == "degraded"
+    assert blocked.state.active_counts() != (0, 0, 0)
+    assert (
+        "d1af8e64-0b4e-4ec9-9ae6-19fbc25ebdcb"
+        not in blocked.state.consumed_recovery_ids
+    )
 
 
 @linux_only
