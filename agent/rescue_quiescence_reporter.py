@@ -658,6 +658,9 @@ def discover_gateway_state(
             continue
         try:
             process_uid = _read_proc_uid(child / "status")
+        except FileNotFoundError:
+            # The process exited after /proc enumeration.
+            continue
         except (OSError, ValueError):
             return [], "unknown"
         if process_uid is None:
