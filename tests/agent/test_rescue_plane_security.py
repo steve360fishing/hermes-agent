@@ -2028,6 +2028,26 @@ def test_gateway_discovery_skips_unreadable_foreign_uid_cmdline(
     assert discover_gateway_state(proc_root=proc, expected_uid=expected_uid) == ([], "dead")
 
 
+def test_gateway_discovery_skips_process_that_exits_before_status_read(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    from agent.rescue_quiescence_reporter import discover_gateway_state
+
+    proc = tmp_path / "proc"
+    process = proc / "321"
+    process.mkdir(parents=True)
+    original_read_text = Path.read_text
+
+    def vanished_status(path: Path, *args, **kwargs) -> str:
+        if path == process / "status":
+            raise FileNotFoundError("process exited")
+        return original_read_text(path, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "read_text", vanished_status)
+    assert discover_gateway_state(proc_root=proc, expected_uid=10000) == ([], "dead")
+
+
 def test_gateway_discovery_fails_closed_for_unreadable_expected_uid_cmdline(
     tmp_path: Path,
     monkeypatch: pytest.MonkeyPatch,
