@@ -43,6 +43,9 @@ _RECOVERY_ID_CAPACITY = 256
 _RECOVERABLE_DEGRADATION_REASONS = frozenset(
     {"continuity_gap", "gateway_unknown", "legacy_unattributed"}
 )
+_STALE_RECOVERY_REASONS = frozenset(
+    {"background_unknown", "gateway_unknown", "worker_crash"}
+)
 _DEGRADATION_REASONS = frozenset({
     "active_work_bound",
     "background_unknown",
@@ -126,12 +129,24 @@ class ReporterState:
     def note_activity(self) -> None:
         self.recovery_idle_emissions = 0
 
-    def recover(self, authorization_id: str | None = None) -> None:
+    def recover(
+        self,
+        authorization_id: str | None = None,
+        *,
+        authorized_reasons: frozenset[str] | None = None,
+    ) -> None:
         if self.telemetry_health != "degraded":
             raise ValueError("reporter is not degraded")
-        if not self.degradation_reasons or not self.degradation_reasons.issubset(
-            _RECOVERABLE_DEGRADATION_REASONS
-        ):
+        normally_recoverable = (
+            self.degradation_reasons
+            and self.degradation_reasons.issubset(_RECOVERABLE_DEGRADATION_REASONS)
+        )
+        specially_recoverable = (
+            authorized_reasons is not None
+            and authorized_reasons == _STALE_RECOVERY_REASONS
+            and self.degradation_reasons == set(authorized_reasons)
+        )
+        if not normally_recoverable and not specially_recoverable:
             raise ValueError("reporter degradation is not recoverable")
         if authorization_id is not None:
             if authorization_id in self.consumed_recovery_ids:
@@ -315,7 +330,8 @@ class ReporterState:
         dead = {pid for pid in active_pids if not is_pid_alive(pid)}
         if dead:
             newly_degraded = self.telemetry_health != "degraded"
-            self.degrade("worker_crash")
+            if "worker_crash" not in self.degradation_reasons:
+                self.degrade("worker_crash")
             if newly_degraded:
                 self.reconciled_crashes = min(
                     100_000, self.reconciled_crashes + len(dead)
@@ -329,6 +345,64 @@ class ReporterState:
             len(self.tools) + len(self.backgrounds),
             len(self.providers),
         )
+
+    def stale_record_ids(self, *, stale_before: float) -> dict[str, list[str]]:
+        if (
+            type(stale_before) not in {int, float}
+            or not math.isfinite(float(stale_before))
+            or float(stale_before) <= 0
+        ):
+            raise ValueError("invalid stale record cutoff")
+        cutoff = float(stale_before)
+        return {
+            "turns": sorted(
+                turn_id
+                for turn_id, turn in self.turns.items()
+                if turn["completed_at"] is None
+                and float(turn["started_at"]) < cutoff
+            ),
+            "tools": sorted(
+                work_id
+                for work_id, item in self.tools.items()
+                if float(item["started_at"]) < cutoff
+            ),
+            "providers": sorted(
+                work_id
+                for work_id, item in self.providers.items()
+                if float(item["started_at"]) < cutoff
+            ),
+            "backgrounds": sorted(
+                work_id
+                for work_id, item in self.backgrounds.items()
+                if float(item["started_at"]) < cutoff
+            ),
+        }
+
+    def stale_record_pids(
+        self, stale_records: Mapping[str, list[str]]
+    ) -> set[int]:
+        pids: set[int] = set()
+        collections: dict[str, Mapping[str, dict[str, Any]]] = {
+            "turns": self.turns,
+            "tools": self.tools,
+            "providers": self.providers,
+            "backgrounds": self.backgrounds,
+        }
+        for name, collection in collections.items():
+            for record_id in stale_records[name]:
+                pids.add(int(collection[record_id]["peer_pid"]))
+        return pids
+
+    def purge_stale_records(self, stale_records: Mapping[str, list[str]]) -> None:
+        for turn_id in stale_records["turns"]:
+            self.turns.pop(turn_id)
+        for work_id in stale_records["tools"]:
+            self.tools.pop(work_id)
+        for work_id in stale_records["providers"]:
+            self.providers.pop(work_id)
+        for work_id in stale_records["backgrounds"]:
+            self.backgrounds.pop(work_id)
+        self.reconciled_crashes = 0
 
     def policy_evidence(self) -> list[dict[str, Any]]:
         return [
@@ -732,56 +806,104 @@ class QuiescenceReporter:
         except FileNotFoundError:
             return None
         payload = _strict_json_object(raw)
-        if (
-            set(payload)
-            != {
-                "schema_version",
-                "authorization_id",
-                "expected_reason",
-                "expected_producer_epoch",
-                "expected_state_hash",
-                "expected_prior_source_sha",
-                "expected_prior_image_id",
-                "expected_target_source_sha",
-                "expected_target_image_id",
-                "issued_at",
-                "expires_at",
-            }
-            or payload["schema_version"] != "hermes-rescue-recovery-authorization-v1"
-            or not __import__("re").fullmatch(
+        schema_version = payload.get("schema_version")
+        common_fields = {
+            "schema_version",
+            "authorization_id",
+            "expected_producer_epoch",
+            "expected_state_hash",
+            "expected_prior_source_sha",
+            "expected_prior_image_id",
+            "expected_target_source_sha",
+            "expected_target_image_id",
+            "issued_at",
+            "expires_at",
+        }
+        v1_fields = common_fields | {"expected_reason"}
+        v2_fields = common_fields | {
+            "expected_reasons",
+            "expected_stale_before",
+            "expected_stale_records",
+        }
+        common_invalid = (
+            not __import__("re").fullmatch(
                 r"[0-9a-f]{8}-[0-9a-f]{4}-[1-5][0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}",
-                str(payload["authorization_id"]),
-            )
-            or type(payload["expected_reason"]) is not str
-            or payload["expected_reason"] not in {"gateway_unknown", "legacy_unattributed"}
-            or not __import__("re").fullmatch(
-                r"[0-9a-f]{32}", str(payload["expected_producer_epoch"])
+                str(payload.get("authorization_id")),
             )
             or not __import__("re").fullmatch(
-                r"[0-9a-f]{64}", str(payload["expected_state_hash"])
+                r"[0-9a-f]{32}", str(payload.get("expected_producer_epoch"))
+            )
+            or not __import__("re").fullmatch(
+                r"[0-9a-f]{64}", str(payload.get("expected_state_hash"))
             )
             or not __import__("re").fullmatch(
                 r"[0-9a-f]{40}|[0-9a-f]{64}",
-                str(payload["expected_prior_source_sha"]),
+                str(payload.get("expected_prior_source_sha")),
             )
             or not __import__("re").fullmatch(
-                r"sha256:[0-9a-f]{64}", str(payload["expected_prior_image_id"])
+                r"sha256:[0-9a-f]{64}", str(payload.get("expected_prior_image_id"))
             )
             or not __import__("re").fullmatch(
                 r"[0-9a-f]{40}|[0-9a-f]{64}",
-                str(payload["expected_target_source_sha"]),
+                str(payload.get("expected_target_source_sha")),
             )
             or not __import__("re").fullmatch(
-                r"sha256:[0-9a-f]{64}", str(payload["expected_target_image_id"])
+                r"sha256:[0-9a-f]{64}", str(payload.get("expected_target_image_id"))
             )
-            or type(payload["issued_at"]) not in {int, float}
-            or not math.isfinite(float(payload["issued_at"]))
-            or type(payload["expires_at"]) not in {int, float}
-            or not math.isfinite(float(payload["expires_at"]))
+            or type(payload.get("issued_at")) not in {int, float}
+            or not math.isfinite(float(payload.get("issued_at", math.nan)))
+            or type(payload.get("expires_at")) not in {int, float}
+            or not math.isfinite(float(payload.get("expires_at", math.nan)))
             or not 0
-            < float(payload["expires_at"]) - float(payload["issued_at"])
+            < float(payload.get("expires_at", 0))
+            - float(payload.get("issued_at", 0))
             <= _RECOVERY_MAX_TTL_SECONDS
-        ):
+        )
+        if schema_version == "hermes-rescue-recovery-authorization-v1":
+            invalid = (
+                set(payload) != v1_fields
+                or type(payload.get("expected_reason")) is not str
+                or payload.get("expected_reason")
+                not in {"gateway_unknown", "legacy_unattributed"}
+            )
+        elif schema_version == "hermes-rescue-recovery-authorization-v2":
+            stale_records = payload.get("expected_stale_records")
+            invalid_stale_records = (
+                type(stale_records) is not dict
+                or set(stale_records) != {
+                    "turns",
+                    "tools",
+                    "providers",
+                    "backgrounds",
+                }
+            )
+            if not invalid_stale_records:
+                for values in stale_records.values():
+                    if (
+                        type(values) is not list
+                        or len(values) > 256
+                        or any(
+                            not _bounded_text(value, limit=256) for value in values
+                        )
+                        or len(values) != len(set(values))
+                        or values != sorted(values)
+                    ):
+                        invalid_stale_records = True
+                        break
+            invalid = (
+                set(payload) != v2_fields
+                or payload.get("expected_reasons")
+                != sorted(_STALE_RECOVERY_REASONS)
+                or type(payload.get("expected_stale_before")) not in {int, float}
+                or not math.isfinite(
+                    float(payload.get("expected_stale_before", math.nan))
+                )
+                or float(payload.get("expected_stale_before", 0)) <= 0
+                or invalid_stale_records
+            )
+        else:
+            invalid = True
+        if common_invalid or invalid:
             raise ValueError("invalid telemetry recovery authorization")
         if (
             payload["expected_target_source_sha"] != self.source_sha
@@ -1051,12 +1173,67 @@ class QuiescenceReporter:
                 return True
             return False
         reasons = self.state.degradation_reasons
+        authorization = self.recovery_authorization
+        if (
+            authorization is not None
+            and authorization["schema_version"]
+            == "hermes-rescue-recovery-authorization-v2"
+        ):
+            stale_records = self.state.stale_record_ids(
+                stale_before=float(authorization["expected_stale_before"])
+            )
+            stale_turns = set(stale_records["turns"])
+            prospective_counts = (
+                active_counts[0] - len(stale_records["turns"]),
+                active_counts[1]
+                - len(stale_records["tools"])
+                - len(stale_records["backgrounds"]),
+                active_counts[2] - len(stale_records["providers"]),
+            )
+            authorized = (
+                reasons == _STALE_RECOVERY_REASONS
+                and authorization["expected_reasons"] == sorted(reasons)
+                and authorization["expected_stale_records"] == stale_records
+                and current >= float(authorization["issued_at"])
+                and current <= float(authorization["expires_at"])
+                and authorization["authorization_id"]
+                not in self.state.consumed_recovery_ids
+                and authorization["expected_state_hash"]
+                == self._recovery_subject_hash()
+                and gateway_state == "active"
+                and prospective_counts == (0, 0, 0)
+                and all(value == 0 for value in self.count_floor.values())
+                and not any(
+                    item["completed_at"] is None
+                    and item["turn_id"] not in stale_turns
+                    for item in policy_evidence
+                )
+                and all(
+                    not _pid_alive(pid)
+                    for pid in self.state.stale_record_pids(stale_records)
+                )
+                and len(self.state.consumed_recovery_ids) < _RECOVERY_ID_CAPACITY
+            )
+            if not authorized:
+                if self.state.recovery_idle_emissions:
+                    self.state.recovery_idle_emissions = 0
+                    return True
+                return False
+            self.state.recovery_idle_emissions += 1
+            if self.state.recovery_idle_emissions >= _RECOVERY_STABLE_EMISSIONS:
+                self.state.purge_stale_records(stale_records)
+                self.state.recover(
+                    str(authorization["authorization_id"]),
+                    authorized_reasons=_STALE_RECOVERY_REASONS,
+                )
+            return True
         if reasons == {"continuity_gap"}:
             authorization_id: str | None = None
         elif reasons in ({"gateway_unknown"}, {"legacy_unattributed"}):
-            authorization = self.recovery_authorization
             if (
                 authorization is None
+                or authorization["schema_version"]
+                != "hermes-rescue-recovery-authorization-v1"
                 or authorization["expected_reason"] not in reasons
                 or current < float(authorization["issued_at"])
                 or current > float(authorization["expires_at"])
