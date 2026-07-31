@@ -125,9 +125,13 @@ def _apply_openrouter_fallback_notice_to_result(
     if not agent or not isinstance(result, dict):
         return
     try:
-        from agent.openrouter_fallback_guard import apply_openrouter_fallback_notice
+        from agent.openrouter_fallback_guard import (
+            apply_openrouter_fallback_notice,
+            fallback_notice_for_agent,
+        )
 
         final_response = result.get("final_response") or ""
+        fallback_notice = fallback_notice_for_agent(agent)
         guarded_response, changed = apply_openrouter_fallback_notice(
             agent, final_response
         )
@@ -135,6 +139,8 @@ def _apply_openrouter_fallback_notice_to_result(
         logger.debug("OpenRouter fallback notice guard failed", exc_info=True)
         return
 
+    if fallback_notice:
+        result["fallback_notice"] = fallback_notice
     if changed:
         result["final_response"] = guarded_response
         result["response_transformed"] = True
@@ -2229,24 +2235,32 @@ def _try_resolve_fallback_provider(
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
+        protected_primary = (
+            primary_model.strip().lower() == "gpt-5.6-sol"
+            and primary_provider.strip().lower() == "openai-codex"
+        )
+        if protected_primary:
+            from agent.openrouter_fallback_guard import CONTINUITY_FALLBACK_ROUTES
+
+            normalized_chain = tuple(
+                (
+                    str(entry.get("provider") or "").strip().lower(),
+                    str(entry.get("model") or "").strip().lower(),
+                )
+                if isinstance(entry, dict)
+                else ("", "")
+                for entry in fb_list
+            )
+            if normalized_chain != CONTINUITY_FALLBACK_ROUTES:
+                logger.error(
+                    "Rejecting automatic fallback chain drift for protected "
+                    "GPT-5.6 subscription route"
+                )
+                return None
         for entry in fb_list:
             try:
                 entry_provider = str(entry.get("provider") or "").strip().lower()
                 entry_model = str(entry.get("model") or "").strip().lower()
-                protected_primary = (
-                    primary_model.strip().lower() == "gpt-5.6-sol"
-                    and primary_provider.strip().lower() == "openai-codex"
-                )
-                if protected_primary and (
-                    entry_provider != "openrouter"
-                    or entry_model != "minimax/minimax-m3"
-                ):
-                    logger.error(
-                        "Rejecting unexpected automatic fallback provider=%s model=%s",
-                        entry_provider or "<empty>",
-                        entry_model or "<empty>",
-                    )
-                    continue
                 from hermes_cli.fallback_config import resolve_entry_api_key
 
                 runtime = resolve_runtime_provider(
@@ -2278,6 +2292,9 @@ def _try_resolve_fallback_provider(
                         "requested_reasoning": requested_reasoning,
                         "route_state": "fallback",
                         "safe_fallback_reason": safe_reason,
+                        "fallback_model": entry.get("model"),
+                        "fallback_provider": entry.get("provider")
+                        or runtime.get("provider"),
                     },
                 }
             except Exception as fb_exc:
@@ -2303,6 +2320,18 @@ def _apply_pre_agent_route_provenance(agent: Any, turn_route: dict) -> None:
     agent._fallback_activated = True
     agent._fallback_reason = provenance.get("safe_fallback_reason")
     agent._requested_reasoning = provenance.get("requested_reasoning")
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+
+        agent.reasoning_config = resolve_reasoning_config(
+            load_config() or {}, str(getattr(agent, "model", "") or "")
+        )
+    except Exception:
+        logger.debug(
+            "Failed to resolve pre-agent fallback reasoning configuration",
+            exc_info=True,
+        )
     try:
         from agent.openrouter_fallback_guard import (
             record_openrouter_fallback_activation,
@@ -13703,7 +13732,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter,
+                            response,
+                            event,
+                            _media_adapter,
+                            fallback_notice=str(
+                                agent_result.get("fallback_notice") or ""
+                            ),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -14771,6 +14805,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
+        *,
+        fallback_notice: str = "",
     ) -> None:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
@@ -14818,6 +14854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=event.source.chat_id,
                         file_path=file_path,
                         metadata=_thread_meta,
+                        **({"caption": fallback_notice} if fallback_notice else {}),
                     )
                 except Exception:
                     result = None
@@ -14882,7 +14919,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [
+                        (f"file://{_quote(p)}", fallback_notice)
+                        for p in image_paths
+                    ]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -14899,12 +14939,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
+                            **(
+                                {"caption": fallback_notice}
+                                if fallback_notice
+                                else {}
+                            ),
                         )
                     elif ext in _VIDEO_EXTS:
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
+                            **(
+                                {"caption": fallback_notice}
+                                if fallback_notice
+                                else {}
+                            ),
                         )
                     else:
                         await _deliver_document(media_path)
@@ -14919,6 +14969,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
+                            **(
+                                {"caption": fallback_notice}
+                                if fallback_notice
+                                else {}
+                            ),
                         )
                     else:
                         await _deliver_document(file_path)
@@ -15059,16 +15114,21 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _apply_pre_agent_route_provenance(agent, turn_route)
                 try:
-                    return agent.run_conversation(
+                    result = agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
+                    _apply_openrouter_fallback_notice_to_result(agent, result)
+                    return result
                 finally:
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
+            fallback_notice = str(
+                result.get("fallback_notice") or ""
+            ) if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
@@ -15081,17 +15141,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                if fallback_notice and text_content.startswith(fallback_notice):
+                    text_content = text_content[len(fallback_notice) :].lstrip()
+                delivery_prefix = (
+                    f"{fallback_notice}\n\n" if fallback_notice else ""
+                )
 
                 if text_content:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + text_content,
+                        content=delivery_prefix + header + text_content,
                         metadata=_thread_metadata,
                     )
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + "(No response generated)",
+                        content=delivery_prefix + header + "(No response generated)",
                         metadata=_thread_metadata,
                     )
 
@@ -15101,7 +15166,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_image(
                             chat_id=source.chat_id,
                             image_url=image_url,
-                            caption=alt_text,
+                            caption=(
+                                f"{fallback_notice}\n\n{alt_text}".rstrip()
+                                if fallback_notice
+                                else alt_text
+                            ),
                             metadata=_thread_metadata,
                         )
                     except Exception:
@@ -15123,24 +15192,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 audio_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                         elif _ext in _VIDEO_EXTS:
                             await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                         elif _ext in _IMAGE_EXTS:
                             await adapter.send_image_file(
                                 chat_id=source.chat_id,
                                 image_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                         else:
                             await adapter.send_document(
                                 chat_id=source.chat_id,
                                 file_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                     except Exception:
                         pass
@@ -21463,10 +21552,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Auto-generate session title after first exchange (non-blocking)
             try:
                 from agent.openrouter_fallback_guard import (
-                    is_emergency_openrouter_fallback_active,
+                    is_continuity_fallback_active,
                 )
 
-                openrouter_fallback_active = is_emergency_openrouter_fallback_active(
+                openrouter_fallback_active = is_continuity_fallback_active(
                     agent
                 )
             except Exception:

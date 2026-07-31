@@ -719,9 +719,9 @@ def _finalize_turn_impl(
     # Background memory/skill review — runs AFTER the response is delivered
     # so it never competes with the user's task for model attention.
     try:
-        from agent.openrouter_fallback_guard import is_emergency_openrouter_fallback_active
+        from agent.openrouter_fallback_guard import is_continuity_fallback_active
 
-        openrouter_fallback_active = is_emergency_openrouter_fallback_active(agent)
+        openrouter_fallback_active = is_continuity_fallback_active(agent)
     except Exception:
         openrouter_fallback_active = False
 

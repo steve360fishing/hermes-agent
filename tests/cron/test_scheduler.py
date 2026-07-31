@@ -3302,7 +3302,9 @@ class TestSendMediaViaAdapter:
         return media_file.resolve()
 
     @staticmethod
-    def _run_with_loop(adapter, chat_id, media_files, metadata, job):
+    def _run_with_loop(
+        adapter, chat_id, media_files, metadata, job, *, caption=None
+    ):
         """Helper: run _send_media_via_adapter with immediate scheduling."""
         from concurrent.futures import Future
 
@@ -3313,7 +3315,15 @@ class TestSendMediaViaAdapter:
             return completed
 
         with patch("asyncio.run_coroutine_threadsafe", side_effect=fake_run_coro):
-            _send_media_via_adapter(adapter, chat_id, media_files, metadata, MagicMock(), job)
+            _send_media_via_adapter(
+                adapter,
+                chat_id,
+                media_files,
+                metadata,
+                MagicMock(),
+                job,
+                caption=caption,
+            )
 
     def test_video_dispatched_to_send_video(self, tmp_path, monkeypatch):
         adapter = MagicMock()
@@ -3343,6 +3353,35 @@ class TestSendMediaViaAdapter:
         self._run_with_loop(adapter, "123", media_files, None, {"id": "j3"})
         adapter.send_voice.assert_called_once()
         adapter.send_image_file.assert_called_once()
+
+    def test_fallback_banner_is_applied_to_every_attachment(
+        self, tmp_path, monkeypatch
+    ):
+        from agent.openrouter_fallback_guard import SECONDARY_FALLBACK_NOTICE
+
+        adapter = MagicMock()
+        adapter.send_voice = AsyncMock()
+        adapter.send_document = AsyncMock()
+        voice_path = self._safe_media_path(tmp_path, monkeypatch, "voice.mp3")
+        report_path = self._safe_media_path(tmp_path, monkeypatch, "report.pdf")
+
+        self._run_with_loop(
+            adapter,
+            "123",
+            [(str(voice_path), False), (str(report_path), False)],
+            None,
+            {"id": "fallback-job"},
+            caption=SECONDARY_FALLBACK_NOTICE,
+        )
+
+        assert (
+            adapter.send_voice.call_args.kwargs["caption"]
+            == SECONDARY_FALLBACK_NOTICE
+        )
+        assert (
+            adapter.send_document.call_args.kwargs["caption"]
+            == SECONDARY_FALLBACK_NOTICE
+        )
 
 
 class TestParallelTick:

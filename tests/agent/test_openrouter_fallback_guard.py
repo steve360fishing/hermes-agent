@@ -4,10 +4,17 @@ from types import SimpleNamespace
 
 from agent.error_classifier import FailoverReason
 from agent.openrouter_fallback_guard import (
+    CONTINUITY_FALLBACK_ROUTES,
     OPENROUTER_FALLBACK_MODEL,
+    OPENROUTER_FALLBACK_NOTICE,
     PRIMARY_ROUTE_RESTORED_NOTICE,
+    SECONDARY_FALLBACK_MODEL,
+    SECONDARY_FALLBACK_NOTICE,
     apply_openrouter_fallback_notice,
+    continuity_fallback_tier,
     fallback_cap_message_if_exhausted,
+    fallback_notice_from_text,
+    is_continuity_fallback_active,
     openrouter_fallback_activation_allowed,
     record_openrouter_fallback_activation,
     record_gateway_primary_route,
@@ -31,8 +38,28 @@ def _agent(**overrides):
     return SimpleNamespace(**values)
 
 
+def _secondary_agent(**overrides):
+    values = {
+        "provider": "openai-api",
+        "model": SECONDARY_FALLBACK_MODEL,
+        "_fallback_activated": True,
+        "max_tokens": 8000,
+        "session_id": "secondary-fallback-session",
+        "_primary_runtime": {
+            "provider": "openai-codex",
+            "model": "gpt-5.6-sol",
+        },
+    }
+    values.update(overrides)
+    return SimpleNamespace(**values)
+
+
 def test_incident_fallback_is_exactly_minimax_m3_via_openrouter() -> None:
     assert OPENROUTER_FALLBACK_MODEL == "minimax/minimax-m3"
+    assert CONTINUITY_FALLBACK_ROUTES == (
+        ("openrouter", "minimax/minimax-m3"),
+        ("openai-api", "gpt-5.6-luna"),
+    )
 
 
 def test_cached_fallback_cap_rechecks_primary_before_blocking() -> None:
@@ -83,7 +110,8 @@ def test_gpt56_primary_rejects_every_unexpected_openrouter_fallback(
         agent, "openrouter", "anthropic/claude-sonnet-4.6"
     )
     assert allowed is False
-    assert "only minimax/minimax-m3" in message
+    assert "openrouter/minimax/minimax-m3 followed by" in message
+    assert "openai-api/gpt-5.6-luna" in message
 
     allowed, message = openrouter_fallback_activation_allowed(
         agent, "openrouter", OPENROUTER_FALLBACK_MODEL
@@ -103,9 +131,9 @@ def test_fallback_is_visible_and_stops_at_turn_cap(tmp_path, monkeypatch) -> Non
 
     response, changed = apply_openrouter_fallback_notice(agent, "continuity response")
     assert changed is True
-    assert response.startswith("OPENROUTER FALLBACK ACTIVE")
-    assert "minimax/minimax-m3" in response
-    assert "GPT-5.6 subscription access failed" in response
+    assert response.startswith(OPENROUTER_FALLBACK_NOTICE)
+    assert "FALLBACK ACTIVE: MiniMax M3 through OpenRouter" in response
+    assert "GPT-5.6 Sol through the subscription is currently unavailable" in response
 
     health = __import__("json").loads(
         (tmp_path / "health.json").read_text(encoding="utf-8")
@@ -168,6 +196,71 @@ def test_non_gpt56_primary_is_not_mislabeled(tmp_path, monkeypatch) -> None:
 
     assert changed is False
     assert response == "generic fallback"
+
+
+def test_secondary_fallback_is_visible_on_every_response(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_GATEWAY_HEALTH_PATH", str(tmp_path / "health.json"))
+    agent = _secondary_agent()
+
+    record_openrouter_fallback_activation(agent, reason="minimax_unavailable")
+    response, changed = apply_openrouter_fallback_notice(agent, "secondary response")
+
+    assert changed is True
+    assert response == f"{SECONDARY_FALLBACK_NOTICE}\n\nsecondary response"
+    assert is_continuity_fallback_active(agent) is True
+    assert continuity_fallback_tier(agent.provider, agent.model) == 2
+    assert fallback_notice_from_text(response) == SECONDARY_FALLBACK_NOTICE
+
+    repeated, changed = apply_openrouter_fallback_notice(agent, response)
+    assert changed is False
+    assert repeated == response
+
+
+def test_protected_fallback_chain_is_exact_and_ordered(tmp_path, monkeypatch) -> None:
+    monkeypatch.setenv("HERMES_GATEWAY_HEALTH_PATH", str(tmp_path / "health.json"))
+    exact_chain = [
+        {"provider": "openrouter", "model": OPENROUTER_FALLBACK_MODEL},
+        {"provider": "openai-api", "model": SECONDARY_FALLBACK_MODEL},
+    ]
+    agent = _agent(
+        _fallback_activated=False,
+        _fallback_chain=exact_chain,
+        _fallback_index=1,
+    )
+
+    allowed, message = openrouter_fallback_activation_allowed(
+        agent, "openrouter", OPENROUTER_FALLBACK_MODEL
+    )
+    assert allowed is True
+    assert message == ""
+
+    agent._fallback_index = 2
+    allowed, message = openrouter_fallback_activation_allowed(
+        agent, "openai-api", SECONDARY_FALLBACK_MODEL
+    )
+    assert allowed is True
+    assert message == ""
+
+    for invalid_chain in (
+        exact_chain[:1],
+        list(reversed(exact_chain)),
+        [*exact_chain, {"provider": "openrouter", "model": "x-ai/grok-4.5"}],
+        [*exact_chain, "invalid-entry"],
+    ):
+        agent._fallback_chain = invalid_chain
+        allowed, message = openrouter_fallback_activation_allowed(
+            agent, "openrouter", OPENROUTER_FALLBACK_MODEL
+        )
+        assert allowed is False
+        assert "must contain exactly" in message
+
+    agent._fallback_chain = exact_chain
+    agent._fallback_index = 2
+    allowed, message = openrouter_fallback_activation_allowed(
+        agent, "openrouter", OPENROUTER_FALLBACK_MODEL
+    )
+    assert allowed is False
+    assert "order violation" in message
 
 
 def test_cap_survives_primary_retry_until_primary_response_succeeds(
@@ -254,6 +347,6 @@ def test_runtime_integration_points_remain_wired() -> None:
 
     assert "openrouter_fallback_activation_allowed" in chat_helpers
     assert "record_openrouter_fallback_activation" in chat_helpers
-    assert "is_emergency_openrouter_fallback_active" in turn_finalizer
+    assert "is_continuity_fallback_active" in turn_finalizer
     assert "apply_openrouter_fallback_notice" in gateway
     assert "fallback_cap_message_after_primary_eligibility" in gateway
