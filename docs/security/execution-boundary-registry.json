@@ -2327,6 +2327,24 @@
       "rationale": "enforcement boundary for the incident fallback contract."
     },
     {
+      "id": "agent/openrouter_fallback_guard.py:_fallback_notice_for_route",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "_fallback_notice_for_route",
+      "disposition": "covered",
+      "rationale": "Selects the exact permanent warning required for the active fallback tier."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:_strip_known_fallback_notice",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "_strip_known_fallback_notice",
+      "disposition": "covered",
+      "rationale": "Prevents duplicate fallback warnings while preserving one exact warning on every delivery."
+    },
+    {
       "id": "agent/openrouter_fallback_guard.py:apply_openrouter_fallback_notice",
       "contract": "incident_fallback",
       "role": "enforcement",
@@ -2345,6 +2363,24 @@
       "rationale": "enforcement boundary for the incident fallback contract."
     },
     {
+      "id": "agent/openrouter_fallback_guard.py:fallback_notice_for_agent",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "fallback_notice_for_agent",
+      "disposition": "covered",
+      "rationale": "Maps the authenticated active route to its exact user-visible fallback warning."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:fallback_notice_from_text",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "fallback_notice_from_text",
+      "disposition": "covered",
+      "rationale": "Propagates an existing fallback warning into attachment and scheduled-delivery captions."
+    },
+    {
       "id": "agent/openrouter_fallback_guard.py:is_emergency_openrouter_fallback_active",
       "contract": "incident_fallback",
       "role": "enforcement",
@@ -2352,6 +2388,15 @@
       "symbol": "is_emergency_openrouter_fallback_active",
       "disposition": "covered",
       "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "agent/openrouter_fallback_guard.py:is_continuity_fallback_active",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "agent/openrouter_fallback_guard.py",
+      "symbol": "is_continuity_fallback_active",
+      "disposition": "covered",
+      "rationale": "Recognizes only the two approved continuity fallback routes for warning and recovery enforcement."
     },
     {
       "id": "agent/openrouter_fallback_guard.py:openrouter_fallback_activation_allowed",
@@ -2399,6 +2444,42 @@
       "rationale": "recovery boundary for the incident fallback contract."
     },
     {
+      "id": "cron/scheduler.py:_deliver_result",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "cron/scheduler.py",
+      "symbol": "_deliver_result",
+      "disposition": "covered",
+      "rationale": "Keeps the active fallback warning first in scheduled text and on every scheduled attachment."
+    },
+    {
+      "id": "cron/scheduler.py:run_job",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "cron/scheduler.py",
+      "symbol": "run_job",
+      "disposition": "covered",
+      "rationale": "Applies the permanent fallback warning before a scheduled result can be persisted or delivered."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter",
+      "disposition": "covered",
+      "rationale": "Owns the common platform delivery boundary that preserves warnings on text and attachments."
+    },
+    {
+      "id": "gateway/platforms/base.py:BasePlatformAdapter._process_message_background",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/platforms/base.py",
+      "symbol": "BasePlatformAdapter._process_message_background",
+      "disposition": "covered",
+      "rationale": "Propagates the active fallback warning to every normal platform delivery."
+    },
+    {
       "id": "gateway/run.py:GatewayRunner",
       "contract": "incident_fallback",
       "role": "enforcement",
@@ -2406,6 +2487,24 @@
       "symbol": "GatewayRunner",
       "disposition": "covered",
       "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task_inner",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task_inner",
+      "disposition": "covered",
+      "rationale": "Keeps the active fallback warning first on background text and on every background attachment."
+    },
+    {
+      "id": "gateway/run.py:GatewayRunner._run_background_task_inner.run_sync",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "GatewayRunner._run_background_task_inner.run_sync",
+      "disposition": "covered",
+      "rationale": "Applies route provenance and warning enforcement before a background result leaves the agent."
     },
     {
       "id": "gateway/run.py:GatewayRunner._run_agent_inner",
@@ -2426,6 +2525,15 @@
       "rationale": "enforcement boundary for the incident fallback contract."
     },
     {
+      "id": "gateway/run.py:_apply_pre_agent_route_provenance",
+      "contract": "incident_fallback",
+      "role": "enforcement",
+      "path": "gateway/run.py",
+      "symbol": "_apply_pre_agent_route_provenance",
+      "disposition": "covered",
+      "rationale": "Enforces configured-primary provenance and visible fallback state when fallback is selected before agent construction."
+    },
+    {
       "id": "gateway/run.py:_apply_openrouter_fallback_notice_to_result",
       "contract": "incident_fallback",
       "role": "enforcement",
@@ -2433,6 +2541,15 @@
       "symbol": "_apply_openrouter_fallback_notice_to_result",
       "disposition": "covered",
       "rationale": "enforcement boundary for the incident fallback contract."
+    },
+    {
+      "id": "gateway/run.py:_try_resolve_fallback_provider",
+      "contract": "incident_fallback",
+      "role": "decision",
+      "path": "gateway/run.py",
+      "symbol": "_try_resolve_fallback_provider",
+      "disposition": "covered",
+      "rationale": "Fail-closes protected primary routing unless the configured chain exactly matches the two approved fallback tiers."
     },
     {
       "id": "agent/shell_hooks.py:register_from_config",

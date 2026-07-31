@@ -301,6 +301,42 @@ async def test_streaming_delivery_routes_telegram_flac_media_tag_to_document_sen
 
 
 @pytest.mark.asyncio
+async def test_streaming_fallback_banner_is_applied_to_attachment(
+    tmp_path, monkeypatch
+):
+    from agent.openrouter_fallback_guard import OPENROUTER_FALLBACK_NOTICE
+
+    event = _event(thread_id="topic-1")
+    media_file = _allowed_media_path(tmp_path, monkeypatch, "report.pdf")
+    adapter = SimpleNamespace(
+        name="test",
+        extract_media=BasePlatformAdapter.extract_media,
+        extract_images=BasePlatformAdapter.extract_images,
+        extract_local_files=BasePlatformAdapter.extract_local_files,
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice")),
+        send_voice=AsyncMock(return_value=SendResult(success=True, message_id="voice")),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="doc")),
+        send_image_file=AsyncMock(return_value=SendResult(success=True, message_id="image")),
+        send_video=AsyncMock(return_value=SendResult(success=True, message_id="video")),
+    )
+
+    await GatewayRunner._deliver_media_from_response(
+        _fake_runner({"thread_id": "topic-1"}),
+        f"MEDIA:{media_file}",
+        event,
+        adapter,
+        fallback_notice=OPENROUTER_FALLBACK_NOTICE,
+    )
+
+    adapter.send_document.assert_awaited_once_with(
+        chat_id="chat-1",
+        file_path=str(media_file),
+        caption=OPENROUTER_FALLBACK_NOTICE,
+        metadata={"thread_id": "topic-1"},
+    )
+
+
+@pytest.mark.asyncio
 async def test_streaming_delivery_routes_non_voice_telegram_ogg_media_tag_to_document_sender(tmp_path, monkeypatch):
     event = _event(thread_id="topic-1")
     media_file = _allowed_media_path(tmp_path, monkeypatch, "speech.ogg")

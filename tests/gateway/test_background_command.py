@@ -268,6 +268,67 @@ class TestRunBackgroundTask:
         mock_agent_instance.close.assert_called_once()
 
     @pytest.mark.asyncio
+    async def test_fallback_background_result_starts_with_permanent_banner(
+        self, monkeypatch
+    ):
+        from agent.openrouter_fallback_guard import SECONDARY_FALLBACK_NOTICE
+        from gateway import run as gateway_run
+
+        runner = _make_runner()
+        runner._resolve_session_agent_runtime = MagicMock(
+            return_value=("gpt-5.6-luna", {"api_key": "test-key"})
+        )
+        runner._resolve_session_reasoning_config = MagicMock(
+            return_value={"enabled": True, "effort": "high"}
+        )
+        runner._load_service_tier = MagicMock(return_value=None)
+        runner._resolve_turn_agent_config = MagicMock(
+            return_value={
+                "model": "gpt-5.6-luna",
+                "runtime": {"api_key": "test-key"},
+                "request_overrides": None,
+            }
+        )
+        runner._run_in_executor_with_context = AsyncMock(
+            return_value={
+                "final_response": (
+                    f"{SECONDARY_FALLBACK_NOTICE}\n\nFallback background result."
+                ),
+                "fallback_notice": SECONDARY_FALLBACK_NOTICE,
+                "messages": [],
+            }
+        )
+        monkeypatch.setattr(gateway_run, "_load_gateway_config", lambda: {})
+
+        mock_adapter = AsyncMock()
+        mock_adapter.send = AsyncMock()
+        mock_adapter.extract_media = MagicMock(
+            return_value=(
+                [],
+                f"{SECONDARY_FALLBACK_NOTICE}\n\nFallback background result.",
+            )
+        )
+        mock_adapter.extract_images = MagicMock(
+            side_effect=lambda response: ([], response)
+        )
+        runner.adapters[Platform.TELEGRAM] = mock_adapter
+
+        source = SessionSource(
+            platform=Platform.TELEGRAM,
+            user_id="12345",
+            chat_id="67890",
+            user_name="testuser",
+        )
+
+        await runner._run_background_task("say hello", source, "bg_fallback")
+
+        content = mock_adapter.send.call_args.kwargs["content"]
+        assert content.startswith(SECONDARY_FALLBACK_NOTICE)
+        assert content.count(SECONDARY_FALLBACK_NOTICE) == 1
+        assert "Background task complete" in content
+        assert "Fallback background result." in content
+
+    @pytest.mark.asyncio
     async def test_media_files_routed_by_type(self, monkeypatch):
         """Result media is routed to the type-specific sender, not send_document.
 

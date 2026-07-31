@@ -5127,6 +5127,16 @@ class BasePlatformAdapter(ABC):
             if not response:
                 logger.debug("[%s] Handler returned empty/None response for %s", self.name, event.source.chat_id)
             if response:
+                try:
+                    from agent.openrouter_fallback_guard import (
+                        fallback_notice_from_text,
+                    )
+
+                    _fallback_attachment_caption = fallback_notice_from_text(
+                        response
+                    )
+                except Exception:
+                    _fallback_attachment_caption = ""
                 # Capture [[as_document]] before extract_media strips it, so the
                 # dispatch partition below can route image-extension files
                 # through send_document instead of send_multiple_images. Used
@@ -5143,6 +5153,16 @@ class BasePlatformAdapter(ABC):
 
                 # Extract image URLs and send them as native platform attachments
                 images, text_content = self.extract_images(response)
+                if _fallback_attachment_caption and images:
+                    images = [
+                        (
+                            image_url,
+                            (
+                                f"{_fallback_attachment_caption}\n\n{alt_text}".rstrip()
+                            ),
+                        )
+                        for image_url, alt_text in images
+                    ]
                 # Strip any remaining internal directives from message body (fixes #1561).
                 # _strip_media_directives shares MEDIA_TAG_CLEANUP_RE, so a MEDIA: tag
                 # with an unknown extension is intentionally left in the body for
@@ -5378,7 +5398,10 @@ class BasePlatformAdapter(ABC):
 
                 if _image_paths:
                     try:
-                        _batch = [(f"file://{_quote(p)}", "") for p in _image_paths]
+                        _batch = [
+                            (f"file://{_quote(p)}", _fallback_attachment_caption)
+                            for p in _image_paths
+                        ]
                         await self.send_multiple_images(
                             chat_id=event.source.chat_id,
                             images=_batch,
@@ -5393,17 +5416,24 @@ class BasePlatformAdapter(ABC):
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(media_path).suffix.lower()
+                        _caption_kw = (
+                            {"caption": _fallback_attachment_caption}
+                            if _fallback_attachment_caption
+                            else {}
+                        )
                         if should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
                             media_result = await self.send_voice(
                                 chat_id=event.source.chat_id,
                                 audio_path=media_path,
                                 metadata=_final_thread_metadata,
+                                **_caption_kw,
                             )
                         elif ext in _VIDEO_EXTS:
                             media_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=media_path,
                                 metadata=_final_thread_metadata,
+                                **_caption_kw,
                             )
                         else:
                             _artifact_correlation = _artifact_correlation_for_path(media_path)
@@ -5411,6 +5441,7 @@ class BasePlatformAdapter(ABC):
                                 chat_id=event.source.chat_id,
                                 file_path=media_path,
                                 metadata=_final_thread_metadata,
+                                **_caption_kw,
                             )
 
                         if not media_result.success:
@@ -5462,17 +5493,24 @@ class BasePlatformAdapter(ABC):
                         await asyncio.sleep(human_delay)
                     try:
                         ext = Path(file_path).suffix.lower()
+                        _caption_kw = (
+                            {"caption": _fallback_attachment_caption}
+                            if _fallback_attachment_caption
+                            else {}
+                        )
                         if ext in _VIDEO_EXTS:
                             await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
+                                **_caption_kw,
                             )
                         else:
                             await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
+                                **_caption_kw,
                             )
                     except Exception as file_err:
                         logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)

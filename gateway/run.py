@@ -43,7 +43,7 @@ import sqlite3
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Awaitable, Callable, Dict, Optional, Any, List, Union
 
 # account_usage imports the OpenAI SDK chain (~230 ms). Only needed by
@@ -125,9 +125,13 @@ def _apply_openrouter_fallback_notice_to_result(
     if not agent or not isinstance(result, dict):
         return
     try:
-        from agent.openrouter_fallback_guard import apply_openrouter_fallback_notice
+        from agent.openrouter_fallback_guard import (
+            apply_openrouter_fallback_notice,
+            fallback_notice_for_agent,
+        )
 
         final_response = result.get("final_response") or ""
+        fallback_notice = fallback_notice_for_agent(agent)
         guarded_response, changed = apply_openrouter_fallback_notice(
             agent, final_response
         )
@@ -135,6 +139,8 @@ def _apply_openrouter_fallback_notice_to_result(
         logger.debug("OpenRouter fallback notice guard failed", exc_info=True)
         return
 
+    if fallback_notice:
+        result["fallback_notice"] = fallback_notice
     if changed:
         result["final_response"] = guarded_response
         result["response_transformed"] = True
@@ -2099,6 +2105,21 @@ def _resolve_runtime_agent_kwargs() -> dict:
     )
     from hermes_cli.auth import AuthError, is_rate_limited_auth_error
 
+    model_cfg = _get_model_config()
+    primary_model = ""
+    primary_provider = ""
+    requested_reasoning = ""
+    if isinstance(model_cfg, dict):
+        primary_model = str(
+            model_cfg.get("default") or model_cfg.get("model") or ""
+        ).strip()
+        primary_provider = str(model_cfg.get("provider") or "").strip()
+        requested_reasoning = str(
+            model_cfg.get("reasoning_effort")
+            or model_cfg.get("reasoning")
+            or ""
+        ).strip()
+
     try:
         runtime = resolve_runtime_provider()
     except AuthError as auth_exc:
@@ -2110,14 +2131,22 @@ def _resolve_runtime_agent_kwargs() -> dict:
             logger.warning("Primary provider rate-limited (429): %s — trying fallback", auth_exc)
         else:
             logger.warning("Primary provider auth failed: %s — trying fallback", auth_exc)
-        fb_config = _try_resolve_fallback_provider()
+        fb_config = _try_resolve_fallback_provider(
+            primary_model=primary_model,
+            primary_provider=primary_provider,
+            requested_reasoning=requested_reasoning,
+            safe_reason=(
+                "subscription_rate_limited"
+                if is_rate_limited_auth_error(auth_exc)
+                else "subscription_auth_failed"
+            ),
+        )
         if fb_config is not None:
             return fb_config
         raise RuntimeError(format_runtime_provider_error(auth_exc)) from auth_exc
     except Exception as exc:
         raise RuntimeError(format_runtime_provider_error(exc)) from exc
 
-    model_cfg = _get_model_config()
     max_tokens = None
     _env_mt = os.environ.get("HERMES_MAX_TOKENS")
     if _env_mt:
@@ -2187,7 +2216,13 @@ def _credential_pool_for_provider(provider: Optional[str]):
         return None
 
 
-def _try_resolve_fallback_provider() -> dict | None:
+def _try_resolve_fallback_provider(
+    *,
+    primary_model: str = "",
+    primary_provider: str = "",
+    requested_reasoning: str = "",
+    safe_reason: str = "primary_unavailable",
+) -> dict | None:
     """Attempt to resolve credentials from the fallback_model/fallback_providers config."""
     from hermes_cli.runtime_provider import resolve_runtime_provider
     try:
@@ -2200,8 +2235,32 @@ def _try_resolve_fallback_provider() -> dict | None:
         fb_list = get_fallback_chain(cfg)
         if not fb_list:
             return None
+        protected_primary = (
+            primary_model.strip().lower() == "gpt-5.6-sol"
+            and primary_provider.strip().lower() == "openai-codex"
+        )
+        if protected_primary:
+            from agent.openrouter_fallback_guard import CONTINUITY_FALLBACK_ROUTES
+
+            normalized_chain = tuple(
+                (
+                    str(entry.get("provider") or "").strip().lower(),
+                    str(entry.get("model") or "").strip().lower(),
+                )
+                if isinstance(entry, dict)
+                else ("", "")
+                for entry in fb_list
+            )
+            if normalized_chain != CONTINUITY_FALLBACK_ROUTES:
+                logger.error(
+                    "Rejecting automatic fallback chain drift for protected "
+                    "GPT-5.6 subscription route"
+                )
+                return None
         for entry in fb_list:
             try:
+                entry_provider = str(entry.get("provider") or "").strip().lower()
+                entry_model = str(entry.get("model") or "").strip().lower()
                 from hermes_cli.fallback_config import resolve_entry_api_key
 
                 runtime = resolve_runtime_provider(
@@ -2227,6 +2286,16 @@ def _try_resolve_fallback_provider() -> dict | None:
                     "args": list(runtime.get("args") or []),
                     "credential_pool": runtime.get("credential_pool"),
                     "model": entry.get("model"),
+                    "_route_provenance": {
+                        "primary_model": primary_model,
+                        "primary_provider": primary_provider,
+                        "requested_reasoning": requested_reasoning,
+                        "route_state": "fallback",
+                        "safe_fallback_reason": safe_reason,
+                        "fallback_model": entry.get("model"),
+                        "fallback_provider": entry.get("provider")
+                        or runtime.get("provider"),
+                    },
                 }
             except Exception as fb_exc:
                 logger.debug("Fallback entry %s failed: %s", entry.get("provider"), fb_exc)
@@ -2234,6 +2303,46 @@ def _try_resolve_fallback_provider() -> dict | None:
     except Exception:
         pass
     return None
+
+
+def _apply_pre_agent_route_provenance(agent: Any, turn_route: dict) -> None:
+    """Restore configured-primary truth after pre-construction fallback."""
+    provenance = turn_route.get("route_provenance")
+    if not agent or not isinstance(provenance, dict):
+        return
+    if provenance.get("route_state") != "fallback":
+        return
+    primary = dict(getattr(agent, "_primary_runtime", None) or {})
+    primary["model"] = provenance.get("primary_model")
+    primary["provider"] = provenance.get("primary_provider")
+    agent._primary_runtime = primary
+    agent._pre_agent_fallback = True
+    agent._fallback_activated = True
+    agent._fallback_reason = provenance.get("safe_fallback_reason")
+    agent._requested_reasoning = provenance.get("requested_reasoning")
+    try:
+        from hermes_cli.config import load_config
+        from hermes_constants import resolve_reasoning_config
+
+        agent.reasoning_config = resolve_reasoning_config(
+            load_config() or {}, str(getattr(agent, "model", "") or "")
+        )
+    except Exception:
+        logger.debug(
+            "Failed to resolve pre-agent fallback reasoning configuration",
+            exc_info=True,
+        )
+    try:
+        from agent.openrouter_fallback_guard import (
+            record_openrouter_fallback_activation,
+        )
+
+        record_openrouter_fallback_activation(
+            agent, reason=provenance.get("safe_fallback_reason")
+        )
+    except Exception:
+        logger.exception("Failed to initialize visible pre-agent fallback state")
+        raise
 
 
 def _event_media_type_at(event, index: int) -> str:
@@ -4286,6 +4395,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         route = {
             "model": model,
             "runtime": runtime,
+            "route_provenance": runtime_kwargs.get("_route_provenance"),
             "signature": (
                 model,
                 runtime["provider"],
@@ -4330,6 +4440,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             "base_url": getattr(agent, "base_url", None),
             "api_mode": getattr(agent, "api_mode", None),
             "fallback_active": bool(getattr(agent, "_fallback_activated", False)),
+            "route_state": (
+                "fallback"
+                if bool(getattr(agent, "_fallback_activated", False))
+                else "primary"
+            ),
+            "requested_reasoning": (
+                getattr(agent, "_requested_reasoning", None)
+                or (getattr(agent, "reasoning_config", None) or {}).get("effort")
+            ),
+            "safe_fallback_reason": getattr(agent, "_fallback_reason", None),
+            "completed_at": datetime.now(timezone.utc).isoformat(),
         }
         runtime = {k: v for k, v in runtime.items() if v not in (None, "")}
 
@@ -13250,6 +13371,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     user_config=_load_gateway_config(),
                     platform_key=_platform_config_key(source.platform),
                     model=agent_result.get("model"),
+                    provider=agent_result.get("provider"),
+                    requested_reasoning=agent_result.get("requested_reasoning"),
+                    route_state=agent_result.get("route_state"),
                     context_tokens=agent_result.get("last_prompt_tokens", 0) or 0,
                     context_length=agent_result.get("context_length") or None,
                     cwd=os.environ.get("TERMINAL_CWD", ""),
@@ -13608,7 +13732,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
                         await self._deliver_media_from_response(
-                            response, event, _media_adapter,
+                            response,
+                            event,
+                            _media_adapter,
+                            fallback_notice=str(
+                                agent_result.get("fallback_notice") or ""
+                            ),
                         )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
@@ -13874,8 +14003,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             ctx_display = str(context_length)
 
         lines = [
-            f"◆ Model: `{model}`",
-            f"◆ Provider: {provider or 'openrouter'}",
+            f"◆ Configured next-turn model: `{model}`",
+            f"◆ Configured next-turn provider: {provider or 'openrouter'}",
             f"◆ Context: {ctx_display} tokens ({ctx_source})",
         ]
 
@@ -14676,6 +14805,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         response: str,
         event: MessageEvent,
         adapter,
+        *,
+        fallback_notice: str = "",
     ) -> None:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
@@ -14723,6 +14854,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         chat_id=event.source.chat_id,
                         file_path=file_path,
                         metadata=_thread_meta,
+                        **({"caption": fallback_notice} if fallback_notice else {}),
                     )
                 except Exception:
                     result = None
@@ -14787,7 +14919,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
             if image_paths:
                 try:
-                    images = [(f"file://{_quote(p)}", "") for p in image_paths]
+                    images = [
+                        (f"file://{_quote(p)}", fallback_notice)
+                        for p in image_paths
+                    ]
                     await adapter.send_multiple_images(
                         chat_id=event.source.chat_id,
                         images=images,
@@ -14804,12 +14939,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_id=event.source.chat_id,
                             audio_path=media_path,
                             metadata=_thread_meta,
+                            **(
+                                {"caption": fallback_notice}
+                                if fallback_notice
+                                else {}
+                            ),
                         )
                     elif ext in _VIDEO_EXTS:
                         await adapter.send_video(
                             chat_id=event.source.chat_id,
                             video_path=media_path,
                             metadata=_thread_meta,
+                            **(
+                                {"caption": fallback_notice}
+                                if fallback_notice
+                                else {}
+                            ),
                         )
                     else:
                         await _deliver_document(media_path)
@@ -14824,6 +14969,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             chat_id=event.source.chat_id,
                             video_path=file_path,
                             metadata=_thread_meta,
+                            **(
+                                {"caption": fallback_notice}
+                                if fallback_notice
+                                else {}
+                            ),
                         )
                     else:
                         await _deliver_document(file_path)
@@ -14962,17 +15112,23 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                _apply_pre_agent_route_provenance(agent, turn_route)
                 try:
-                    return agent.run_conversation(
+                    result = agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
                     )
+                    _apply_openrouter_fallback_notice_to_result(agent, result)
+                    return result
                 finally:
                     self._cleanup_agent_resources(agent)
 
             result = await self._run_in_executor_with_context(run_sync)
 
             response = result.get("final_response", "") if result else ""
+            fallback_notice = str(
+                result.get("fallback_notice") or ""
+            ) if result else ""
             if not response and result and result.get("error"):
                 response = f"Error: {result['error']}"
 
@@ -14985,17 +15141,22 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
 
                 preview = prompt[:60] + ("..." if len(prompt) > 60 else "")
                 header = f'✅ Background task complete\nPrompt: "{preview}"\n\n'
+                if fallback_notice and text_content.startswith(fallback_notice):
+                    text_content = text_content[len(fallback_notice) :].lstrip()
+                delivery_prefix = (
+                    f"{fallback_notice}\n\n" if fallback_notice else ""
+                )
 
                 if text_content:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + text_content,
+                        content=delivery_prefix + header + text_content,
                         metadata=_thread_metadata,
                     )
                 elif not images and not media_files:
                     await adapter.send(
                         chat_id=source.chat_id,
-                        content=header + "(No response generated)",
+                        content=delivery_prefix + header + "(No response generated)",
                         metadata=_thread_metadata,
                     )
 
@@ -15005,7 +15166,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         await adapter.send_image(
                             chat_id=source.chat_id,
                             image_url=image_url,
-                            caption=alt_text,
+                            caption=(
+                                f"{fallback_notice}\n\n{alt_text}".rstrip()
+                                if fallback_notice
+                                else alt_text
+                            ),
                             metadata=_thread_metadata,
                         )
                     except Exception:
@@ -15027,24 +15192,44 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 chat_id=source.chat_id,
                                 audio_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                         elif _ext in _VIDEO_EXTS:
                             await adapter.send_video(
                                 chat_id=source.chat_id,
                                 video_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                         elif _ext in _IMAGE_EXTS:
                             await adapter.send_image_file(
                                 chat_id=source.chat_id,
                                 image_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                         else:
                             await adapter.send_document(
                                 chat_id=source.chat_id,
                                 file_path=media_path,
                                 metadata=_thread_metadata,
+                                **(
+                                    {"caption": fallback_notice}
+                                    if fallback_notice
+                                    else {}
+                                ),
                             )
                     except Exception:
                         pass
@@ -20543,6 +20728,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     # Reload from disk — do not reuse the startup snapshot (#60955).
                     fallback_model=self._refresh_fallback_model(),
                 )
+                _apply_pre_agent_route_provenance(agent, turn_route)
                 if _cache_lock and _cache is not None:
                     with _cache_lock:
                         # Record the session_id the snapshot was taken for
@@ -21181,6 +21367,18 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 _output_toks = getattr(_agent, "session_completion_tokens", 0)
                 _context_length = getattr(_agent.context_compressor, "context_length", 0) or 0
             _resolved_model = getattr(_agent, "model", None) if _agent else None
+            if _agent is not None:
+                result["model"] = _resolved_model
+                result["provider"] = getattr(_agent, "provider", None)
+                result["requested_reasoning"] = (
+                    getattr(_agent, "_requested_reasoning", None)
+                    or (getattr(_agent, "reasoning_config", None) or {}).get("effort")
+                )
+                result["route_state"] = (
+                    "fallback"
+                    if bool(getattr(_agent, "_fallback_activated", False))
+                    else "primary"
+                )
 
             # Sync session_id immediately after run_conversation(). Compression
             # can rotate before a follow-up model call fails; the failure return
@@ -21354,10 +21552,10 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # Auto-generate session title after first exchange (non-blocking)
             try:
                 from agent.openrouter_fallback_guard import (
-                    is_emergency_openrouter_fallback_active,
+                    is_continuity_fallback_active,
                 )
 
-                openrouter_fallback_active = is_emergency_openrouter_fallback_active(
+                openrouter_fallback_active = is_continuity_fallback_active(
                     agent
                 )
             except Exception:

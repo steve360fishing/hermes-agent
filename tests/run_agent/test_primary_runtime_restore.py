@@ -147,17 +147,24 @@ class TestRestorePrimaryRuntime:
         assert agent.model == original_model
         assert agent.provider == original_provider
 
-    def test_restores_output_cap_after_capped_grok_fallback(
+    def test_restores_output_cap_after_capped_minimax_fallback(
         self, tmp_path, monkeypatch
     ):
         monkeypatch.setenv(
             "HERMES_GATEWAY_HEALTH_PATH", str(tmp_path / "health.json")
         )
         agent = _make_agent(
-            fallback_model={
-                "provider": "openrouter",
-                "model": "x-ai/grok-4.5",
-            },
+            fallback_model=[
+                {
+                    "provider": "openrouter",
+                    "model": "minimax/minimax-m3",
+                },
+                {
+                    "provider": "openai-api",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "high",
+                },
+            ],
             provider="openai-codex",
         )
         agent.model = "gpt-5.6-sol"

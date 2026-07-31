@@ -2025,10 +2025,21 @@ def try_activate_fallback(agent, reason: "FailoverReason | None" = None) -> bool
         # success path surfaces exactly once via _emit_pending_fallback_notice
         # (see run_agent.py); it is discarded on terminal failure since the
         # buffered line is flushed instead.  See fallback-observability fix.
-        agent._pending_fallback_notice = (
-            f"🔄 Switched to fallback model: {old_model} via {old_provider} "
-            f"→ {fb_model} via {fb_provider}"
-        )
+        try:
+            from agent.openrouter_fallback_guard import fallback_notice_for_agent
+
+            agent._pending_fallback_notice = (
+                fallback_notice_for_agent(agent)
+                or (
+                    f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                    f"→ {fb_model} via {fb_provider}"
+                )
+            )
+        except Exception:
+            agent._pending_fallback_notice = (
+                f"🔄 Switched to fallback model: {old_model} via {old_provider} "
+                f"→ {fb_model} via {fb_provider}"
+            )
         logger.info(
             "Fallback activated: %s → %s (%s)",
             old_model, fb_model, fb_provider,

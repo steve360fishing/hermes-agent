@@ -1421,6 +1421,7 @@ def _send_media_via_adapter(
     loop,
     job: dict,
     platform=None,
+    caption: str | None = None,
 ) -> None:
     """Send extracted MEDIA files as native platform attachments via a live adapter.
 
@@ -1438,14 +1439,35 @@ def _send_media_via_adapter(
         try:
             ext = Path(media_path).suffix.lower()
             route_platform = platform if platform is not None else getattr(adapter, "platform", None)
+            caption_kw = {"caption": caption} if caption else {}
             if should_send_media_as_audio(route_platform, ext, is_voice=_is_voice):
-                coro = adapter.send_voice(chat_id=chat_id, audio_path=media_path, metadata=metadata)
+                coro = adapter.send_voice(
+                    chat_id=chat_id,
+                    audio_path=media_path,
+                    metadata=metadata,
+                    **caption_kw,
+                )
             elif ext in _VIDEO_EXTS:
-                coro = adapter.send_video(chat_id=chat_id, video_path=media_path, metadata=metadata)
+                coro = adapter.send_video(
+                    chat_id=chat_id,
+                    video_path=media_path,
+                    metadata=metadata,
+                    **caption_kw,
+                )
             elif ext in _IMAGE_EXTS:
-                coro = adapter.send_image_file(chat_id=chat_id, image_path=media_path, metadata=metadata)
+                coro = adapter.send_image_file(
+                    chat_id=chat_id,
+                    image_path=media_path,
+                    metadata=metadata,
+                    **caption_kw,
+                )
             else:
-                coro = adapter.send_document(chat_id=chat_id, file_path=media_path, metadata=metadata)
+                coro = adapter.send_document(
+                    chat_id=chat_id,
+                    file_path=media_path,
+                    metadata=metadata,
+                    **caption_kw,
+                )
 
             from agent.async_utils import safe_schedule_threadsafe
             future = safe_schedule_threadsafe(coro, loop)
@@ -1593,15 +1615,27 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
     except Exception:
         pass
 
+    try:
+        from agent.openrouter_fallback_guard import fallback_notice_from_text
+
+        fallback_delivery_notice = fallback_notice_from_text(content)
+    except Exception:
+        fallback_delivery_notice = ""
+
     if wrap_response:
         task_name = job.get("name", job["id"])
         job_id = job.get("id", "")
-        delivery_content = (
+        cron_body = (
             f"Cronjob Response: {task_name}\n"
             f"(job_id: {job_id})\n"
             f"-------------\n\n"
-            f"{content}\n\n"
+            f"{content[len(fallback_delivery_notice):].lstrip() if fallback_delivery_notice else content}\n\n"
             f"To stop or manage this job, send me a new message (e.g. \"stop reminder {task_name}\")."
+        )
+        delivery_content = (
+            f"{fallback_delivery_notice}\n\n{cron_body}"
+            if fallback_delivery_notice
+            else cron_body
         )
     else:
         delivery_content = content
@@ -1984,6 +2018,7 @@ def _deliver_result(job: dict, content: str, adapters=None, loop=None) -> Option
                         loop,
                         job,
                         platform=platform,
+                        caption=fallback_delivery_notice or None,
                     )
                 elif timed_out and media_files:
                     msg = (
@@ -3552,6 +3587,19 @@ def run_job(
         if not isinstance(result, dict):
             raise RuntimeError(
                 f"agent.run_conversation returned {type(result).__name__} instead of dict: {result!r}"
+            )
+
+        try:
+            from agent.openrouter_fallback_guard import apply_openrouter_fallback_notice
+
+            guarded_response, changed = apply_openrouter_fallback_notice(
+                agent, result.get("final_response") or ""
+            )
+            if changed:
+                result["final_response"] = guarded_response
+        except Exception:
+            logger.debug(
+                "Job '%s': fallback notice guard failed", job_name, exc_info=True
             )
 
         # If the agent itself reported failure (e.g. all retries exhausted on
