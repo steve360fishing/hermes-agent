@@ -154,10 +154,17 @@ class TestRestorePrimaryRuntime:
             "HERMES_GATEWAY_HEALTH_PATH", str(tmp_path / "health.json")
         )
         agent = _make_agent(
-            fallback_model={
-                "provider": "openrouter",
-                "model": "minimax/minimax-m3",
-            },
+            fallback_model=[
+                {
+                    "provider": "openrouter",
+                    "model": "minimax/minimax-m3",
+                },
+                {
+                    "provider": "openai-api",
+                    "model": "gpt-5.6-luna",
+                    "reasoning_effort": "high",
+                },
+            ],
             provider="openai-codex",
         )
         agent.model = "gpt-5.6-sol"
