@@ -12,6 +12,7 @@ import pytest
 from agent.task_execution_contract import (
     ARTIFACT_ONLY,
     NORMAL,
+    _is_direct_handoff_artifact_request,
     build_task_execution_contract,
     validate_artifact_output_path,
 )
@@ -90,6 +91,27 @@ def test_incident_recovery_language_never_activates_artifact_only(message):
     assert _contract(message).lane == NORMAL
 
 
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "Continue the complete Travel Ready system through 100% completion. "
+            "Coordinate Desktop Hermes, Codex, and Claude, then issue the final report."
+        ),
+        (
+            "Resume the Buzz recovery work with Codex and Claude and finish with a "
+            "visible completion prompt."
+        ),
+    ],
+)
+def test_operational_handoff_mentions_never_activate_artifact_only(message):
+    contract = _contract(message)
+
+    assert contract.lane == NORMAL
+    assert contract.artifact_file_requested is False
+    assert contract.artifact_output_path == ""
+
+
 def test_emergency_disable_keeps_explicit_artifact_request_normal(monkeypatch):
     monkeypatch.setattr(
         "hermes_cli.config.load_config_readonly",
@@ -145,10 +167,194 @@ def test_handoff_to_another_model_defaults_to_a_txt_attachment(monkeypatch, tmp_
     assert contract.artifact_mime_type == "text/plain"
 
 
-def test_explicit_inline_handoff_does_not_create_an_attachment():
-    contract = _contract("Give me a prompt for Claude in this chat, no attachment.")
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Give me a handoff for Claude.",
+        "Create a checklist for Claude.",
+        "Write a final report for Claude.",
+        "Give me a prompt for Claude to inspect these logs.",
+    ],
+)
+def test_direct_handoff_forms_preserve_artifact_only(message):
+    contract = _contract(message)
 
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.decision_reason == "handoff_text_attachment"
+    assert contract.artifact_file_requested is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Give me a prompt for Claude to inspect these logs. Then restart the service.",
+        "Give me a prompt for Claude to inspect these logs, and then you restart the service.",
+        "Create a checklist for Claude, but first you inspect the repository and fix the failing test.",
+        "Write a report for Claude, and deploy the release yourself.",
+        "Give me a prompt for Claude to inspect these logs, then restart the service.",
+        "Write a report for Claude and restart the service.",
+        "Create a checklist for Claude but inspect the repository first.",
+        "Give me a handoff for Claude and deploy the release.",
+        "Write a report and have Claude restart the service.",
+        "Give me a prompt, and ask Claude to inspect the logs.",
+        "Write a report, then ask Claude to inspect the logs.",
+        "Create a checklist and have Claude deploy the release.",
+        (
+            "Give me a prompt with the following text: \"summarize the context "
+            "and ask Claude to inspect the logs\", and restart the service."
+        ),
+        (
+            "Write a report with the following text: \"explain the outage and "
+            "summarize the timeline\", and then deploy the release yourself."
+        ),
+        (
+            "Create a checklist with these steps: \"capture the error and ask "
+            "Claude to inspect the logs\", and have Codex deploy the release."
+        ),
+        (
+            "Draft a handoff that says \"explain the failure and ask Claude to "
+            "inspect the logs\", and outside the handoff, inspect the repository."
+        ),
+        (
+            "Draft a handoff that says ask Claude to inspect the logs, and after "
+            "the handoff is complete, restart the service."
+        ),
+        (
+            "Draft a handoff that says to let Claude run the tests, and after "
+            "the handoff, inspect the repository."
+        ),
+    ],
+)
+def test_direct_handoff_plus_separate_operational_clause_stays_normal(message):
+    contract = _contract(message)
+
+    assert contract.lane == NORMAL
     assert contract.artifact_file_requested is False
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "Give me a prompt for Claude to inspect the logs, diagnose the issue, "
+            "and summarize the findings."
+        ),
+        "Give me a prompt that asks Claude to inspect the logs.",
+        (
+            "Give me a prompt with the following text: summarize the context, "
+            "and ask Claude to inspect the logs."
+        ),
+        (
+            "Write a report whose final instructions are: explain the outage, "
+            "and then have Claude restart the service."
+        ),
+        (
+            "Create a checklist with these steps: capture the error, "
+            "and tell Claude to inspect the logs."
+        ),
+        (
+            "Draft a handoff that says to explain the failure, "
+            "and let Codex run the tests."
+        ),
+    ],
+)
+def test_direct_prompt_coordinated_content_remains_artifact_only(message):
+    contract = _contract(message)
+    try:
+        assert contract.lane == ARTIFACT_ONLY
+        assert contract.decision_reason == "handoff_text_attachment"
+        assert contract.artifact_file_requested is True
+    finally:
+        contract.deactivate()
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Give me a prompt for Claude to inspect the logs and then explain the findings.",
+        "Give me a prompt for Claude to inspect the logs, and then explain the findings.",
+        "Give me a prompt that mentions Claude and asks Codex to inspect the logs.",
+        (
+            "Give me a prompt for Claude to inspect the logs and then have Codex "
+            "restart the service."
+        ),
+        (
+            "Write a report with this text: 'explain the user's outage, "
+            "and have Claude restart the service.'"
+        ),
+        (
+            "Write a report with this text: ‘explain why it isn’t working, "
+            "and have Claude restart the service.’"
+        ),
+        (
+            "Write a report with this text: ‘explain the users’ outage, "
+            "and have Claude restart the service.’"
+        ),
+        (
+            "Write a report with this text: explain the outage, "
+            "and have Claude restart the service."
+        ),
+        (
+            "Create a checklist where the instructions say: capture the error, "
+            "and tell Claude to inspect the logs."
+        ),
+        (
+            "Draft a handoff; the handoff should say explain the failure, "
+            "and let Codex run the tests."
+        ),
+    ],
+)
+def test_explicit_artifact_content_frame_owns_delegated_actions(message):
+    assert _is_direct_handoff_artifact_request(message) is True
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        "Give me a prompt for Claude in this chat, no attachment.",
+        "Write a report for Claude in this chat, no attachment.",
+        "Create a checklist for Claude inline, no file.",
+        (
+            "Draft a handoff for Claude in this chat, no attachment, that asks "
+            "Claude to inspect the logs."
+        ),
+        (
+            "Draft a handoff for Claude in this chat, no attachment, in three "
+            "bullets, that asks Claude to inspect the logs."
+        ),
+    ],
+)
+def test_explicit_inline_handoff_stays_artifact_only_without_attachment(message):
+    contract = _contract(message)
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.artifact_file_requested is False
+    assert not contract.before_tool("terminal", {"command": "pwd"}).allowed
+
+
+@pytest.mark.parametrize(
+    "message",
+    [
+        (
+            "Give me a prompt for Claude in this chat, no attachment, and then "
+            "inspect the repository yourself."
+        ),
+        (
+            "Write a report for Claude inline, no file, and then deploy the release "
+            "yourself."
+        ),
+        (
+            "Draft a handoff for Claude in this chat, no attachment, first inspect "
+            "the repository yourself, that asks Claude to summarize the findings."
+        ),
+    ],
+)
+def test_explicit_inline_handoff_with_external_operation_stays_normal(message):
+    contract = _contract(message)
+
+    assert contract.lane == NORMAL
+    assert contract.artifact_file_requested is False
+    assert contract.before_tool("terminal", {"command": "pwd"}).allowed
 
 
 def test_file_correction_reuses_the_last_assistant_text(monkeypatch, tmp_path):
