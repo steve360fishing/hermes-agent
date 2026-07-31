@@ -144,6 +144,60 @@ _HANDOFF_ARTIFACT = re.compile(
     r"\b(?:prompt|brief|handoff|report|checklist|caption\s+package|copy)\b",
     re.IGNORECASE,
 )
+_DIRECT_HANDOFF_LEAD = re.compile(
+    r"^\s*"
+    r"(?:all\s+right[,:\s]+|alright[,:\s]+|ok(?:ay)?[,:\s]+)?"
+    r"(?:please\s+|(?:can|could|would)\s+you\s+(?:please\s+)?|"
+    r"i\s+(?:want|need)(?:\s+you)?\s+to\s+)?"
+    r"(?:return|give(?:\s+me)?|write|draft|create|produce|generate|"
+    r"make(?!\s+sure\b))\b",
+    re.IGNORECASE,
+)
+_HANDOFF_CLAUSE = re.compile(r"[^.!?;\n]+(?:[.!?;]|$)")
+_HANDOFF_SUBCLAUSE_BOUNDARY = re.compile(
+    r",\s*(?:(?:and|but)\s+)?|\b(?:and|but)\s+",
+    re.IGNORECASE,
+)
+_HANDOFF_OPERATIONAL_DELEGATION_TAIL = re.compile(
+    r"^(?:(?:then|first|next)\s+)?"
+    r"(?:ask|have|tell|instruct|let)\s+"
+    r"(?:codex|claude|opus|gemini|chatgpt|gpt(?:-\d+)?)\b",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT_CONTENT_FRAME = re.compile(
+    r"\b(?:"
+    r"with\s+(?:(?:(?:the\s+following|this|these)\s+)?"
+    r"(?:text|steps?|instructions?|content))|"
+    r"whose\s+(?:final\s+)?(?:text|steps?|instructions?|content)\s+"
+    r"(?:is|are|says?|reads?|states?)|"
+    r"that\s+(?:says?|reads?|states?)(?:\s+to)?|"
+    r"that\s+(?:asks?|tells?|instructs?)|"
+    r"that\s+mentions?\s+"
+    r"(?:codex|claude|another\s+(?:model|agent|person)|a\s+(?:model|person))\s+"
+    r"(?:and\s+)?(?:then\s+)?(?:asks?|tells?|instructs?)|"
+    r"(?:where\s+)?the\s+(?:final\s+)?"
+    r"(?:text|steps?|instructions?|content|handoff)\s+"
+    r"(?:should\s+)?(?:is|are|says?|reads?|states?)|"
+    r"containing\s+(?:(?:the\s+following|these)\s+)?"
+    r"(?:text|steps?|instructions?|content)"
+    r")\b\s*:?,?",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT_CONTENT_CONTINUATION = re.compile(
+    r";(?=\s*(?:the\s+)?(?:prompt|brief|handoff|report|checklist|copy)\s+"
+    r"(?:should\s+)?(?:say|read|state)\b)",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT_CONTENT_EXIT = re.compile(
+    r"(?:"
+    r",\s*(?:(?:and|but)\s+)?outside\s+(?:the\s+)?"
+    r"(?:prompt|brief|handoff|report|checklist|copy)\b[:,]?|"
+    r",?\s*(?:(?:and|but)\s+)?after\s+(?:the\s+)?"
+    r"(?:prompt|brief|handoff|report|checklist|copy)"
+    r"(?:\s+(?:is\s+)?(?:complete|completed|done)\b[:,]?|\s*,)"
+    r")",
+    re.IGNORECASE,
+)
 _INLINE_ONLY = re.compile(
     r"\b(?:inline|in\s+(?:this\s+)?chat|do\s+not\s+(?:attach|create)\s+(?:a\s+)?file|"
     r"don't\s+(?:attach|create)\s+(?:a\s+)?file|no\s+(?:file|attachment))\b",
@@ -545,6 +599,129 @@ class TaskExecutionContract:
             self.active = False
 
 
+def _artifact_content_end(clause: str, content_frame: re.Match[str]) -> int:
+    """Return the exclusive end of explicitly framed artifact content."""
+    content_start = content_frame.end()
+    while content_start < len(clause) and clause[content_start].isspace():
+        content_start += 1
+
+    closing_quotes = {'"': '"', "'": "'", "\u201c": "\u201d", "\u2018": "\u2019"}
+    opening_quote = clause[content_start : content_start + 1]
+    closing_quote = closing_quotes.get(opening_quote)
+    if closing_quote:
+        search_start = content_start + 1
+        while True:
+            closing_index = clause.find(closing_quote, search_start)
+            if closing_index < 0:
+                break
+            previous = clause[closing_index - 1 : closing_index]
+            following = clause[closing_index + 1 : closing_index + 2]
+            following_word = re.match(
+                r"\s+([A-Za-z][A-Za-z0-9_-]*)",
+                clause[closing_index + 1 :],
+            )
+            apostrophe_inside_word = closing_quote in {"'", "\u2019"} and (
+                previous.isalnum() and following.isalnum()
+            )
+            plural_possessive = bool(
+                closing_quote in {"'", "\u2019"}
+                and previous.lower() == "s"
+                and following_word
+                and following_word.group(1).lower()
+                not in {"and", "but", "then", "outside", "after", "next", "first"}
+            )
+            if not (apostrophe_inside_word or plural_possessive):
+                return closing_index + 1
+            search_start = closing_index + 1
+
+    content_exit = _HANDOFF_ARTIFACT_CONTENT_EXIT.search(clause, content_start)
+    if content_exit:
+        return content_exit.start()
+    return len(clause)
+
+
+def _is_direct_handoff_artifact_request(text: str) -> bool:
+    """Return True only when one clause directly asks for a model handoff.
+
+    Operational verbs inside the requested handoff are content (for example,
+    ``a prompt for Claude to inspect logs``), while operational work in another
+    clause makes the overall request mixed and therefore keeps normal tools.
+    """
+    normalized_text = _HANDOFF_ARTIFACT_CONTENT_CONTINUATION.sub(",", text)
+    for match in _HANDOFF_CLAUSE.finditer(normalized_text):
+        clause = match.group(0).strip()
+        if not (
+            _DIRECT_HANDOFF_LEAD.search(clause)
+            and _HANDOFF_TARGET.search(clause)
+            and _HANDOFF_ARTIFACT.search(clause)
+        ):
+            continue
+        target_match = _HANDOFF_TARGET.search(clause)
+        target_action_content = bool(
+            target_match
+            and re.match(
+                r"\s+to\b",
+                clause[target_match.end() :],
+                re.IGNORECASE,
+            )
+            and _OPERATIONAL_REQUEST.search(clause[target_match.end() :])
+        )
+        content_frame = _HANDOFF_ARTIFACT_CONTENT_FRAME.search(clause)
+        content_end = (
+            _artifact_content_end(clause, content_frame) if content_frame else -1
+        )
+        for boundary in _HANDOFF_SUBCLAUSE_BOUNDARY.finditer(clause):
+            tail = clause[boundary.end() :].strip()
+            if content_frame and boundary.end() <= content_frame.start():
+                before_frame = clause[boundary.end() : content_frame.start()]
+                if not _OPERATIONAL_REQUEST.search(before_frame):
+                    continue
+            framed_artifact_content = bool(
+                content_frame
+                and content_frame.start() <= boundary.start() < content_end
+            )
+            if framed_artifact_content:
+                continue
+            operational_delegation = bool(
+                _HANDOFF_OPERATIONAL_DELEGATION_TAIL.match(tail)
+                and _OPERATIONAL_REQUEST.search(tail)
+            )
+            if target_match and boundary.start() < target_match.end():
+                if operational_delegation:
+                    return False
+                continue
+            explicit_current_agent = bool(
+                re.search(r"\b(?:you|yourself)\b", tail[:120], re.IGNORECASE)
+            )
+            explicit_sequence = bool(
+                re.match(r"(?:then|first|next|after\s+that)\b", tail, re.IGNORECASE)
+            )
+            boundary_text = clause[boundary.start() : boundary.end()].lstrip()
+            bare_comma_sequence = boundary_text.startswith(",") and not re.search(
+                r"\band\b", boundary_text, re.IGNORECASE
+            )
+            if (
+                _OPERATIONAL_REQUEST.search(tail)
+                and (
+                    explicit_current_agent
+                    or (
+                        explicit_sequence
+                        and (not target_action_content or bare_comma_sequence)
+                    )
+                    or (operational_delegation and not target_action_content)
+                    or content_frame is not None
+                    or not target_action_content
+                )
+            ):
+                return False
+        remaining = (
+            f"{normalized_text[:match.start()]} {normalized_text[match.end():]}"
+        )
+        if not _OPERATIONAL_REQUEST.search(remaining):
+            return True
+    return False
+
+
 def build_task_execution_contract(
     message: Any,
     *,
@@ -559,22 +736,29 @@ def build_task_execution_contract(
     file_requested, requested_filename, requested_extension = _requested_artifact_file(
         affirmative_text
     )
-    handoff_artifact = bool(
-        _HANDOFF_TARGET.search(affirmative_text)
-        and _HANDOFF_ARTIFACT.search(affirmative_text)
-        and not _INLINE_ONLY.search(affirmative_text)
+    # The handoff shortcut must be a direct request for a textual handoff, not
+    # a broad co-occurrence check. Operational continuation prompts commonly
+    # mention Codex/Claude and a later report; forcing those into artifact-only
+    # prevents the requested work from running.
+    direct_handoff_artifact = _is_direct_handoff_artifact_request(affirmative_text)
+    inline_handoff_artifact = bool(
+        direct_handoff_artifact and _INLINE_ONLY.search(affirmative_text)
     )
+    handoff_attachment = bool(direct_handoff_artifact and not inline_handoff_artifact)
     recovery_content = ""
     correction_artifact = False
     if not file_requested and _FILE_CORRECTION.search(affirmative_text):
         recovery_content = _last_assistant_text(conversation_history)
         correction_artifact = bool(recovery_content)
-    if handoff_artifact or correction_artifact:
+    if handoff_attachment or correction_artifact:
         file_requested = True
         requested_extension = ".txt"
     lane, reason = _classify(trusted_text, file_requested=file_requested)
-    if handoff_artifact:
-        lane, reason = ARTIFACT_ONLY, "handoff_text_attachment"
+    if direct_handoff_artifact:
+        lane = ARTIFACT_ONLY
+        reason = (
+            "handoff_text_inline" if inline_handoff_artifact else "handoff_text_attachment"
+        )
     elif correction_artifact:
         lane, reason = ARTIFACT_ONLY, "artifact_correction_attachment"
     if lane == ARTIFACT_ONLY:
