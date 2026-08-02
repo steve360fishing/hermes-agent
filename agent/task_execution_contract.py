@@ -28,7 +28,7 @@ from agent.file_safety import get_safe_write_roots, is_write_denied
 
 NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
-POLICY_VERSION = "artifact-only-v4"
+POLICY_VERSION = "artifact-only-v5"
 MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
 MAX_PENDING_ARTIFACTS = 16
 MAX_PENDING_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -79,7 +79,8 @@ _QUOTED_FILENAME = re.compile(
     re.IGNORECASE,
 )
 _BARE_FILENAME = re.compile(
-    r"(?<![\w.-])(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:txt|md|markdown))(?![\w.])",
+    r"(?<![\w.-])(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:txt|md|markdown))"
+    r"(?=$|[\s,;:!?)\]}]|\.(?:\s|$))",
     re.IGNORECASE,
 )
 _TEXT_FILE_REQUEST = re.compile(
@@ -198,11 +199,6 @@ _HANDOFF_ARTIFACT_CONTENT_EXIT = re.compile(
     r")",
     re.IGNORECASE,
 )
-_INLINE_ONLY = re.compile(
-    r"\b(?:inline|in\s+(?:this\s+)?chat|do\s+not\s+(?:attach|create)\s+(?:a\s+)?file|"
-    r"don't\s+(?:attach|create)\s+(?:a\s+)?file|no\s+(?:file|attachment))\b",
-    re.IGNORECASE,
-)
 _FILE_CORRECTION = re.compile(
     r"\b(?:should\s+have\s+(?:made|sent|attached)|make|send|attach|turn)\b"
     r"(?:(?![.!?\n]).){0,80}\b(?:it|that|this|the\s+(?:prompt|brief|report|handoff|copy))\b"
@@ -245,6 +241,10 @@ _ARTIFACT_ID = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 _ARTIFACT_EXECUTION_CONTRACT_MARKER = "request execution contract (artifact_only"
 _MEDIA_PATH = re.compile(
     r"MEDIA:\s*(?P<path>(?:[A-Za-z]:[/\\]|/)[^\s\"'`]+)",
+    re.IGNORECASE,
+)
+_SYNTHETIC_BACKGROUND_NOTICE = re.compile(
+    r"^\s*\[(?:IMPORTANT|SYSTEM):\s*(?:Background process|Watch disabled for)\b",
     re.IGNORECASE,
 )
 _BARE_LOCAL_ARTIFACT_PATH = re.compile(
@@ -731,6 +731,7 @@ def build_task_execution_contract(
 ) -> TaskExecutionContract:
     text = message if isinstance(message, str) else str(message or "")
     correlation_id = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:16]
+    synthetic_background_event = bool(_SYNTHETIC_BACKGROUND_NOTICE.match(text))
     trusted_text = _trusted_request_text(text)
     affirmative_text = _NEGATED_CONSTRAINT.sub("", trusted_text)
     file_requested, requested_filename, requested_extension = _requested_artifact_file(
@@ -742,19 +743,24 @@ def build_task_execution_contract(
     # prevents the requested work from running.
     direct_handoff_artifact = _is_direct_handoff_artifact_request(affirmative_text)
     inline_handoff_artifact = bool(
-        direct_handoff_artifact and _INLINE_ONLY.search(affirmative_text)
+        direct_handoff_artifact and not file_requested
     )
-    handoff_attachment = bool(direct_handoff_artifact and not inline_handoff_artifact)
+    handoff_attachment = bool(direct_handoff_artifact and file_requested)
     recovery_content = ""
     correction_artifact = False
     if not file_requested and _FILE_CORRECTION.search(affirmative_text):
         recovery_content = _last_assistant_text(conversation_history)
         correction_artifact = bool(recovery_content)
-    if handoff_attachment or correction_artifact:
+    if correction_artifact:
         file_requested = True
         requested_extension = ".txt"
+    elif handoff_attachment and not requested_extension:
+        requested_extension = ".txt"
     lane, reason = _classify(trusted_text, file_requested=file_requested)
-    if direct_handoff_artifact:
+    if synthetic_background_event:
+        lane = NORMAL
+        reason = "synthetic_background_event"
+    elif direct_handoff_artifact:
         lane = ARTIFACT_ONLY
         reason = (
             "handoff_text_inline" if inline_handoff_artifact else "handoff_text_attachment"
@@ -1685,6 +1691,8 @@ def _cleanup_task_owned_artifact(contract: TaskExecutionContract) -> None:
 
 def _trusted_request_text(text: str) -> str:
     """Discard fenced, quoted, and inline-code examples before classification."""
+    if _SYNTHETIC_BACKGROUND_NOTICE.match(text):
+        return ""
     text = re.sub(r"```[\s\S]*?```", "", text)
     text = re.sub(r"(?m)^\s*>.*$", "", text)
     return re.sub(r"`[^`\r\n]*`", "", text)
@@ -1940,24 +1948,25 @@ def _has_direct_file_request_clause(text: str) -> bool:
         ]
         if not evidence_matches:
             continue
-        evidence = min(evidence_matches, key=lambda match: match.start())
-        between = text[verb_match.end() : evidence.start()]
-        after = text[evidence.end() :]
-        # This is an optimization, not a capability boundary. Ambiguous prose
-        # safely falls back to the full normal agent, which can still write and
-        # deliver files through the standard guarded tools.
-        if (
-            len(between) > 64
-            or any(character in _SPLITLINE_BOUNDARIES for character in between)
-            or any(
-            unicodedata.category(character).startswith("P") for character in between
-            )
-            or _DIRECT_FILE_BRIDGE.fullmatch(between) is None
-            or _MENTIONED_FILE_REFERENCE_SUFFIX.search(after) is not None
-            or _DIRECT_FILE_REQUEST_SUFFIX.fullmatch(after) is None
-        ):
-            continue
-        return True
+        for evidence in sorted(evidence_matches, key=lambda match: match.start()):
+            between = text[verb_match.end() : evidence.start()]
+            after = text[evidence.end() :]
+            # This is an optimization, not a capability boundary. Ambiguous prose
+            # safely falls back to the full normal agent, which can still write and
+            # deliver files through the standard guarded tools.
+            if (
+                len(between) > 64
+                or any(character in _SPLITLINE_BOUNDARIES for character in between)
+                or any(
+                    unicodedata.category(character).startswith("P")
+                    for character in between
+                )
+                or _DIRECT_FILE_BRIDGE.fullmatch(between) is None
+                or _MENTIONED_FILE_REFERENCE_SUFFIX.search(after) is not None
+                or _DIRECT_FILE_REQUEST_SUFFIX.fullmatch(after) is None
+            ):
+                continue
+            return True
     return False
 
 
