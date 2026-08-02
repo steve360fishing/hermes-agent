@@ -15,7 +15,6 @@ import stat
 import tempfile
 import threading
 import time
-import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -1957,10 +1956,6 @@ def _has_direct_file_request_clause(text: str) -> bool:
             if (
                 len(between) > 64
                 or any(character in _SPLITLINE_BOUNDARIES for character in between)
-                or any(
-                    unicodedata.category(character).startswith("P")
-                    for character in between
-                )
                 or _DIRECT_FILE_BRIDGE.fullmatch(between) is None
                 or _MENTIONED_FILE_REFERENCE_SUFFIX.search(after) is not None
                 or _DIRECT_FILE_REQUEST_SUFFIX.fullmatch(after) is None
