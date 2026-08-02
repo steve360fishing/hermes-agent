@@ -231,6 +231,13 @@ def test_create_then_run_requests_remain_operational(message):
             "handoff.txt",
             "explicit_text_file_artifact",
         ),
+        (
+            "Create and attach a plain-text file named canary.txt containing exactly "
+            "CANARY_OK followed by one LF newline. Send exactly one document and no "
+            "other attachment or commentary.",
+            "canary.txt",
+            "explicit_text_file_artifact",
+        ),
     ],
 )
 def test_explicit_prompt_file_request_creates_one_attachment(
