@@ -135,6 +135,7 @@ def _write_stale_recovery_authorization(
     authorization_id: str = "d1af8e64-0b4e-4ec9-9ae6-19fbc25ebdcb",
     expected_state_hash: str | None = None,
     expected_stale_records: dict[str, list[str]] | None = None,
+    expected_reasons: list[str] | None = None,
     prior_source_sha: str = "a" * 40,
     prior_image_id: str = "sha256:" + "b" * 64,
     target_source_sha: str = "a" * 40,
@@ -150,11 +151,15 @@ def _write_stale_recovery_authorization(
             {
                 "schema_version": "hermes-rescue-recovery-authorization-v2",
                 "authorization_id": authorization_id,
-                "expected_reasons": [
-                    "background_unknown",
-                    "gateway_unknown",
-                    "worker_crash",
-                ],
+                "expected_reasons": (
+                    expected_reasons
+                    if expected_reasons is not None
+                    else [
+                        "background_unknown",
+                        "gateway_unknown",
+                        "worker_crash",
+                    ]
+                ),
                 "expected_producer_epoch": reporter.producer_epoch,
                 "expected_state_hash": (
                     expected_state_hash or reporter._recovery_subject_hash()
@@ -772,13 +777,101 @@ def test_stale_recovery_v2_removes_only_exact_pre_container_records(
 
 @linux_only
 @pytest.mark.parametrize(
+    "expected_reasons",
+    [
+        ["gateway_unknown", "worker_crash"],
+        ["background_unknown", "gateway_unknown", "worker_crash"],
+    ],
+)
+def test_stale_recovery_v2_accepts_exact_reason_subsets(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+    expected_reasons: list[str],
+) -> None:
+    import agent.rescue_quiescence_reporter as reporter_module
+
+    runtime = tmp_path / "runtime"
+    continuity = tmp_path / "continuity"
+    reporter = _durable_reporter(runtime, continuity)
+    _seed_stale_recovery_state(reporter)
+    reporter.state.degradation_reasons = set(expected_reasons)
+    reporter._persist_state()
+    monkeypatch.setattr(
+        reporter_module,
+        "discover_gateway_state",
+        lambda **_kwargs: ([321], "active"),
+    )
+    monkeypatch.setattr(reporter_module, "_pid_alive", lambda _pid: False)
+    reporter.emit_snapshot(now=10.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v2.json"
+    _write_stale_recovery_authorization(
+        authorization,
+        reporter=reporter,
+        stale_before=100.0,
+        expected_reasons=expected_reasons,
+    )
+
+    recovering = _durable_reporter(
+        runtime,
+        continuity,
+        recovery_authorization_path=authorization,
+    )
+    for now in (20.0, 21.0, 22.0):
+        recovering.emit_snapshot(now=now)
+    assert recovering.state.telemetry_health == "healthy"
+    assert recovering.state.active_counts() == (0, 0, 0)
+
+
+@linux_only
+@pytest.mark.parametrize(
+    "expected_reasons",
+    [
+        [],
+        ["worker_crash", "gateway_unknown"],
+        ["gateway_unknown", "gateway_unknown"],
+        ["not_allowed"],
+        [
+            "background_unknown",
+            "gateway_unknown",
+            "legacy_unattributed",
+            "worker_crash",
+        ],
+    ],
+)
+def test_stale_recovery_v2_rejects_invalid_reason_sets(
+    tmp_path: Path,
+    expected_reasons: list[str],
+) -> None:
+    reporter = _durable_reporter(tmp_path / "runtime", tmp_path / "continuity")
+    _seed_stale_recovery_state(reporter)
+    reporter.emit_snapshot(now=10.0)
+    authorization = tmp_path / "authorization" / "telemetry-recovery-v2.json"
+    _write_stale_recovery_authorization(
+        authorization,
+        reporter=reporter,
+        stale_before=100.0,
+        expected_reasons=expected_reasons,
+    )
+
+    with pytest.raises(ValueError, match="invalid telemetry recovery authorization"):
+        _durable_reporter(
+            tmp_path / "runtime",
+            tmp_path / "continuity",
+            recovery_authorization_path=authorization,
+        )
+
+
+@linux_only
+@pytest.mark.parametrize(
     "failure",
     [
         "pid_reused",
         "current_work",
         "state_drift",
         "source_drift",
+        "image_drift",
         "record_drift",
+        "reason_mismatch",
         "gateway_unknown",
         "expired",
     ],
@@ -835,6 +928,16 @@ def test_stale_recovery_v2_blocks_unsafe_or_drifted_state(
             else None
         ),
         target_source_sha="c" * 40 if failure == "source_drift" else "a" * 40,
+        target_image_id=(
+            "sha256:" + "c" * 64
+            if failure == "image_drift"
+            else "sha256:" + "b" * 64
+        ),
+        expected_reasons=(
+            ["gateway_unknown", "worker_crash"]
+            if failure == "reason_mismatch"
+            else None
+        ),
         expires_at=15.0 if failure == "expired" else 300.0,
     )
     if failure == "state_drift":

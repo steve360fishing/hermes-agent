@@ -82,6 +82,17 @@ def _bounded_text(value: Any, *, limit: int = 256) -> bool:
     return type(value) is str and 1 <= len(value) <= limit
 
 
+def _valid_stale_recovery_reasons(value: Any) -> bool:
+    return (
+        type(value) is list
+        and bool(value)
+        and all(type(reason) is str for reason in value)
+        and len(value) == len(set(value))
+        and value == sorted(value)
+        and set(value).issubset(_STALE_RECOVERY_REASONS)
+    )
+
+
 def _strict_json_object(raw: bytes | str) -> dict[str, Any]:
     def reject_duplicates(pairs: list[tuple[str, Any]]) -> dict[str, Any]:
         result: dict[str, Any] = {}
@@ -143,7 +154,8 @@ class ReporterState:
         )
         specially_recoverable = (
             authorized_reasons is not None
-            and authorized_reasons == _STALE_RECOVERY_REASONS
+            and bool(authorized_reasons)
+            and authorized_reasons.issubset(_STALE_RECOVERY_REASONS)
             and self.degradation_reasons == set(authorized_reasons)
         )
         if not normally_recoverable and not specially_recoverable:
@@ -895,8 +907,9 @@ class QuiescenceReporter:
                         break
             invalid = (
                 set(payload) != v2_fields
-                or payload.get("expected_reasons")
-                != sorted(_STALE_RECOVERY_REASONS)
+                or not _valid_stale_recovery_reasons(
+                    payload.get("expected_reasons")
+                )
                 or type(payload.get("expected_stale_before")) not in {int, float}
                 or not math.isfinite(
                     float(payload.get("expected_stale_before", math.nan))
@@ -1182,6 +1195,7 @@ class QuiescenceReporter:
             and authorization["schema_version"]
             == "hermes-rescue-recovery-authorization-v2"
         ):
+            authorized_reasons = frozenset(authorization["expected_reasons"])
             stale_records = self.state.stale_record_ids(
                 stale_before=float(authorization["expected_stale_before"])
             )
@@ -1194,8 +1208,7 @@ class QuiescenceReporter:
                 active_counts[2] - len(stale_records["providers"]),
             )
             authorized = (
-                reasons == _STALE_RECOVERY_REASONS
-                and authorization["expected_reasons"] == sorted(reasons)
+                reasons == set(authorized_reasons)
                 and authorization["expected_stale_records"] == stale_records
                 and current >= float(authorization["issued_at"])
                 and current <= float(authorization["expires_at"])
@@ -1227,7 +1240,7 @@ class QuiescenceReporter:
                 self.state.purge_stale_records(stale_records)
                 self.state.recover(
                     str(authorization["authorization_id"]),
-                    authorized_reasons=_STALE_RECOVERY_REASONS,
+                    authorized_reasons=authorized_reasons,
                 )
             return True
         if reasons == {"continuity_gap"}:
