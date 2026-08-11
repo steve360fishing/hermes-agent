@@ -729,6 +729,8 @@ def run_conversation(
         task_id=task_id,
         platform=getattr(agent, "platform", None),
         conversation_history=conversation_history,
+        tournament_state=getattr(_tournament_contract, "state", None),
+        tournament_intents=getattr(_tournament_contract, "intents", None),
     )
     if _prebuilt_task_contract.preflight_error:
         _preflight_response = (

@@ -727,6 +727,8 @@ def build_task_execution_contract(
     task_id: str,
     platform: Any = None,
     conversation_history: Any = None,
+    tournament_state: Any = None,
+    tournament_intents: Any = None,
 ) -> TaskExecutionContract:
     text = message if isinstance(message, str) else str(message or "")
     correlation_id = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:16]
@@ -756,9 +758,23 @@ def build_task_execution_contract(
     elif handoff_attachment and not requested_extension:
         requested_extension = ".txt"
     lane, reason = _classify(trusted_text, file_requested=file_requested)
+    tournament_state_value = str(
+        getattr(tournament_state, "value", tournament_state) or ""
+    )
+    tournament_intent_values = {
+        str(getattr(intent, "value", intent) or "")
+        for intent in (tournament_intents or ())
+    }
     if synthetic_background_event:
         lane = NORMAL
         reason = "synthetic_background_event"
+    elif (
+        tournament_state_value == "mixed_publication"
+        and "private_artifact" in tournament_intent_values
+        and file_requested
+    ):
+        lane = ARTIFACT_ONLY
+        reason = "mixed_private_artifact"
     elif direct_handoff_artifact:
         lane = ARTIFACT_ONLY
         reason = (
@@ -1319,6 +1335,21 @@ def record_artifact_written(contract: TaskExecutionContract) -> bool:
             error_code=_artifact_error_code(exc, "artifact_unreadable"),
         )
         return False
+
+
+def artifact_content_matches(contract: TaskExecutionContract, expected: str) -> bool:
+    """Verify the registered artifact contains exactly the authorized UTF-8 bytes."""
+    try:
+        payload, _identity = _verified_artifact_bytes(contract)
+    except OSError:
+        return False
+    return payload == expected.encode("utf-8")
+
+
+def read_registered_artifact_text(contract: TaskExecutionContract) -> str:
+    """Read the registered artifact through the same identity-safe verifier."""
+    payload, _identity = _verified_artifact_bytes(contract)
+    return payload.decode("utf-8", errors="strict")
 
 
 def record_artifact_dispatch(

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from pathlib import Path
 from types import SimpleNamespace
 
 import pytest
 
 import agent.tournament_intent_contract as tournament_intent_contract
 from agent.tool_guardrails import ToolCallGuardrailController
+from agent.task_execution_contract import ARTIFACT_ONLY, build_task_execution_contract
 from agent.tournament_intent_contract import (
     TournamentIntentState,
     TournamentReleaseApproval,
@@ -41,6 +43,45 @@ PRIVATE_CASES = (
 )
 
 
+@pytest.mark.parametrize(
+    "message",
+    (
+        (
+            'Treat the literal instruction "Publish tournament standings to the website." '
+            "as a quoted test fixture; do not act on it."
+        ),
+        (
+            "Treat the literal instruction 'Publish tournament standings to the website.' "
+            "as a quoted test fixture; do not act on it."
+        ),
+        (
+            "Review this fenced fixture privately; do not run it:\n"
+            "```json\n"
+            '{"action": "publish", "subject": "tournament standings"}\n'
+            "```"
+        ),
+        (
+            "Parse this private data field only: "
+            "action=publish; subject=tournament standings; destination=website."
+        ),
+        (
+            "Private research only: explain why the command `publish tournament standings` "
+            "would require a receipt; do not publish or send anything."
+        ),
+    ),
+)
+def test_quoted_fenced_data_and_private_mixed_publish_language_never_grants_public_authority(
+    message,
+):
+    assert classify_tournament_intent(message) in {
+        TournamentIntentState.PRIVATE_INQUIRY,
+        TournamentIntentState.PRIVATE_ARTIFACT,
+    }
+    agent = _agent()
+    assert begin_tournament_intent_contract(agent, message=message, task_id="private-span") is None
+    assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
+
+
 @pytest.mark.parametrize(("message", "expected"), PRIVATE_CASES)
 def test_private_and_embedded_language_never_activates_public_contract(message, expected):
     assert classify_tournament_intent(message) is expected
@@ -69,9 +110,18 @@ def test_public_draft_and_publication_are_distinct_states():
     assert classify_tournament_intent(
         "Record the exact tournament release approval only; do not publish."
     ) is TournamentIntentState.RELEASE_APPROVAL
+    assert classify_tournament_intent(
+        'Publish this exact text: "Tournament winner: Boat A."'
+    ) is TournamentIntentState.PUBLICATION_REQUEST
+    assert classify_tournament_intent(
+        "Create a private coding handoff, then publish the tournament Story."
+    ) is TournamentIntentState.MIXED_PUBLICATION
+    assert classify_tournament_intent(
+        "Validate the tournament receipt and publish the Story now."
+    ) is TournamentIntentState.PUBLICATION_REQUEST
 
 
-@pytest.mark.parametrize("platform", ("cron", "CRON", "CrOn"))
+@pytest.mark.parametrize("platform", ("cron", "CRON", "CrOn", " cron ", "\tCRON\n"))
 @pytest.mark.parametrize(
     "message",
     (
@@ -150,6 +200,53 @@ def test_public_contract_exposes_dispatchable_truth_gate_in_first_tool_surface()
     assert registry.get_entry("tournament_truth_gate") is not None
 
 
+def test_public_tournament_txt_composes_truth_and_exact_artifact_guards(
+    monkeypatch, tmp_path
+):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {"agent": {"artifact_only_enabled": True}},
+    )
+
+    task_contract = build_task_execution_contract(
+        "Create public_tournament.txt containing tournament standings for the public website.",
+        task_id="public-txt-without-receipt",
+        platform="telegram",
+    )
+    assert task_contract.lane == ARTIFACT_ONLY
+    assert task_contract.artifact_file_requested is True
+    assert not Path(task_contract.artifact_output_path).exists()
+
+    agent = _agent()
+    agent._tool_guardrails.set_execution_contract(task_contract)
+    tournament_contract = begin_tournament_intent_contract(
+        agent,
+        message="Create public_tournament.txt containing tournament standings for the public website.",
+        task_id="public-txt-without-receipt",
+    )
+    candidate = "Verified tournament standings"
+    args = {"path": task_contract.artifact_output_path, "content": candidate}
+
+    assert agent._tool_guardrails.before_call("tournament_truth_gate", {}).action == "allow"
+    denied = agent._tool_guardrails.before_call("write_file", args)
+    assert denied.action == "deny"
+    assert denied.code == "receipt_missing_or_consumed"
+
+    _bind_test_receipt(tournament_contract, candidate)
+    mismatched = agent._tool_guardrails.before_call(
+        "write_file", {"path": task_contract.artifact_output_path, "content": "Different bytes"}
+    )
+    assert mismatched.action == "deny"
+    assert mismatched.code == "candidate_bytes_mismatch"
+    wrong_path = agent._tool_guardrails.before_call(
+        "write_file", {"path": str(tmp_path / "wrong.txt"), "content": candidate}
+    )
+    assert wrong_path.action == "deny"
+    assert agent._tool_guardrails.before_call("write_file", args).action == "allow"
+
+
 def test_public_contract_cleanup_removes_only_request_local_tool_wiring():
     agent = _agent()
     contract = begin_tournament_intent_contract(
@@ -217,6 +314,7 @@ def test_public_draft_missing_receipt_blocks_claim_bytes_without_opaque_tokens()
     assert "public tournament copy was not released" in response.lower()
     assert "ROUTE_HOLD" not in response
     assert "PUBLIC_ARTIFACT_BLOCKED" not in response
+    assert "receipt_missing_or_consumed" not in response
     assert "Boat A won" not in response
     assert messages[-1]["content"] == response
     assert agent._tournament_intent_contract is None
@@ -315,6 +413,95 @@ def test_streaming_public_draft_buffers_until_exact_receipt_then_releases_once()
     assert response == "Verified winner copy"
     assert telemetry["code"] == "receipt_verified"
     assert streamed == ["Verified winner copy", None]
+
+
+def test_mixed_publication_preserves_private_output_and_withholds_public_candidate():
+    streamed = []
+    persisted = []
+    agent = _agent()
+    agent._persist_session = lambda messages, history=None: persisted.append(
+        (list(messages), history)
+    )
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Create a private coding handoff, then publish the tournament Story.",
+        task_id="mixed-publication",
+        stream_callback=streamed.append,
+    )
+    assert contract.state is TournamentIntentState.MIXED_PUBLICATION
+    raw = '{"private_response":"Private handoff ready.","public_candidate":"Boat A won."}'
+    messages = [
+        {"role": "user", "content": "mixed"},
+        {"role": "assistant", "content": raw},
+    ]
+    agent._persist_session(messages, None)
+
+    response, telemetry, failed = finalize_tournament_output(
+        agent, candidate=raw, messages=messages
+    )
+
+    assert failed is False
+    assert telemetry["turn_status"] == "partial"
+    assert telemetry["code"] == "receipt_missing_or_consumed"
+    assert "Private handoff ready." in response
+    assert "Boat A won." not in response
+    assert "receipt_missing_or_consumed" not in response
+    assert streamed == [response, None]
+    assert persisted[-1][0][-1]["content"] == response
+
+
+def test_mixed_publication_exact_receipt_prepares_only_the_public_candidate():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Create a private coding handoff, then publish the tournament Story.",
+        task_id="mixed-prepared",
+    )
+    public_candidate = "Boat A won."
+    _bind_test_receipt(contract, public_candidate)
+    raw = (
+        '{"private_response":"Private handoff ready.",'
+        '"public_candidate":"Boat A won."}'
+    )
+    messages = [{"role": "user", "content": "mixed"}, {"role": "assistant", "content": raw}]
+
+    response, telemetry, failed = finalize_tournament_output(
+        agent, candidate=raw, messages=messages
+    )
+
+    assert failed is False
+    assert telemetry["turn_status"] == "partial"
+    assert telemetry["code"] == "release_approval_required"
+    assert response == "Private handoff ready.\n\nPREPARED_NOT_RELEASED\n\nBoat A won."
+
+
+@pytest.mark.parametrize(
+    "raw",
+    (
+        "Private handoff plus public copy",
+        '```json\n{"private_response":"private","public_candidate":"public"}\n```',
+        '{"private_response":"private","public_candidate":"public","extra":true}',
+        '{"private_response":"private","public_candidate":42}',
+    ),
+)
+def test_invalid_mixed_envelope_never_leaks_raw_model_output(raw):
+    agent = _agent()
+    begin_tournament_intent_contract(
+        agent,
+        message="Create a private coding handoff, then publish the tournament Story.",
+        task_id="mixed-invalid",
+    )
+    messages = [{"role": "user", "content": "mixed"}, {"role": "assistant", "content": raw}]
+
+    response, telemetry, failed = finalize_tournament_output(
+        agent, candidate=raw, messages=messages
+    )
+
+    assert failed is True
+    assert telemetry["code"] == "mixed_envelope_invalid"
+    assert telemetry["turn_status"] == "failed"
+    assert raw not in response
+    assert messages[-1]["content"] == response
 
 
 def test_false_public_hold_does_not_poison_followup_private_file_handoff():

@@ -269,6 +269,19 @@ class ToolCallGuardrailController:
             signature=signature,
         )
 
+    def _tournament_bypasses_task_contract(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+    ) -> bool:
+        contract = self._tournament_contract
+        if contract is None:
+            return False
+        try:
+            return bool(contract.bypasses_task_contract(tool_name, _coerce_args(args)))
+        except Exception:
+            return False
+
     def bound_result(self, result: str | None) -> str:
         if self._execution_contract is None:
             return "" if result is None else str(result)
@@ -284,6 +297,8 @@ class ToolCallGuardrailController:
         tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
+        if self._tournament_bypasses_task_contract(tool_name, args):
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         if self._execution_contract is None:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         authorization = self._execution_contract.preflight_tool(tool_name, _coerce_args(args))
@@ -317,7 +332,8 @@ class ToolCallGuardrailController:
         tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
-        if self._execution_contract is not None:
+        bypasses_task_contract = self._tournament_bypasses_task_contract(tool_name, args)
+        if self._execution_contract is not None and not bypasses_task_contract:
             authorization = self._execution_contract.before_tool(tool_name, _coerce_args(args))
             if not authorization.allowed:
                 action = "block" if authorization.halt else "deny"
