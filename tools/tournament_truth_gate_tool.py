@@ -9,7 +9,7 @@ from __future__ import annotations
 
 import json
 import os
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
 import sys
@@ -24,6 +24,7 @@ from agent.tournament_truth_support import (
     contained_path,
     secure_read_contained_text,
 )
+from agent.tournament_intent_contract import active_contract
 from tools.registry import registry, tool_error, tool_result
 
 
@@ -50,11 +51,11 @@ def _read_only_snapshot_ingestion(request: Mapping[str, Any], snapshot_root: Pat
     return None
 
 
-def _build_request_payload(candidate: str, request: Mapping[str, Any], metadata: Mapping[str, Any]) -> dict[str, Any]:
+def _build_request_payload(contract, candidate: str, request: Mapping[str, Any], metadata: Mapping[str, Any]) -> dict[str, Any]:
     payload = dict(request)
-    payload.setdefault("artifact_type", "private_answer")
-    payload.setdefault("allowed_entrypoints", ["advisory_validation"])
-    payload["artifact_payload"] = build_artifact_payload(candidate, "tool:tournament_truth_gate", metadata)
+    payload["artifact_type"] = "public_copy"
+    payload["allowed_entrypoints"] = [contract.entrypoint]
+    payload["artifact_payload"] = build_artifact_payload(candidate, contract.destination, metadata)
     payload.pop("receipt_path", None)
     payload.pop("journal_pointer", None)
     return payload
@@ -90,9 +91,8 @@ def _run_preflight(roots, request_payload: Mapping[str, Any], *, suffix: str):
         return None, None, "audit_preflight_failed"
     try:
         result = json.loads(completed.stdout)
-        expected_receipt_path = output_dir / "receipt.json"
-        receipt_path = contained_path(roots.receipt_root, expected_receipt_path)
-        if str(result.get("receipt_path") or "") != str(expected_receipt_path):
+        receipt_path = contained_path(roots.receipt_root, str(result.get("receipt_path") or ""))
+        if receipt_path is None or output_dir.resolve(strict=True) not in receipt_path.parents:
             return None, None, "audit_receipt_path_mismatch"
         receipt_text = secure_read_contained_text(roots.receipt_root, receipt_path) if receipt_path else None
         receipt = json.loads(receipt_text) if receipt_text else None
@@ -104,7 +104,13 @@ def _run_preflight(roots, request_payload: Mapping[str, Any], *, suffix: str):
 def run_tournament_truth_gate(
     args: Mapping[str, Any], *, task_id: str = "", session_id: str = "", **_kwargs: Any
 ) -> str:
-    """Run one bounded advisory preflight; it never affects turn delivery."""
+    """Run one bounded preflight and bind it to the active public turn."""
+    contract = active_contract(str(task_id or ""), str(session_id or ""))
+    if contract is None:
+        return tool_error(
+            "Tournament truth gate has no active request-local public contract.",
+            code="truth_gate_no_active_contract",
+        )
     candidate = args.get("candidate")
     request = args.get("request")
     metadata = args.get("artifact_metadata", {})
@@ -119,12 +125,84 @@ def run_tournament_truth_gate(
     if snapshot_error:
         return tool_error("No trusted direct-source snapshot is available; provider fetch was not attempted.", code=snapshot_error)
 
-    request_payload = _build_request_payload(candidate, request, metadata)
-    receipt_path, receipt, code = _run_preflight(roots, request_payload, suffix="preflight")
+    request_payload = _build_request_payload(contract, candidate, request, metadata)
+    receipt_path, receipt, code = _run_preflight(roots, request_payload, suffix=contract.nonce)
     if receipt_path is None:
         return tool_error("Tournament audit preflight rejected or failed.", code=code)
-    valid = isinstance(receipt, Mapping) and receipt.get("schema_version") == AUDIT_SCHEMA_VERSION and receipt.get("receipt_hash") == canonical_json_sha256({k: v for k, v in receipt.items() if k != "receipt_hash"})
-    return tool_result(accepted=bool(valid), advisory=True, code=("verified" if valid else "receipt_invalid"), receipt_sha256=(canonical_json_sha256(receipt) if valid else ""), candidate_sha256=canonical_json_sha256({"candidate": candidate}))
+    expires_at = _parse_expiry(receipt.get("expires_at_utc") if isinstance(receipt, Mapping) else None)
+    issued_at = _parse_expiry(receipt.get("issued_at_utc") if isinstance(receipt, Mapping) else None)
+    artifact_payload = build_artifact_payload(candidate, contract.destination, metadata)
+    valid = bool(
+        isinstance(receipt, Mapping)
+        and receipt.get("schema_version") == AUDIT_SCHEMA_VERSION
+        and receipt.get("decision") == "ALLOW_PUBLIC_ARTIFACT"
+        and contract.entrypoint in (receipt.get("allowed_entrypoints") or [])
+        and receipt.get("artifact_payload_hash") == canonical_json_sha256(artifact_payload)
+        and receipt.get("receipt_hash")
+        == canonical_json_sha256({k: v for k, v in receipt.items() if k != "receipt_hash"})
+        and issued_at is not None
+        and expires_at is not None
+        and expires_at - issued_at == timedelta(minutes=15)
+        and issued_at <= datetime.now(timezone.utc) < expires_at
+        and contract.attach_receipt(
+            receipt_path=receipt_path,
+            candidate=candidate,
+            metadata=metadata,
+            audit_request=request,
+            expires_at=expires_at,
+        )
+    )
+    if not valid:
+        return tool_error(
+            "Tournament audit receipt was not safely bound to this turn.",
+            code="audit_receipt_binding_failed",
+        )
+    return tool_result(
+        accepted=True,
+        advisory=False,
+        code="verified",
+        receipt_sha256=canonical_json_sha256(receipt),
+        candidate_sha256=contract.candidate_sha256(candidate),
+        expires_at_utc=expires_at.isoformat(),
+    )
+
+
+def validate_tournament_sink(contract, candidate: str) -> tuple[bool, str]:
+    """Re-run the audit-owned policy immediately before final delivery."""
+    roots = configured_runtime_roots()
+    if roots is None or contract.audit_request is None or contract.receipt_metadata is None:
+        return False, "audit_sink_validator_unavailable"
+    payload = _build_request_payload(
+        contract,
+        candidate,
+        contract.audit_request,
+        contract.receipt_metadata,
+    )
+    receipt_path, receipt, code = _run_preflight(
+        roots,
+        payload,
+        suffix=f"{contract.nonce}-sink",
+    )
+    if receipt_path is None or not isinstance(receipt, Mapping):
+        return False, code
+    try:
+        from audit_agent.tournament_artifact_gate import require_public_entrypoint_receipt
+
+        require_public_entrypoint_receipt(
+            entrypoint=contract.entrypoint,
+            artifact_payload=build_artifact_payload(
+                candidate,
+                contract.destination,
+                contract.receipt_metadata,
+            ),
+            receipt_path=receipt_path,
+            approved_receipt_root=roots.receipt_root,
+            approved_journal_root=roots.journal_root,
+            approved_source_snapshot_root=roots.source_snapshot_root,
+        )
+    except (ImportError, OSError, TypeError, ValueError):
+        return False, "receipt_sink_rejected"
+    return True, "receipt_sink_verified"
 
 
 def _parse_expiry(value: object) -> datetime | None:

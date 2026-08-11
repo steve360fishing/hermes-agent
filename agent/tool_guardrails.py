@@ -241,22 +241,32 @@ class ToolCallGuardrailController:
         """Bind the active request-local tournament safety contract."""
         self._tournament_contract = contract
 
-    def _tournament_preflight(self, tool_name: str, signature: ToolCallSignature) -> ToolGuardrailDecision | None:
+    def _tournament_preflight_args(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        signature: ToolCallSignature,
+    ) -> ToolGuardrailDecision | None:
         contract = self._tournament_contract
-        # Tournament verification never changes the ordinary tool policy.
-        return None
-        try:
-            authorized = bool(contract.has_valid_receipt())
-        except Exception:
-            authorized = False
-        # A receipt only authorizes final text release. It never opens a
-        # mutable/provider/public tool lane during a protected turn.
-        if tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
+        if contract is None:
             return None
+        try:
+            authorization = contract.authorize_tool(tool_name, _coerce_args(args))
+        except Exception:
+            authorization = None
+        if authorization is not None and authorization.allowed:
+            return None
+        action = "block" if getattr(authorization, "halt", False) else "deny"
         return ToolGuardrailDecision(
-            action="deny", code="tournament_verification_advisory",
-            message="Tournament verification is advisory-only and does not restrict this tool.",
-            tool_name=tool_name, signature=signature,
+            action=action,
+            code=getattr(authorization, "code", "tournament_contract_unavailable"),
+            message=getattr(
+                authorization,
+                "message",
+                "The request-local tournament authority contract could not authorize this tool.",
+            ),
+            tool_name=tool_name,
+            signature=signature,
         )
 
     def bound_result(self, result: str | None) -> str:
@@ -271,7 +281,7 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         """Apply request-local shape checks before tool middleware."""
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        tournament_decision = self._tournament_preflight(tool_name, signature)
+        tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
         if self._execution_contract is None:
@@ -304,7 +314,7 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        tournament_decision = self._tournament_preflight(tool_name, signature)
+        tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
         if self._execution_contract is not None:
@@ -376,6 +386,24 @@ class ToolCallGuardrailController:
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        contract = self._tournament_contract
+        if contract is not None and getattr(contract, "release_state", "") == "in_flight":
+            result_text = str(result or "").lower()
+            ambiguous = bool(
+                failed
+                and any(
+                    token in result_text
+                    for token in ("timeout", "timed out", "ambiguous", "unknown outcome")
+                )
+            )
+            try:
+                contract.record_external_result(success=not failed, ambiguous=ambiguous)
+            except Exception:
+                contract.release_state = "ambiguous"
+                approval = getattr(contract, "release_approval", None)
+                if approval is not None:
+                    approval.state = "ambiguous"
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1
