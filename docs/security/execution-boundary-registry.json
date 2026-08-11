@@ -419,6 +419,15 @@
       "rationale": "recovery boundary for the artifact delivery contract."
     },
     {
+      "id": "agent/turn_finalizer.py:_finalize_artifact_obligation",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/turn_finalizer.py",
+      "symbol": "_finalize_artifact_obligation",
+      "disposition": "covered",
+      "rationale": "Validates the registered artifact path and, for tournament-gated delivery, the exact authorized UTF-8 bytes before final delivery."
+    },
+    {
       "id": "cron/scheduler.py:_send_media_via_adapter",
       "contract": "artifact_delivery",
       "role": "delivery",
