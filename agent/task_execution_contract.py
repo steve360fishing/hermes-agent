@@ -889,7 +889,7 @@ def _last_assistant_text(history: Any) -> str:
 
 def platform_supports_document_delivery(platform: Any) -> bool:
     """Static capability gate used before an attachment-only turn is activated."""
-    return str(getattr(platform, "value", platform) or "").lower() == "telegram"
+    return str(getattr(platform, "value", platform) or "").lower() in {"telegram", "cron"}
 
 
 def artifact_content_fits(content: str) -> bool:

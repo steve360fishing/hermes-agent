@@ -777,6 +777,21 @@ def test_file_artifact_requires_known_document_delivery_capability(monkeypatch, 
     assert contract.preflight_error == "artifact_delivery_unavailable"
 
 
+def test_cron_preserves_document_delivery_capability(monkeypatch, tmp_path):
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+
+    contract = build_task_execution_contract(
+        "Create and deliver report.txt containing safe text.",
+        task_id="cron-delivery",
+        platform="cron",
+    )
+
+    assert contract.lane == ARTIFACT_ONLY
+    assert contract.preflight_error == ""
+    assert contract.artifact_output_path.endswith("report.txt")
+
+
 def test_txt_request_without_filename_gets_stable_txt_name(monkeypatch, tmp_path):
     monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
     monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))

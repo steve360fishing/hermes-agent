@@ -6192,6 +6192,7 @@ class AIAgent:
         function_result: str,
         *,
         failed: bool,
+        no_dispatch_proven: bool = False,
     ) -> str:
         function_result = self._tool_guardrails.bound_result(function_result)
         decision = self._tool_guardrails.after_call(
@@ -6199,6 +6200,7 @@ class AIAgent:
             function_args,
             function_result,
             failed=failed,
+            no_dispatch_proven=no_dispatch_proven,
         )
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)

@@ -839,8 +839,10 @@ def _finalize_turn_impl(
     # Clear interrupt state after handling
     agent.clear_interrupt()
 
-    # Clear stream callback so it doesn't leak into future calls
-    agent._stream_callback = None
+    # Tournament cleanup restores the caller's original callback. Ordinary
+    # turns still clear the turn-local callback to prevent leakage.
+    if tournament_telemetry is None:
+        agent._stream_callback = None
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False

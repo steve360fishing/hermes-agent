@@ -69,7 +69,8 @@ def test_publication_request_fails_safely_and_next_turn_has_no_sticky_contract()
         tool.get("function", {}).get("name") == "tournament_truth_gate"
         for tool in provider_tools
     )
-    assert "public tournament copy was not released" in first["final_response"].lower()
+    assert "publication was not attempted" in first["final_response"].lower()
+    assert "receipt_and_release_approval_required" in first["final_response"]
     assert first["tournament_intent"]["state"] == "publication_request"
     assert first["tournament_intent"]["code"] == "receipt_and_release_approval_required"
     assert "unverified standings" not in str(persisted[-1])
@@ -112,9 +113,27 @@ def test_negation_reset_with_real_publication_request_remains_fail_closed():
         "Do not publish the stale tournament standings, please post the current standings to the website."
     )
 
-    assert "public tournament copy was not released" in result["final_response"].lower()
+    assert "publication was not attempted" in result["final_response"].lower()
+    assert "receipt_and_release_approval_required" in result["final_response"]
     assert result["tournament_intent"]["state"] == "publication_request"
     assert "unverified public standings" not in str(persisted[-1])
+
+
+def test_full_finalizer_restores_preexisting_stream_callback_after_tournament_hold():
+    agent = _agent()
+    original_stream = lambda _delta: None
+    agent._stream_callback = original_stream
+    agent.client.chat.completions.create.return_value = _response("unsupported public copy")
+    agent._persist_session = lambda *_args: None
+    agent._save_trajectory = lambda *_args: None
+    agent._cleanup_task_resources = lambda *_args: None
+
+    result = agent.run_conversation(
+        "Create the public-facing tournament copy and give it to me here for review."
+    )
+
+    assert result["tournament_intent"]["code"] == "receipt_missing_or_consumed"
+    assert agent._stream_callback is original_stream
 
 
 def test_missing_truth_gate_persists_one_safe_recoverable_response(monkeypatch):

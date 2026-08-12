@@ -13,10 +13,21 @@ from agent.tournament_intent_contract import (
     TournamentIntentState,
     TournamentReleaseApproval,
     begin_tournament_intent_contract,
+    classify_bound_release_approval_intake,
     classify_tournament_intent,
     clear_tournament_intent_contract,
     finalize_tournament_output,
+    intake_authenticated_tournament_release_approval,
+    prepare_tournament_publication,
 )
+from agent.tournament_release_state import PendingPublicationPacket, TournamentReleaseStore
+
+
+@pytest.fixture(autouse=True)
+def _isolated_release_store(monkeypatch, tmp_path):
+    """Never let unit approvals touch the operator's real Hermes state."""
+    store = TournamentReleaseStore(state_path=tmp_path / "release-state.json")
+    monkeypatch.setattr(tournament_intent_contract, "_PENDING_PUBLICATIONS", store)
 
 
 PRIVATE_CASES = (
@@ -100,7 +111,7 @@ def test_public_draft_and_publication_are_distinct_states():
     ) is TournamentIntentState.PUBLICATION_REQUEST
     assert classify_tournament_intent(
         "Publish that approved Story now."
-    ) is TournamentIntentState.PUBLICATION_REQUEST
+    ) is None
     assert classify_tournament_intent(
         "Create a public tournament audit report for the website."
     ) is TournamentIntentState.PUBLIC_FACING_DRAFT
@@ -119,6 +130,158 @@ def test_public_draft_and_publication_are_distinct_states():
     assert classify_tournament_intent(
         "Validate the tournament receipt and publish the Story now."
     ) is TournamentIntentState.PUBLICATION_REQUEST
+
+
+@pytest.mark.parametrize(
+    ("message", "trusted_context", "expected"),
+    (
+        (
+            "Alright, well, you have my release approval for the public tournament copy. "
+            "I don't understand why you would need it, but you have it, and you have it permanently.",
+            False,
+            TournamentIntentState.RELEASE_APPROVAL_DISCUSSION_OR_GRANT,
+        ),
+        ("You have my permanent approval to generate public tournament copy for me to review. Do not post it.", False, TournamentIntentState.PUBLIC_FACING_DRAFT),
+        ("Create the public-facing Tournaments to Follow copy and give it to me here for review. Do not publish or send it anywhere.", False, TournamentIntentState.PUBLIC_FACING_DRAFT),
+        ("Give me a detailed Codex prompt to fix the tournament release-approval blocker.", False, TournamentIntentState.PRIVATE_ARTIFACT),
+        ('Write a private test containing the quoted sentence “Publish that tournament Story now.”', False, TournamentIntentState.PRIVATE_ARTIFACT),
+        ("Do not publish anything; explain why the tournament draft was blocked.", False, TournamentIntentState.PRIVATE_INQUIRY),
+        ("Does my release approval apply permanently?", False, TournamentIntentState.RELEASE_REVOCATION_OR_QUESTION),
+        ("I revoke any standing tournament publication approval.", False, TournamentIntentState.RELEASE_REVOCATION_OR_QUESTION),
+        ("Prepare this exact verified caption for Instagram, but do not post it.", True, TournamentIntentState.PUBLIC_FACING_DRAFT),
+        ("Publish this exact verified caption to the SportFish Hub Instagram account now.", True, TournamentIntentState.PUBLICATION_REQUEST),
+        ("Okay, post that exact approved Story now.", True, TournamentIntentState.PUBLICATION_REQUEST),
+    ),
+)
+def test_exact_p1_through_p11_intent_table(message, trusted_context, expected):
+    assert classify_tournament_intent(
+        message, trusted_publication_context=trusted_context
+    ) is expected
+
+
+def test_p9_p10_p11_resolve_only_one_trusted_session_publication_object():
+    agent = _agent()
+    packet = tournament_intent_contract._PENDING_PUBLICATIONS.prepare(
+        PendingPublicationPacket(
+            task_id="prior",
+            session_id=agent.session_id,
+            destination="instagram:sportfish-hub",
+            external_publication_sink="instagram:sportfish-hub",
+            private_delivery_surface="telegram:session-1",
+            candidate_sha256="a" * 64,
+            actor_identity=agent.session_id,
+            idempotency_key="prior-1",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    for index, (message, expected) in enumerate((
+        ("Prepare this exact verified caption for Instagram, but do not post it.", TournamentIntentState.PUBLIC_FACING_DRAFT),
+        ("Publish this exact verified caption to the SportFish Hub Instagram account now.", TournamentIntentState.PUBLICATION_REQUEST),
+        ("Okay, post that exact approved Story now.", TournamentIntentState.PUBLICATION_REQUEST),
+    )):
+        contract = begin_tournament_intent_contract(agent, message=message, task_id=f"context-{index}")
+        assert contract is not None
+        assert contract.state is expected
+        assert contract.pending_publication is packet
+        clear_tournament_intent_contract(agent)
+
+    tournament_intent_contract._PENDING_PUBLICATIONS.prepare(
+        PendingPublicationPacket(
+            task_id="second",
+            session_id=agent.session_id,
+            destination="instagram:other",
+            external_publication_sink="instagram:other",
+            private_delivery_surface="telegram:session-1",
+            candidate_sha256="b" * 64,
+            actor_identity=agent.session_id,
+            idempotency_key="prior-2",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    direct_draft = begin_tournament_intent_contract(
+        agent,
+        message="Prepare this exact verified caption for Instagram, but do not post it.",
+        task_id="ambiguous-context",
+    )
+    assert direct_draft is not None
+    assert direct_draft.state is TournamentIntentState.PUBLIC_FACING_DRAFT
+    assert direct_draft.pending_publication is None
+    clear_tournament_intent_contract(agent)
+    assert begin_tournament_intent_contract(
+        agent,
+        message="Okay, post that exact approved Story now.",
+        task_id="ambiguous-continuation",
+    ) is None
+
+
+def test_p17_exact_authenticated_packet_intake_records_authority_but_never_dispatches():
+    agent = _agent()
+    packet = tournament_intent_contract._PENDING_PUBLICATIONS.prepare(
+        PendingPublicationPacket(
+            task_id="prepare",
+            session_id=agent.session_id,
+            destination="instagram:sportfish-hub",
+            external_publication_sink="instagram:sportfish-hub",
+            private_delivery_surface="telegram:session-1",
+            candidate_sha256="c" * 64,
+            actor_identity=agent.session_id,
+            idempotency_key="release-p17",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    phrase = f"APPROVE_TOURNAMENT_RELEASE action_id={packet.pending_action_id} checksum={packet.checksum()}"
+    state, resolved = classify_bound_release_approval_intake(
+        phrase, session_id=agent.session_id, authenticated_identity=agent.session_id
+    )
+    assert state is TournamentIntentState.BOUND_RELEASE_APPROVAL_INTAKE
+    assert resolved is packet
+    assert begin_tournament_intent_contract(agent, message=phrase, task_id="approval-turn") is None
+    assert packet.state.value == "approved"
+    assert agent._tournament_intent_contract is None
+
+    copied = _agent()
+    copied._user_id = "copied-actor"
+    assert classify_bound_release_approval_intake(
+        phrase, session_id=copied.session_id, authenticated_identity=copied._user_id
+    ) == (None, None)
+
+
+def test_p8_authenticated_revocation_clears_only_non_dispatched_session_authority():
+    agent = _agent()
+    packet = tournament_intent_contract._PENDING_PUBLICATIONS.prepare(
+        PendingPublicationPacket(
+            task_id="revoke",
+            session_id=agent.session_id,
+            destination="instagram:sportfish-hub",
+            external_publication_sink="instagram:sportfish-hub",
+            private_delivery_surface="telegram:session-1",
+            candidate_sha256="d" * 64,
+            actor_identity=agent.session_id,
+            idempotency_key="release-revoke",
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    assert begin_tournament_intent_contract(
+        agent,
+        message="I revoke any standing tournament publication approval.",
+        task_id="revoke-turn",
+    ) is None
+    assert packet.state.value == "failed_pre_dispatch"
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Do not record tournament release approval; explain the policy.",
+        "Never grant publication approval for tournament copy.",
+        'Review the quoted instruction "grant tournament publication approval" privately.',
+    ),
+)
+def test_negated_or_quoted_approval_language_never_classifies_as_release_approval(message):
+    assert classify_tournament_intent(message) in {
+        TournamentIntentState.PRIVATE_INQUIRY,
+        TournamentIntentState.PRIVATE_ARTIFACT,
+    }
 
 
 @pytest.mark.parametrize("platform", ("cron", "CRON", "CrOn", " cron ", "\tCRON\n"))
@@ -281,6 +444,21 @@ def test_public_contract_allows_target_listing_but_not_sending_without_authority
     assert denied.code == "receipt_and_release_approval_required"
 
 
+@pytest.mark.parametrize(
+    "tool_name,args",
+    (
+        ("memory", {"action": "search", "query": "tournament notes"}),
+        ("tournament_truth_gate", {"candidate": "copy", "request": {}, "artifact_metadata": {}}),
+    ),
+)
+def test_public_contract_keeps_safe_internal_research_capture_and_private_artifacts_reachable(tool_name, args):
+    agent = _agent()
+    begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="safe-internal"
+    )
+    assert agent._tool_guardrails.before_call(tool_name, args).action == "allow"
+
+
 def test_missing_registered_truth_gate_fails_before_provider_request(monkeypatch):
     from tools.registry import registry
 
@@ -293,6 +471,20 @@ def test_missing_registered_truth_gate_fails_before_provider_request(monkeypatch
     )
     assert contract is not None
     assert contract.preflight_error == "truth_gate_unavailable"
+
+
+def test_cleanup_preserves_preexisting_capture_schema_when_only_truth_gate_was_injected():
+    agent = _agent()
+    capture = {"type": "function", "function": {"name": "tournament_source_capture"}}
+    agent.tools.append(capture)
+    agent.valid_tool_names.add("tournament_source_capture")
+    contract = begin_tournament_intent_contract(
+        agent, message="Create a public tournament Story naming winners.", task_id="asymmetric"
+    )
+    assert contract.added_tool_schemas == {"tournament_truth_gate"}
+    clear_tournament_intent_contract(agent)
+    assert agent.tools == [capture]
+    assert agent.valid_tool_names == {"tournament_source_capture"}
 
 
 def test_public_draft_missing_receipt_blocks_claim_bytes_without_opaque_tokens():
@@ -311,10 +503,10 @@ def test_public_draft_missing_receipt_blocks_claim_bytes_without_opaque_tokens()
     )
     assert failed is True
     assert telemetry["code"] == "receipt_missing_or_consumed"
-    assert "public tournament copy was not released" in response.lower()
+    assert response.startswith("DRAFT_VALIDATION_HOLD")
     assert "ROUTE_HOLD" not in response
     assert "PUBLIC_ARTIFACT_BLOCKED" not in response
-    assert "receipt_missing_or_consumed" not in response
+    assert "receipt_missing_or_consumed" in response
     assert "Boat A won" not in response
     assert messages[-1]["content"] == response
     assert agent._tournament_intent_contract is None
@@ -348,14 +540,9 @@ def test_public_draft_ignores_and_does_not_consume_irrelevant_release_approval()
     )
     candidate = "Verified winner copy"
     _bind_test_receipt(contract, candidate)
-    approval = TournamentReleaseApproval(
-        destination="telegram:channel-42",
-        candidate_sha256=contract.candidate_sha256(candidate),
-        identity="steve",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-        idempotency_key="irrelevant-draft-approval",
+    _, approval = _attach_exact_approval(
+        contract, candidate, idempotency_key="irrelevant-draft-approval"
     )
-    assert contract.attach_release_approval(approval)
     messages = [{"role": "user", "content": "draft"}, {"role": "assistant", "content": candidate}]
     response, _, failed = finalize_tournament_output(agent, candidate=candidate, messages=messages)
     assert failed is False
@@ -546,33 +733,25 @@ def test_publication_requires_receipt_and_exact_release_approval():
         task_id="publication",
     )
     candidate = "Verified winner copy"
-    destination = "telegram:channel-42"
+    destination = "instagram:sportfish-hub"
     _bind_test_receipt(contract, candidate)
 
     missing = contract.authorize_external_action(
         tool_name="send_message",
         candidate=candidate,
         destination=destination,
-        identity="steve",
+        identity=contract.actor_identity,
         idempotency_key="release-1",
     )
     assert missing.allowed is False
     assert missing.code == "release_approval_required"
 
-    contract.attach_release_approval(
-        TournamentReleaseApproval(
-            destination=destination,
-            candidate_sha256=contract.candidate_sha256(candidate),
-            identity="steve",
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-            idempotency_key="release-1",
-        )
-    )
+    _attach_exact_approval(contract, candidate, idempotency_key="release-1")
     allowed = contract.authorize_external_action(
         tool_name="send_message",
         candidate=candidate,
         destination=destination,
-        identity="steve",
+        identity=contract.actor_identity,
         idempotency_key="release-1",
     )
     assert allowed.allowed is True
@@ -581,13 +760,164 @@ def test_publication_requires_receipt_and_exact_release_approval():
         tool_name="send_message",
         candidate=candidate,
         destination=destination,
-        identity="steve",
+        identity=contract.actor_identity,
         idempotency_key="release-1",
     )
-    assert repeated_preflight.allowed is True
+    assert repeated_preflight.allowed is False
+    assert repeated_preflight.code == "release_already_in_flight"
     contract.record_external_result(success=True, ambiguous=False)
     assert contract.release_state == "consumed"
     assert contract.receipt_used is True
+
+
+def test_p10_valid_truth_prepares_exact_packet_without_dispatch():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Publish this exact verified caption to the SportFish Hub Instagram account now.",
+        task_id="p10-prepare",
+    )
+    candidate = "Verified winner copy"
+    _bind_test_receipt(contract, candidate)
+    messages = [{"role": "assistant", "content": candidate}]
+
+    response, telemetry, failed = finalize_tournament_output(
+        agent, candidate=candidate, messages=messages
+    )
+
+    assert failed is False
+    assert response.startswith("PREPARED_NOT_RELEASED")
+    assert contract.pending_publication is not None
+    assert contract.pending_publication.external_publication_sink == "instagram:sportfish-hub"
+    assert contract.pending_publication.private_delivery_surface == "platform:telegram"
+    assert contract.pending_publication.pending_action_id in response
+    assert contract.pending_publication.checksum() in response
+    assert telemetry["code"] == "release_approval_required"
+    assert contract.pending_publication.state.value == "prepared"
+
+
+def test_authenticated_intake_attaches_only_a_current_exact_prepared_publication_without_dispatch():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="intake"
+    )
+    candidate = "Verified winner copy"
+    _bind_test_receipt(contract, candidate)
+    packet = prepare_tournament_publication(
+        contract,
+        candidate=candidate,
+        destination="instagram:sportfish-hub",
+        idempotency_key="intake-1",
+    )
+    assert packet.state.value == "prepared"
+
+    decision = intake_authenticated_tournament_release_approval(
+        task_id="intake",
+        session_id="session-1",
+        destination="instagram:sportfish-hub",
+        candidate_sha256=contract.candidate_sha256(candidate),
+        authenticated_identity=contract.actor_identity,
+        idempotency_key="intake-1",
+        pending_action_id=packet.pending_action_id,
+        packet_checksum=packet.checksum(),
+    )
+
+    assert decision.allowed is True
+    assert decision.code == "release_approval_recorded"
+    assert contract.release_approval is not None
+    assert contract.release_state == "prepared_not_released"
+    assert packet.state.value == "approved"
+
+
+def test_authenticated_intake_rejects_replay_and_never_attaches_mismatched_approval():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="intake-replay"
+    )
+    candidate = "Verified winner copy"
+    _bind_test_receipt(contract, candidate)
+    packet = prepare_tournament_publication(
+        contract,
+        candidate=candidate,
+        destination="instagram:sportfish-hub",
+        idempotency_key="intake-replay-1",
+    )
+    args = dict(
+        task_id="intake-replay",
+        session_id="session-1",
+        destination="instagram:sportfish-hub",
+        candidate_sha256=contract.candidate_sha256(candidate),
+        authenticated_identity=contract.actor_identity,
+        idempotency_key="intake-replay-1",
+        pending_action_id=packet.pending_action_id,
+        packet_checksum=packet.checksum(),
+    )
+    assert intake_authenticated_tournament_release_approval(**args).allowed
+    replay = intake_authenticated_tournament_release_approval(**args)
+    assert replay.allowed is False
+    assert replay.code == "pending_publication_not_prepared"
+
+
+def test_bound_intake_turn_never_installs_contract_or_dispatches():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="prepare-bound"
+    )
+    candidate = "Verified winner copy"
+    _bind_test_receipt(contract, candidate)
+    packet = prepare_tournament_publication(
+        contract, candidate=candidate, destination="instagram:brand", idempotency_key="bound-1"
+    )
+    clear_tournament_intent_contract(agent)
+    message = f"APPROVE_TOURNAMENT_RELEASE action_id={packet.pending_action_id} checksum={packet.checksum()}"
+    assert begin_tournament_intent_contract(agent, message=message, task_id="new-intake") is None
+    assert agent._tournament_intent_contract is None
+    assert packet.state.value == "approved"
+
+
+def test_approval_question_without_pending_context_never_installs_publication_contract():
+    agent = _agent()
+    assert begin_tournament_intent_contract(
+        agent, message="Do I have release approval for Instagram?", task_id="no-context"
+    ) is None
+
+
+def test_approved_packet_resolves_only_an_exact_later_publication_continuation():
+    agent = _agent()
+    first = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="prepare-turn"
+    )
+    candidate = "Verified winner copy"
+    destination = "instagram:sportfish-hub"
+    _bind_test_receipt(first, candidate)
+    packet = prepare_tournament_publication(
+        first, candidate=candidate, destination=destination, idempotency_key="continuation-1"
+    )
+    clear_tournament_intent_contract(agent)
+    assert intake_authenticated_tournament_release_approval(
+        task_id="prepare-turn",
+        session_id="session-1",
+        destination=destination,
+        candidate_sha256=first.candidate_sha256(candidate),
+        authenticated_identity=first.actor_identity,
+        idempotency_key="continuation-1",
+        pending_action_id=packet.pending_action_id,
+        packet_checksum=packet.checksum(),
+    ).allowed
+
+    continuation = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="continuation-turn"
+    )
+    _bind_test_receipt(continuation, candidate)
+    allowed = continuation.authorize_external_action(
+        tool_name="send_message",
+        candidate=candidate,
+        destination=destination,
+        identity=continuation.actor_identity,
+        idempotency_key="continuation-1",
+    )
+    assert allowed.allowed is True
+    assert continuation.release_approval is not None
 
 
 def test_approval_never_bypasses_missing_or_mismatched_truth_receipt():
@@ -598,20 +928,12 @@ def test_approval_never_bypasses_missing_or_mismatched_truth_receipt():
         task_id="approval-no-truth",
     )
     candidate = "Unverified copy"
-    contract.attach_release_approval(
-        TournamentReleaseApproval(
-            destination="telegram:channel-42",
-            candidate_sha256=contract.candidate_sha256(candidate),
-            identity="steve",
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-            idempotency_key="release-2",
-        )
-    )
+    _attach_exact_approval(contract, candidate, idempotency_key="release-2")
     decision = contract.authorize_external_action(
         tool_name="send_message",
         candidate=candidate,
-        destination="telegram:channel-42",
-        identity="steve",
+        destination="instagram:sportfish-hub",
+        identity=contract.actor_identity,
         idempotency_key="release-2",
     )
     assert decision.allowed is False
@@ -630,8 +952,8 @@ def test_publication_with_neither_authority_reports_both_missing():
     decision = contract.authorize_external_action(
         tool_name="send_message",
         candidate="Unverified copy",
-        destination="telegram:channel-42",
-        identity="steve",
+        destination="instagram:sportfish-hub",
+        identity=contract.actor_identity,
         idempotency_key="release-none",
     )
     assert decision.code == "receipt_and_release_approval_required"
@@ -655,16 +977,11 @@ def test_publication_release_approval_failure_matrix(mutation, expected_code):
         task_id=f"publication-{mutation}",
     )
     candidate = "Verified winner copy"
-    destination = "telegram:channel-42"
+    destination = "instagram:sportfish-hub"
     _bind_test_receipt(contract, candidate)
-    approval = TournamentReleaseApproval(
-        destination=destination,
-        candidate_sha256=contract.candidate_sha256(candidate),
-        identity="steve",
-        expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-        idempotency_key="release-matrix",
+    _, approval = _attach_exact_approval(
+        contract, candidate, idempotency_key="release-matrix"
     )
-    assert contract.attach_release_approval(approval)
     if mutation == "expired":
         approval.expires_at = datetime.now(timezone.utc) - timedelta(seconds=1)
     elif mutation == "consumed":
@@ -672,8 +989,8 @@ def test_publication_release_approval_failure_matrix(mutation, expected_code):
     decision = contract.authorize_external_action(
         tool_name="send_message",
         candidate=candidate,
-        destination=("telegram:other" if mutation == "destination" else destination),
-        identity=("other" if mutation == "identity" else "steve"),
+        destination=("instagram:other" if mutation == "destination" else destination),
+        identity=("other" if mutation == "identity" else contract.actor_identity),
         idempotency_key=("other" if mutation == "idempotency" else "release-matrix"),
     )
     assert decision.code == expected_code
@@ -687,22 +1004,14 @@ def test_ambiguous_external_result_is_not_replayed():
         task_id="ambiguous-release",
     )
     candidate = "Verified winner copy"
-    destination = "telegram:channel-42"
+    destination = "instagram:sportfish-hub"
     _bind_test_receipt(contract, candidate)
-    contract.attach_release_approval(
-        TournamentReleaseApproval(
-            destination=destination,
-            candidate_sha256=contract.candidate_sha256(candidate),
-            identity="steve",
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-            idempotency_key="release-3",
-        )
-    )
+    _attach_exact_approval(contract, candidate, idempotency_key="release-3")
     assert contract.authorize_external_action(
         tool_name="send_message",
         candidate=candidate,
         destination=destination,
-        identity="steve",
+        identity=contract.actor_identity,
         idempotency_key="release-3",
     ).allowed
     contract.record_external_result(success=False, ambiguous=True)
@@ -711,11 +1020,85 @@ def test_ambiguous_external_result_is_not_replayed():
         tool_name="send_message",
         candidate=candidate,
         destination=destination,
-        identity="steve",
+        identity=contract.actor_identity,
         idempotency_key="release-3",
     )
     assert replay.allowed is False
     assert replay.code == "release_outcome_ambiguous"
+
+
+@pytest.mark.parametrize(
+    "provider_result",
+    (
+        '{"error":"provider rejected after acceptance"}',
+        '{"error":"timeout"}',
+        '{"error":"connection lost"}',
+        '{"error":"malformed provider response"}',
+        '{"error":"no_dispatch_proven"}',
+    ),
+)
+def test_p19_provider_side_failures_are_ambiguous_even_if_result_text_claims_no_dispatch(provider_result):
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="provider-failure"
+    )
+    candidate = "Verified winner copy"
+    destination = "instagram:sportfish-hub"
+    _bind_test_receipt(contract, candidate)
+    _attach_exact_approval(contract, candidate, idempotency_key="provider-failure-1")
+    assert contract.authorize_external_action(
+        tool_name="send_message", candidate=candidate, destination=destination,
+        identity=contract.actor_identity, idempotency_key="provider-failure-1",
+    ).allowed
+    agent._tool_guardrails.after_call(
+        "send_message", {"message": candidate, "target": destination},
+        provider_result, failed=True,
+    )
+    assert contract.release_state == "ambiguous"
+
+
+def test_p19_authoritative_runtime_no_dispatch_proof_is_the_only_retryable_failure_boundary():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id="no-dispatch"
+    )
+    candidate = "Verified winner copy"
+    destination = "instagram:sportfish-hub"
+    _bind_test_receipt(contract, candidate)
+    _attach_exact_approval(contract, candidate, idempotency_key="no-dispatch-1")
+    assert contract.authorize_external_action(
+        tool_name="send_message", candidate=candidate, destination=destination,
+        identity=contract.actor_identity, idempotency_key="no-dispatch-1",
+    ).allowed
+    agent._tool_guardrails.after_call(
+        "send_message", {"message": candidate, "target": destination},
+        '{"error":"local validation"}', failed=True, no_dispatch_proven=True,
+    )
+    assert contract.release_state == "prepared_not_released"
+    assert contract.release_approval.state == "available"
+
+
+@pytest.mark.parametrize(
+    "maintenance_tool",
+    ("build", "pull", "apply", "recreate", "canary", "rollback", "terminal", "execute_code"),
+)
+def test_p20_tournament_release_authority_never_authorizes_deployment_or_maintenance_tools(maintenance_tool):
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message="Publish that approved tournament Story now.", task_id=f"maintenance-{maintenance_tool}"
+    )
+    candidate = "Verified winner copy"
+    _bind_test_receipt(contract, candidate)
+    _attach_exact_approval(contract, candidate, idempotency_key="publication-only")
+    decision = contract.authorize_external_action(
+        tool_name=maintenance_tool,
+        candidate=candidate,
+        destination="instagram:sportfish-hub",
+        identity=contract.actor_identity,
+        idempotency_key="publication-only",
+    )
+    assert decision.allowed is False
+    assert decision.code == "publication_tool_not_bound"
 
 
 def test_successful_bound_publication_returns_confirmation_without_rechecking_consumed_receipt():
@@ -727,22 +1110,14 @@ def test_successful_bound_publication_returns_confirmation_without_rechecking_co
     )
     candidate = "Verified winner copy"
     _bind_test_receipt(contract, candidate)
-    contract.attach_release_approval(
-        TournamentReleaseApproval(
-            destination="telegram:channel-42",
-            candidate_sha256=contract.candidate_sha256(candidate),
-            identity=contract.actor_identity,
-            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
-            idempotency_key="release-success",
-        )
-    )
+    _attach_exact_approval(contract, candidate, idempotency_key="release-success")
     assert agent._tool_guardrails.before_call(
         "send_message",
-        {"action": "send", "target": "telegram:channel-42", "message": candidate},
+        {"action": "send", "target": "instagram:sportfish-hub", "message": candidate},
     ).action == "allow"
     agent._tool_guardrails.after_call(
         "send_message",
-        {"action": "send", "target": "telegram:channel-42", "message": candidate},
+        {"action": "send", "target": "instagram:sportfish-hub", "message": candidate},
         '{"ok":true}',
         failed=False,
     )
@@ -779,3 +1154,38 @@ def _bind_test_receipt(contract, candidate: str) -> None:
         candidate=candidate,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
+
+
+def _attach_exact_approval(
+    contract,
+    candidate: str,
+    *,
+    idempotency_key: str,
+    destination: str = "instagram:sportfish-hub",
+):
+    packet = tournament_intent_contract._PENDING_PUBLICATIONS.prepare(
+        PendingPublicationPacket(
+            task_id=contract.task_id,
+            session_id=contract.session_id,
+            destination=destination,
+            external_publication_sink=destination,
+            private_delivery_surface=contract.destination,
+            candidate_sha256=contract.candidate_sha256(candidate),
+            actor_identity=contract.actor_identity,
+            idempotency_key=idempotency_key,
+            expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
+        )
+    )
+    decision = intake_authenticated_tournament_release_approval(
+        task_id=contract.task_id,
+        session_id=contract.session_id,
+        destination=destination,
+        candidate_sha256=packet.candidate_sha256,
+        authenticated_identity=contract.actor_identity,
+        idempotency_key=idempotency_key,
+        pending_action_id=packet.pending_action_id,
+        packet_checksum=packet.checksum(),
+    )
+    assert decision.allowed
+    assert contract.release_approval is not None
+    return packet, contract.release_approval

@@ -8,7 +8,9 @@ there is intentionally no provider fetch or retry path here.
 from __future__ import annotations
 
 import json
+import hashlib
 import os
+import re
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 import subprocess
@@ -36,19 +38,51 @@ def _audit_command() -> list[str]:
     return [sys.executable, "-m", "audit_agent", "tournament-artifact-preflight"]
 
 
-def _read_only_snapshot_ingestion(request: Mapping[str, Any], snapshot_root: Path) -> str | None:
-    """Require model references to resolve to already-captured trusted snapshots."""
+def _hydrate_snapshot_ingestion(
+    request: Mapping[str, Any], snapshot_root: Path
+) -> tuple[dict[str, Any] | None, str | None]:
+    """Hydrate model references exclusively from runtime-owned snapshot bytes."""
+    payload = dict(request)
     rows = request.get("evidence_manifest")
     if not isinstance(rows, list) or not rows:
-        return "trusted_source_snapshot_required"
+        return None, "trusted_source_snapshot_required"
+    hydrated_rows: list[dict[str, Any]] = []
     for row in rows:
         if not isinstance(row, Mapping):
-            return "trusted_source_snapshot_invalid"
+            return None, "trusted_source_snapshot_invalid"
         path = contained_path(snapshot_root, str(row.get("source_snapshot_path") or ""))
         digest = row.get("source_snapshot_sha256")
-        if path is None or not path.is_file() or not isinstance(digest, str) or len(digest) != 64:
-            return "trusted_source_snapshot_missing"
-    return None
+        if (
+            path is None
+            or not path.is_file()
+            or not isinstance(digest, str)
+            or re.fullmatch(r"[0-9a-f]{64}", digest) is None
+        ):
+            return None, "trusted_source_snapshot_missing"
+        text = secure_read_contained_text(snapshot_root, path)
+        if text is None or hashlib.sha256(text.encode("utf-8")).hexdigest() != digest:
+            return None, "trusted_source_snapshot_hash_mismatch"
+        try:
+            evidence = json.loads(text)
+        except (TypeError, ValueError):
+            return None, "trusted_source_snapshot_invalid"
+        if not isinstance(evidence, dict) or evidence.get("schema_version") != "tournament_trusted_snapshot.v1":
+            return None, "trusted_source_snapshot_invalid"
+        hydrated = dict(row)
+        hydrated["source_snapshot_path"] = str(path)
+        hydrated["source_snapshot_sha256"] = digest
+        hydrated["source_snapshot_id"] = digest
+        hydrated["source_evidence"] = evidence
+        hydrated["source_evidence_hash"] = canonical_json_sha256(evidence)
+        hydrated["pulled_at_utc"] = evidence.get("pulled_at_utc")
+        finality = evidence.get("verified_finality")
+        if not isinstance(finality, Mapping):
+            return None, "trusted_source_snapshot_finality_missing"
+        for field in ("displayed", "standings_final", "payout_final"):
+            hydrated[field] = finality.get(field) is True
+        hydrated_rows.append(hydrated)
+    payload["evidence_manifest"] = hydrated_rows
+    return payload, None
 
 
 def _build_request_payload(contract, candidate: str, request: Mapping[str, Any], metadata: Mapping[str, Any]) -> dict[str, Any]:
@@ -121,11 +155,14 @@ def run_tournament_truth_gate(
     roots = configured_runtime_roots()
     if roots is None:
         return tool_error("Trusted tournament runtime roots are not configured.", code="trusted_runtime_roots_unavailable")
-    snapshot_error = _read_only_snapshot_ingestion(request, roots.source_snapshot_root)
+    hydrated_request, snapshot_error = _hydrate_snapshot_ingestion(
+        request, roots.source_snapshot_root
+    )
     if snapshot_error:
         return tool_error("No trusted direct-source snapshot is available; provider fetch was not attempted.", code=snapshot_error)
 
-    request_payload = _build_request_payload(contract, candidate, request, metadata)
+    assert hydrated_request is not None
+    request_payload = _build_request_payload(contract, candidate, hydrated_request, metadata)
     receipt_path, receipt, code = _run_preflight(roots, request_payload, suffix=contract.nonce)
     if receipt_path is None:
         return tool_error("Tournament audit preflight rejected or failed.", code=code)
@@ -148,7 +185,7 @@ def run_tournament_truth_gate(
             receipt_path=receipt_path,
             candidate=candidate,
             metadata=metadata,
-            audit_request=request,
+            audit_request=hydrated_request,
             expires_at=expires_at,
         )
     )
@@ -203,6 +240,43 @@ def validate_tournament_sink(contract, candidate: str) -> tuple[bool, str]:
     except (ImportError, OSError, TypeError, ValueError):
         return False, "receipt_sink_rejected"
     return True, "receipt_sink_verified"
+
+
+def validate_tournament_publication_sink(
+    contract, candidate: str, external_publication_sink: str
+) -> tuple[bool, str]:
+    """Issue and consume a fresh truth receipt bound to the real external sink."""
+    roots = configured_runtime_roots()
+    if roots is None or contract.audit_request is None or contract.receipt_metadata is None:
+        return False, "audit_publication_sink_validator_unavailable"
+    original_destination = contract.destination
+    try:
+        contract.destination = external_publication_sink
+        payload = _build_request_payload(
+            contract, candidate, contract.audit_request, contract.receipt_metadata
+        )
+        receipt_path, receipt, code = _run_preflight(
+            roots, payload, suffix=f"{contract.nonce}-publication-sink"
+        )
+        if receipt_path is None or not isinstance(receipt, Mapping):
+            return False, code
+        from audit_agent.tournament_artifact_gate import require_public_entrypoint_receipt
+
+        require_public_entrypoint_receipt(
+            entrypoint=contract.entrypoint,
+            artifact_payload=build_artifact_payload(
+                candidate, external_publication_sink, contract.receipt_metadata
+            ),
+            receipt_path=receipt_path,
+            approved_receipt_root=roots.receipt_root,
+            approved_journal_root=roots.journal_root,
+            approved_source_snapshot_root=roots.source_snapshot_root,
+        )
+    except (ImportError, OSError, TypeError, ValueError):
+        return False, "publication_sink_receipt_rejected"
+    finally:
+        contract.destination = original_destination
+    return True, "publication_sink_receipt_verified"
 
 
 def _parse_expiry(value: object) -> datetime | None:

@@ -26,6 +26,12 @@ from agent.tournament_truth_support import (
     contained_path,
     secure_read_contained_text,
 )
+from agent.tournament_release_state import (
+    PendingPublicationPacket,
+    ReleaseApprovalIntake,
+    ReleaseState,
+    TournamentReleaseStore,
+)
 
 
 POLICY_VERSION = "tournament-intent-v1"
@@ -39,7 +45,11 @@ class TournamentIntentState(str, Enum):
     PUBLICATION_REQUEST = "publication_request"
     MIXED_PUBLICATION = "mixed_publication"
     RECEIPT_VALIDATION = "receipt_validation"
-    RELEASE_APPROVAL = "release_approval"
+    RELEASE_APPROVAL_DISCUSSION_OR_GRANT = "release_approval_discussion_or_grant"
+    BOUND_RELEASE_APPROVAL_INTAKE = "bound_release_approval_intake"
+    RELEASE_REVOCATION_OR_QUESTION = "release_revocation_or_question"
+    # Compatibility alias: approval language is never an execution request.
+    RELEASE_APPROVAL = "release_approval_discussion_or_grant"
 
 
 @dataclass(frozen=True)
@@ -62,6 +72,7 @@ class TournamentReleaseApproval:
 
 _CONTRACTS: dict[tuple[str, str], "TournamentIntentContract"] = {}
 _CONTRACTS_LOCK = threading.RLock()
+_PENDING_PUBLICATIONS = TournamentReleaseStore()
 
 _TOURNAMENT_CUE = re.compile(
     r"\b(?:tournaments?|catchstat|reel\s*time|leaderboards?|standings?|"
@@ -69,7 +80,7 @@ _TOURNAMENT_CUE = re.compile(
     re.IGNORECASE,
 )
 _TOURNAMENT_CONTINUATION_CUE = re.compile(
-    r"\b(?:that|the)\s+approved\s+(?:instagram\s+)?(?:stor(?:y|ies)|post|caption|newsletter|copy)\b",
+    r"\b(?:that|the)\s+(?:exact\s+)?approved\s+(?:instagram\s+)?(?:stor(?:y|ies)|post|caption|newsletter|copy)\b",
     re.IGNORECASE,
 )
 _PRIVATE_ARTIFACT_FRAME = re.compile(
@@ -89,7 +100,8 @@ _PUBLIC_SURFACE = re.compile(
 )
 _DRAFT_ACTION = re.compile(r"\b(?:create|write|draft|make|prepare|generate)\b", re.IGNORECASE)
 _PUBLICATION_ACTION = re.compile(
-    r"\b(?:publish|send|upload|deploy|release|post(?!\s+(?:is|was|has|that|which|request)))\b",
+    r"\b(?:publish|send|upload|deploy|release)\b|"
+    r"\bpost(?=\s+(?:that\s+exact|this|the|it|now)\b|[.!?,;]|$)",
     re.IGNORECASE,
 )
 _NEGATION = re.compile(r"\b(?:do\s+not|don't|without|never)\b", re.IGNORECASE)
@@ -105,7 +117,7 @@ _RECEIPT_OPERATION = re.compile(
     re.IGNORECASE,
 )
 _APPROVAL_OPERATION = re.compile(
-    r"\b(?:record|grant|approve|validate)\b.{0,64}\b(?:release|publication)\s+approval\b",
+    r"\b(?:record|grant|approve|validate|have|give|supply)\b.{0,64}\b(?:release|publication)\s+approval\b",
     re.IGNORECASE,
 )
 _FENCED_DATA = re.compile(r"```.*?```", re.DOTALL)
@@ -145,6 +157,26 @@ _READ_ONLY_PUBLIC_TOOLS = frozenset(
         "sportfish_tournament_research",
     }
 )
+_EXPLICIT_BOUND_PUBLIC_SURFACE = re.compile(
+    r"\b(?:instagram|facebook|newsletter|website|cms)\b.*\b(?:account|caption|story|post|page)\b|"
+    r"\b(?:caption|story|post|page)\b.*\b(?:instagram|facebook|newsletter|website|cms)\b",
+    re.IGNORECASE,
+)
+_BOUND_APPROVAL_INTAKE = re.compile(
+    r"^APPROVE_TOURNAMENT_RELEASE\s+action_id=(?P<action>[a-f0-9]{32})\s+checksum=(?P<checksum>[a-f0-9]{64})$",
+    re.IGNORECASE,
+)
+_REVOCATION_OR_QUESTION = re.compile(
+    r"\b(?:revoke|withdraw|cancel|question|why|whether|explain|does|is|can)\b.{0,64}\b(?:release|publication)\s+approval\b",
+    re.IGNORECASE,
+)
+_INTERNAL_PUBLIC_TOOLS = frozenset(
+    {
+        "memory",
+        "tournament_source_capture",
+        "tournament_truth_gate",
+    }
+)
 
 
 def _has_affirmative_action(message: str, pattern: re.Pattern[str]) -> bool:
@@ -171,15 +203,20 @@ def _mask_non_authoritative_data(message: str) -> str:
     return _LABELED_DATA.sub(lambda match: match.group("prefix"), masked)
 
 
-def _classify_tournament_intents(message: object) -> frozenset[TournamentIntentState]:
+def _classify_tournament_intents(
+    message: object, *, trusted_publication_context: bool = False
+) -> frozenset[TournamentIntentState]:
     """Return every directed intent present after removing data-only vocabulary."""
     if not isinstance(message, str):
         return frozenset()
     directed = _mask_non_authoritative_data(message)
     raw_has_tournament_cue = bool(
-        _TOURNAMENT_CUE.search(message) or _TOURNAMENT_CONTINUATION_CUE.search(message)
+        _TOURNAMENT_CUE.search(message)
+        or (trusted_publication_context and _TOURNAMENT_CONTINUATION_CUE.search(message))
+        or _APPROVAL_OPERATION.search(message) or _REVOCATION_OR_QUESTION.search(message)
+        or _EXPLICIT_BOUND_PUBLIC_SURFACE.search(message)
     )
-    if not raw_has_tournament_cue:
+    if not raw_has_tournament_cue and not trusted_publication_context:
         return frozenset()
     directed_has_tournament_cue = bool(
         _TOURNAMENT_CUE.search(directed) or _TOURNAMENT_CONTINUATION_CUE.search(directed)
@@ -191,9 +228,12 @@ def _classify_tournament_intents(message: object) -> frozenset[TournamentIntentS
         states.add(TournamentIntentState.PRIVATE_INQUIRY)
     if _RECEIPT_OPERATION.search(directed):
         states.add(TournamentIntentState.RECEIPT_VALIDATION)
-    if _APPROVAL_OPERATION.search(directed):
-        states.add(TournamentIntentState.RELEASE_APPROVAL)
-    public_action_text = _APPROVAL_OPERATION.sub(" ", directed)
+    if _REVOCATION_OR_QUESTION.search(directed):
+        states.add(TournamentIntentState.RELEASE_REVOCATION_OR_QUESTION)
+    elif _APPROVAL_OPERATION.search(directed) and _has_affirmative_action(directed, _APPROVAL_OPERATION):
+        states.add(TournamentIntentState.RELEASE_APPROVAL_DISCUSSION_OR_GRANT)
+    # Approval is an authority noun, never a publication instruction itself.
+    public_action_text = re.sub(r"\b(?:release|publication)[\s-]+approval(?:[\s-]+blocker)?\b", " ", directed, flags=re.IGNORECASE)
     if _has_affirmative_action(public_action_text, _PUBLICATION_ACTION):
         states.add(TournamentIntentState.PUBLICATION_REQUEST)
     if _PUBLIC_SURFACE.search(directed) and _has_affirmative_action(directed, _DRAFT_ACTION):
@@ -201,9 +241,13 @@ def _classify_tournament_intents(message: object) -> frozenset[TournamentIntentS
     return frozenset(states or {TournamentIntentState.PRIVATE_INQUIRY})
 
 
-def classify_tournament_intent(message: object) -> TournamentIntentState | None:
+def classify_tournament_intent(
+    message: object, *, trusted_publication_context: bool = False
+) -> TournamentIntentState | None:
     """Classify the controlling state without discarding concurrent intents."""
-    states = _classify_tournament_intents(message)
+    states = _classify_tournament_intents(
+        message, trusted_publication_context=trusted_publication_context
+    )
     if (
         TournamentIntentState.PUBLICATION_REQUEST in states
         and states.intersection(
@@ -213,12 +257,20 @@ def classify_tournament_intent(message: object) -> TournamentIntentState | None:
             }
         )
     ):
+        # A private handoff that discusses approval vocabulary is not mixed;
+        # only a separate affirmative publication clause may create mixed work.
+        masked = _mask_non_authoritative_data(message) if isinstance(message, str) else ""
+        masked = re.sub(r"\b(?:release|publication)[\s-]+approval(?:[\s-]+blocker)?\b", " ", masked, flags=re.IGNORECASE)
+        if not _has_affirmative_action(masked, _PUBLICATION_ACTION):
+            return TournamentIntentState.PRIVATE_ARTIFACT
         return TournamentIntentState.MIXED_PUBLICATION
     for state in (
         TournamentIntentState.PUBLICATION_REQUEST,
         TournamentIntentState.PUBLIC_FACING_DRAFT,
         TournamentIntentState.RECEIPT_VALIDATION,
-        TournamentIntentState.RELEASE_APPROVAL,
+        TournamentIntentState.BOUND_RELEASE_APPROVAL_INTAKE,
+        TournamentIntentState.RELEASE_APPROVAL_DISCUSSION_OR_GRANT,
+        TournamentIntentState.RELEASE_REVOCATION_OR_QUESTION,
         TournamentIntentState.PRIVATE_ARTIFACT,
         TournamentIntentState.PRIVATE_INQUIRY,
     ):
@@ -229,6 +281,26 @@ def classify_tournament_intent(message: object) -> TournamentIntentState | None:
 
 def platform_bypasses_tournament_contract(platform: object) -> bool:
     return str(getattr(platform, "value", platform) or "").strip().casefold() == "cron"
+
+
+def classify_bound_release_approval_intake(
+    message: object, *, session_id: str, authenticated_identity: str
+) -> tuple[TournamentIntentState | None, PendingPublicationPacket | None]:
+    """Resolve an authenticated exact packet response without granting execution."""
+    if not isinstance(message, str):
+        return None, None
+    match = _BOUND_APPROVAL_INTAKE.fullmatch(message.strip())
+    if match is None:
+        return None, None
+    packet = _PENDING_PUBLICATIONS.current_action(match.group("action"), session_id)
+    if (
+        packet is None
+        or packet.actor_identity != str(authenticated_identity)
+        or packet.state is not ReleaseState.PREPARED
+        or packet.checksum() != match.group("checksum").lower()
+    ):
+        return None, None
+    return TournamentIntentState.BOUND_RELEASE_APPROVAL_INTAKE, packet
 
 
 @dataclass
@@ -251,6 +323,8 @@ class TournamentIntentContract:
     buffer_callback: Callable[[str | None], None] | None = None
     added_tool_schema: bool = False
     added_valid_tool_name: bool = False
+    added_tool_schemas: set[str] = field(default_factory=set)
+    added_valid_tool_names: set[str] = field(default_factory=set)
     receipt_path: Path | None = None
     receipt_candidate_sha256: str = ""
     receipt_metadata: dict[str, Any] | None = None
@@ -261,6 +335,8 @@ class TournamentIntentContract:
     release_approval: TournamentReleaseApproval | None = None
     release_state: str = "not_requested"
     release_binding: tuple[str, str, str, str, str] | None = None
+    pending_publication: PendingPublicationPacket | None = None
+    external_publication_sink: str = ""
     delivery_callback_failed: bool = False
     closed: bool = False
 
@@ -335,9 +411,30 @@ class TournamentIntentContract:
         self.audit_request = {}
         self.test_receipt = True
 
-    def attach_release_approval(self, approval: TournamentReleaseApproval) -> bool:
-        if self.closed or approval.state != "available" or approval.expires_at <= datetime.now(timezone.utc):
+    def attach_release_approval(
+        self, approval: TournamentReleaseApproval, *, packet: PendingPublicationPacket
+    ) -> bool:
+        stored = _PENDING_PUBLICATIONS.current_action(
+            packet.pending_action_id, self.session_id
+        )
+        if (
+            self.closed
+            or stored is not packet
+            or packet.state not in {ReleaseState.APPROVED, ReleaseState.FAILED_PRE_DISPATCH}
+            or (
+                packet.state is ReleaseState.FAILED_PRE_DISPATCH
+                and not packet.retryable_pre_dispatch
+            )
+            or packet.action_tool != "send_message"
+            or approval.state != "available"
+            or approval.expires_at <= datetime.now(timezone.utc)
+            or approval.destination != packet.external_publication_sink
+            or approval.candidate_sha256 != packet.candidate_sha256
+            or approval.identity != packet.actor_identity
+            or approval.idempotency_key != packet.idempotency_key
+        ):
             return False
+        self.pending_publication = packet
         self.release_approval = approval
         self.release_state = "prepared_not_released"
         return True
@@ -404,6 +501,8 @@ class TournamentIntentContract:
             return ContractDecision(True, "allow")
         if tool_name in _READ_ONLY_PUBLIC_TOOLS:
             return ContractDecision(True, "allow")
+        if tool_name in _INTERNAL_PUBLIC_TOOLS:
+            return ContractDecision(True, "allow")
         if self.state is TournamentIntentState.PUBLIC_FACING_DRAFT:
             candidate = _candidate_from_args(args)
             receipt = self.verify_receipt(candidate) if candidate else ContractDecision(False, "receipt_missing_or_consumed")
@@ -427,8 +526,11 @@ class TournamentIntentContract:
 
     def bypasses_task_contract(self, tool_name: str, args: Mapping[str, Any]) -> bool:
         """Let safe research/truth reads coexist with an artifact-only contract."""
-        return tool_name in _READ_ONLY_PUBLIC_TOOLS or (
+        return (
+            tool_name in (_READ_ONLY_PUBLIC_TOOLS | _INTERNAL_PUBLIC_TOOLS)
+            or (
             tool_name == "send_message" and str(args.get("action") or "send") == "list"
+            )
         )
 
     def authorize_external_action(
@@ -450,15 +552,33 @@ class TournamentIntentContract:
             idempotency_key,
         )
         if self.release_state == "in_flight":
-            if self.release_binding == requested_binding:
-                return ContractDecision(True, "release_authorized")
-            return ContractDecision(False, "release_in_flight_mismatch")
+            return ContractDecision(False, "release_already_in_flight")
         receipt = self.verify_receipt(candidate)
         if not receipt.allowed:
             if receipt.code == "receipt_missing_or_consumed" and self.release_approval is None:
                 return ContractDecision(False, "receipt_and_release_approval_required")
             return receipt
         approval = self.release_approval
+        if approval is None:
+            packet = _PENDING_PUBLICATIONS.approved_for(
+                session_id=self.session_id,
+                destination=destination,
+                candidate_sha256=self.candidate_sha256(candidate),
+                identity=identity,
+                idempotency_key=idempotency_key,
+            )
+            if packet is not None:
+                self.attach_release_approval(
+                    TournamentReleaseApproval(
+                        destination=packet.destination,
+                        candidate_sha256=packet.candidate_sha256,
+                        identity=packet.actor_identity,
+                        expires_at=packet.expires_at,
+                        idempotency_key=packet.idempotency_key,
+                    ),
+                    packet=packet,
+                )
+                approval = self.release_approval
         if approval is None:
             return ContractDecision(False, "release_approval_required")
         if approval.state != "available":
@@ -477,6 +597,22 @@ class TournamentIntentContract:
         approval.state = "in_flight"
         self.release_state = "in_flight"
         self.release_binding = requested_binding
+        pending_state = (
+            self.pending_publication.state if self.pending_publication is not None else None
+        )
+        if (
+            self.pending_publication is None
+            or pending_state not in {ReleaseState.APPROVED, ReleaseState.FAILED_PRE_DISPATCH}
+            or not _PENDING_PUBLICATIONS.transition(
+                self.pending_publication,
+                expected=pending_state,
+                target=ReleaseState.IN_FLIGHT,
+            )
+        ):
+            approval.state = "available"
+            self.release_state = "prepared_not_released"
+            self.release_binding = None
+            return ContractDecision(False, "release_state_transition_failed")
         return ContractDecision(True, "release_authorized")
 
     def record_external_result(self, *, success: bool, ambiguous: bool) -> None:
@@ -486,15 +622,27 @@ class TournamentIntentContract:
         if ambiguous:
             approval.state = "ambiguous"
             self.release_state = "ambiguous"
+            if self.pending_publication is not None:
+                _PENDING_PUBLICATIONS.transition(
+                    self.pending_publication, expected=ReleaseState.IN_FLIGHT, target=ReleaseState.AMBIGUOUS
+                )
             return
         if success:
             approval.state = "consumed"
             self.release_state = "consumed"
             self.receipt_used = True
+            if self.pending_publication is not None:
+                _PENDING_PUBLICATIONS.transition(
+                    self.pending_publication, expected=ReleaseState.IN_FLIGHT, target=ReleaseState.CONSUMED
+                )
             return
         approval.state = "available"
         self.release_state = "prepared_not_released"
         self.release_binding = None
+        if self.pending_publication is not None:
+            _PENDING_PUBLICATIONS.transition(
+                self.pending_publication, expected=ReleaseState.IN_FLIGHT, target=ReleaseState.FAILED_PRE_DISPATCH
+            )
 
     def telemetry(
         self,
@@ -546,14 +694,14 @@ class TournamentIntentContract:
             if isinstance(tools, list):
                 agent.tools = [
                     tool for tool in tools
-                    if tool.get("function", {}).get("name") != "tournament_truth_gate"
+                    if tool.get("function", {}).get("name") not in self.added_tool_schemas
                 ]
         if self.added_valid_tool_name:
             valid_names = getattr(agent, "valid_tool_names", None)
             if isinstance(valid_names, set):
-                valid_names.discard("tournament_truth_gate")
+                valid_names.difference_update(self.added_valid_tool_names)
             elif isinstance(valid_names, list):
-                agent.valid_tool_names = [name for name in valid_names if name != "tournament_truth_gate"]
+                agent.valid_tool_names = [name for name in valid_names if name not in self.added_valid_tool_names]
         with _CONTRACTS_LOCK:
             _CONTRACTS.pop((self.task_id, self.session_id), None)
 
@@ -568,16 +716,47 @@ def begin_tournament_intent_contract(
     raw_platform = getattr(agent, "platform", "")
     if platform_bypasses_tournament_contract(raw_platform):
         return None
+    authenticated_identity = str(
+        getattr(agent, "_user_id", None) or getattr(agent, "session_id", "") or ""
+    )
+    intake_state, packet = classify_bound_release_approval_intake(
+        message,
+        session_id=str(getattr(agent, "session_id", "") or ""),
+        authenticated_identity=authenticated_identity,
+    )
+    if intake_state is TournamentIntentState.BOUND_RELEASE_APPROVAL_INTAKE and packet is not None:
+        intake_authenticated_tournament_release_approval(
+            task_id=task_id, session_id=packet.session_id, destination=packet.destination,
+            candidate_sha256=packet.candidate_sha256,
+            authenticated_identity=authenticated_identity,
+            idempotency_key=packet.idempotency_key, pending_action_id=packet.pending_action_id,
+            packet_checksum=packet.checksum(),
+        )
+        return None
     platform = str(raw_platform or "").strip().casefold()
-    intents = _classify_tournament_intents(message)
-    state = classify_tournament_intent(message)
+    session_id = str(getattr(agent, "session_id", "") or "")
+    pending_context = _PENDING_PUBLICATIONS.current_for_session(session_id)
+    trusted_context = pending_context is not None
+    intents = _classify_tournament_intents(
+        message, trusted_publication_context=trusted_context
+    )
+    state = classify_tournament_intent(
+        message, trusted_publication_context=trusted_context
+    )
+    if state is TournamentIntentState.RELEASE_REVOCATION_OR_QUESTION:
+        directed = _mask_non_authoritative_data(message) if isinstance(message, str) else ""
+        if re.search(r"\b(?:revoke|withdraw|cancel)\b", directed, re.IGNORECASE):
+            _PENDING_PUBLICATIONS.revoke_session(
+                session_id=session_id,
+                authenticated_identity=str(getattr(agent, "_user_id", None) or session_id),
+            )
+        return None
     if state not in {
         TournamentIntentState.PUBLIC_FACING_DRAFT,
         TournamentIntentState.PUBLICATION_REQUEST,
         TournamentIntentState.MIXED_PUBLICATION,
     }:
         return None
-    session_id = str(getattr(agent, "session_id", "") or "")
     contract = TournamentIntentContract(
         state=state,
         task_id=str(task_id),
@@ -590,34 +769,42 @@ def begin_tournament_intent_contract(
         entrypoint="direct_public",
         actor_identity=str(getattr(agent, "_user_id", None) or session_id),
         intents=intents,
+        external_publication_sink=_publication_sink_from_message(message),
     )
+    contract.pending_publication = pending_context
     try:
         from tools.registry import registry
         from tools.tournament_truth_gate_tool import TOURNAMENT_TRUTH_GATE_SCHEMA
+        from tools.tournament_source_capture_tool import TOURNAMENT_SOURCE_CAPTURE_SCHEMA
 
         if registry.get_entry("tournament_truth_gate") is None:
             contract.preflight_error = "truth_gate_unavailable"
     except Exception:
         contract.preflight_error = "truth_gate_unavailable"
-        TOURNAMENT_TRUTH_GATE_SCHEMA = None
+        TOURNAMENT_TRUTH_GATE_SCHEMA = TOURNAMENT_SOURCE_CAPTURE_SCHEMA = None
     tools = getattr(agent, "tools", None)
     valid_names = getattr(agent, "valid_tool_names", None)
     if not isinstance(tools, list) or not isinstance(valid_names, (set, list)):
         contract.preflight_error = contract.preflight_error or "truth_gate_not_in_model_request"
     elif not contract.preflight_error:
-        if not any(
-            tool.get("function", {}).get("name") == "tournament_truth_gate"
-            for tool in tools
-        ):
-            tools.append({"type": "function", "function": TOURNAMENT_TRUTH_GATE_SCHEMA})
-            contract.added_tool_schema = True
+        for schema in (TOURNAMENT_TRUTH_GATE_SCHEMA, TOURNAMENT_SOURCE_CAPTURE_SCHEMA):
+            name = schema.get("name") if isinstance(schema, Mapping) else ""
+            if name and not any(tool.get("function", {}).get("name") == name for tool in tools):
+                tools.append({"type": "function", "function": schema})
+                contract.added_tool_schema = True
+                contract.added_tool_schemas.add(name)
         if isinstance(valid_names, set):
-            if "tournament_truth_gate" not in valid_names:
-                valid_names.add("tournament_truth_gate")
-                contract.added_valid_tool_name = True
-        elif "tournament_truth_gate" not in valid_names:
-            valid_names.append("tournament_truth_gate")
-            contract.added_valid_tool_name = True
+            for name in ("tournament_truth_gate", "tournament_source_capture"):
+                if name not in valid_names:
+                    valid_names.add(name)
+                    contract.added_valid_tool_name = True
+                    contract.added_valid_tool_names.add(name)
+        else:
+            for name in ("tournament_truth_gate", "tournament_source_capture"):
+                if name not in valid_names:
+                    valid_names.append(name)
+                    contract.added_valid_tool_name = True
+                    contract.added_valid_tool_names.add(name)
         if not any(
             tool.get("function", {}).get("name") == "tournament_truth_gate"
             for tool in tools
@@ -650,6 +837,99 @@ def begin_tournament_intent_contract(
 def active_contract(task_id: str, session_id: str) -> TournamentIntentContract | None:
     with _CONTRACTS_LOCK:
         return _CONTRACTS.get((str(task_id), str(session_id)))
+
+
+def prepare_tournament_publication(
+    contract: TournamentIntentContract,
+    *,
+    candidate: str,
+    destination: str,
+    idempotency_key: str,
+) -> PendingPublicationPacket:
+    """Freeze the exact, receipt-bound external action for separate approval.
+
+    This creates no delivery side effect and deliberately cannot accept prose as
+    approval.  The gateway must later supply authenticated identity and every
+    bound field to :func:`intake_authenticated_tournament_release_approval`.
+    """
+    if contract.closed or contract.state not in {
+        TournamentIntentState.PUBLICATION_REQUEST,
+        TournamentIntentState.MIXED_PUBLICATION,
+    }:
+        raise ValueError("publication contract is not active")
+    receipt = contract.verify_receipt(candidate)
+    if not receipt.allowed:
+        raise ValueError(f"cannot prepare publication without exact receipt: {receipt.code}")
+    if not destination or destination == contract.destination:
+        raise ValueError("external publication sink must be explicit and distinct from private delivery")
+    if not contract.test_receipt:
+        try:
+            from tools.tournament_truth_gate_tool import validate_tournament_publication_sink
+
+            accepted, code = validate_tournament_publication_sink(
+                contract, candidate, destination
+            )
+        except Exception as exc:
+            raise ValueError("publication sink truth validator unavailable") from exc
+        if not accepted:
+            raise ValueError(f"publication sink truth revalidation failed: {code}")
+    packet = PendingPublicationPacket(
+        task_id=contract.task_id,
+        session_id=contract.session_id,
+        destination=destination,
+        candidate_sha256=contract.candidate_sha256(candidate),
+        actor_identity=contract.actor_identity,
+        idempotency_key=idempotency_key,
+        expires_at=contract.receipt_expires_at or datetime.now(timezone.utc),
+        action_tool="send_message",
+        private_delivery_surface=contract.destination,
+        external_publication_sink=destination,
+    )
+    contract.pending_publication = _PENDING_PUBLICATIONS.prepare(packet)
+    return contract.pending_publication
+
+
+def intake_authenticated_tournament_release_approval(
+    *,
+    task_id: str,
+    session_id: str,
+    destination: str,
+    candidate_sha256: str,
+    authenticated_identity: str,
+    idempotency_key: str,
+    pending_action_id: str,
+    packet_checksum: str,
+) -> ContractDecision:
+    """Record a gateway-authenticated exact approval without dispatching it."""
+    result = _PENDING_PUBLICATIONS.approve_current(
+        ReleaseApprovalIntake(
+            task_id=task_id,
+            session_id=session_id,
+            destination=destination,
+            candidate_sha256=candidate_sha256,
+            authenticated_identity=authenticated_identity,
+            idempotency_key=idempotency_key,
+            pending_action_id=pending_action_id,
+            packet_checksum=packet_checksum,
+        )
+    )
+    if not result.accepted or result.packet is None:
+        return ContractDecision(False, result.code)
+    contract = active_contract(task_id, session_id)
+    if contract is None or contract.closed:
+        return ContractDecision(True, "release_approval_recorded")
+    contract.pending_publication = result.packet
+    attached = contract.attach_release_approval(
+        TournamentReleaseApproval(
+            destination=result.packet.destination,
+            candidate_sha256=result.packet.candidate_sha256,
+            identity=result.packet.actor_identity,
+            expires_at=result.packet.expires_at,
+            idempotency_key=result.packet.idempotency_key,
+        ),
+        packet=result.packet,
+    )
+    return ContractDecision(attached, "release_approval_recorded" if attached else "release_approval_attach_failed")
 
 
 def clear_tournament_intent_contract(agent: Any) -> None:
@@ -857,7 +1137,26 @@ def finalize_tournament_output(
     decision = contract.verify_receipt(candidate_text)
     if decision.allowed:
         if contract.state is TournamentIntentState.PUBLICATION_REQUEST and contract.release_state != "consumed":
-            response = f"PREPARED_NOT_RELEASED\n\n{candidate_text}"
+            try:
+                packet = contract.pending_publication or prepare_tournament_publication(
+                    contract,
+                    candidate=candidate_text,
+                    destination=contract.external_publication_sink,
+                    idempotency_key=f"tournament-{contract.nonce}",
+                )
+                response = (
+                    "PREPARED_NOT_RELEASED\n\n"
+                    f"{candidate_text}\n\n"
+                    f"Pending action: {packet.pending_action_id}\n"
+                    f"Checksum: {packet.checksum()}\n"
+                    f"Destination: {packet.external_publication_sink}\n"
+                    "Approve only this exact unexpired packet through the authenticated approval response."
+                )
+            except ValueError as exc:
+                response = (
+                    "PUBLICATION_PREPARATION_HOLD\n\n"
+                    f"Code: publication_packet_not_prepared\nSafe recovery: {exc}"
+                )
             code = "release_approval_required"
             _replace_current_turn(messages, response)
             telemetry = contract.telemetry(accepted=False, code=code, candidate=candidate_text)
@@ -865,6 +1164,18 @@ def finalize_tournament_output(
             contract.cleanup(agent)
             agent._tournament_intent_contract = None
             return response, telemetry, False
+        if (
+            delivery_response is not None
+            and not delivery_response.startswith("MEDIA:")
+            and contract.candidate_sha256(delivery_response) != contract.candidate_sha256(candidate_text)
+        ):
+            response = "Public tournament copy was not released because final delivery bytes changed after verification. No external action was taken."
+            _replace_current_turn(messages, response)
+            telemetry = contract.telemetry(accepted=False, code="candidate_bytes_mismatch", candidate=candidate_text)
+            contract.persist_final_bytes()
+            contract.cleanup(agent)
+            agent._tournament_intent_contract = None
+            return response, telemetry, True
         contract.receipt_used = True
         response = delivery_response or candidate_text
         _replace_current_turn(messages, response)
@@ -882,10 +1193,17 @@ def finalize_tournament_output(
     ):
         decision = ContractDecision(False, "receipt_and_release_approval_required")
     recovery = _receipt_failure_recovery(decision.code)
-    response = (
-        "Public tournament copy was not released because source verification failed. "
-        f"No external action was taken. Safe recovery: {recovery}."
-    )
+    if contract.state is TournamentIntentState.PUBLIC_FACING_DRAFT:
+        response = (
+            "DRAFT_VALIDATION_HOLD\n\n"
+            f"Code: {decision.code}\n"
+            f"Only the unsupported claim-bearing draft was withheld. Safe recovery: {recovery}."
+        )
+    else:
+        response = (
+            "Publication was not attempted because its required truth authority is invalid. "
+            f"Code: {decision.code}. Safe recovery: {recovery}."
+        )
     _replace_current_turn(messages, response)
     telemetry = contract.telemetry(accepted=False, code=decision.code, candidate=candidate_text)
     contract.persist_final_bytes()
@@ -916,6 +1234,21 @@ def _destination_from_args(args: Mapping[str, Any]) -> str:
         value = args.get(key)
         if isinstance(value, (str, int)) and str(value):
             return str(value)
+    return ""
+
+
+def _publication_sink_from_message(message: object) -> str:
+    if not isinstance(message, str):
+        return ""
+    lowered = message.casefold()
+    if "instagram" in lowered:
+        return "instagram:sportfish-hub" if "sportfish hub" in lowered else "instagram:unspecified"
+    if "facebook" in lowered:
+        return "facebook:unspecified"
+    if "newsletter" in lowered:
+        return "newsletter:unspecified"
+    if "website" in lowered or "cms" in lowered:
+        return "cms:unspecified"
     return ""
 
 

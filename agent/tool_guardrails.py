@@ -56,6 +56,7 @@ MUTATING_TOOL_NAMES = frozenset(
         "browser_scroll",
         "browser_navigate",
         "send_message",
+        "tournament_source_capture",
         "cronjob",
         "delegate_task",
         "process",
@@ -397,6 +398,7 @@ class ToolCallGuardrailController:
         result: str | None,
         *,
         failed: bool | None = None,
+        no_dispatch_proven: bool = False,
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
@@ -405,14 +407,9 @@ class ToolCallGuardrailController:
 
         contract = self._tournament_contract
         if contract is not None and getattr(contract, "release_state", "") == "in_flight":
-            result_text = str(result or "").lower()
-            ambiguous = bool(
-                failed
-                and any(
-                    token in result_text
-                    for token in ("timeout", "timed out", "ambiguous", "unknown outcome")
-                )
-            )
+            # Once a provider-facing call entered the in-flight state, any
+            # reported failure is ambiguous unless a caller proves no dispatch.
+            ambiguous = bool(failed and not no_dispatch_proven)
             try:
                 contract.record_external_result(success=not failed, ambiguous=ambiguous)
             except Exception:
