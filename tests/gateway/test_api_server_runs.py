@@ -90,7 +90,7 @@ def _make_slow_agent(**kwargs):
 
     mock_agent.interrupt = MagicMock(side_effect=_do_interrupt)
 
-    def _slow_run(user_message=None, conversation_history=None, task_id=None):
+    def _slow_run(user_message=None, conversation_history=None, task_id=None, **kwargs):
         ready.set()
         # Block until interrupt() is called
         interrupted.wait(timeout=10)

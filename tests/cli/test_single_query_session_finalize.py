@@ -205,7 +205,7 @@ def test_quiet_single_query_main_finalizes_while_preserving_exit_code(monkeypatc
 
     import cli as cli_mod
 
-    def run_conversation(*, user_message, conversation_history):
+    def run_conversation(*, user_message, conversation_history, **kwargs):
         calls.append(("run", user_message, conversation_history))
         return {
             "final_response": "",

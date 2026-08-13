@@ -1,0 +1,49 @@
+name: Tournament artifact boundary
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+
+permissions:
+  contents: read
+
+concurrency:
+  group: tournament-boundary-${{ github.ref }}
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
+
+jobs:
+  tournament-boundary:
+    name: Tournament artifact boundary
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@de0fac2e4500dabe0009e67214ff5f5447ce83dd # v6.0.2
+
+      - name: Install uv
+        uses: astral-sh/setup-uv@fac544c07dec837d0ccb6301d7b5580bf5edae39 # 8.2.0
+        with:
+          version: "0.11.29"
+          enable-cache: true
+          cache-dependency-glob: |
+            pyproject.toml
+            uv.lock
+
+      - name: Set up Python 3.11
+        run: uv python install 3.11
+
+      - name: Install locked dependencies
+        run: uv sync --locked --python 3.11 --extra dev
+
+      - name: Run provider-free tournament boundary suite
+        run: |
+          source .venv/bin/activate
+          python -m pytest -q \
+            tests/agent/test_tournament_boundary_self_test.py \
+            tests/agent/test_tournament_intent_contract.py \
+            tests/run_agent/test_tournament_research_runtime.py
+        env:
+          OPENROUTER_API_KEY: ""
+          OPENAI_API_KEY: ""
+          NOUS_API_KEY: ""

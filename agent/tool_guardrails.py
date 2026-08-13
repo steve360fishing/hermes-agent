@@ -56,6 +56,7 @@ MUTATING_TOOL_NAMES = frozenset(
         "browser_scroll",
         "browser_navigate",
         "send_message",
+        "tournament_source_capture",
         "cronjob",
         "delegate_task",
         "process",
@@ -241,23 +242,46 @@ class ToolCallGuardrailController:
         """Bind the active request-local tournament safety contract."""
         self._tournament_contract = contract
 
-    def _tournament_preflight(self, tool_name: str, signature: ToolCallSignature) -> ToolGuardrailDecision | None:
+    def _tournament_preflight_args(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        signature: ToolCallSignature,
+    ) -> ToolGuardrailDecision | None:
         contract = self._tournament_contract
-        # Tournament verification never changes the ordinary tool policy.
-        return None
-        try:
-            authorized = bool(contract.has_valid_receipt())
-        except Exception:
-            authorized = False
-        # A receipt only authorizes final text release. It never opens a
-        # mutable/provider/public tool lane during a protected turn.
-        if tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
+        if contract is None:
             return None
+        try:
+            authorization = contract.authorize_tool(tool_name, _coerce_args(args))
+        except Exception:
+            authorization = None
+        if authorization is not None and authorization.allowed:
+            return None
+        action = "block" if getattr(authorization, "halt", False) else "deny"
         return ToolGuardrailDecision(
-            action="deny", code="tournament_verification_advisory",
-            message="Tournament verification is advisory-only and does not restrict this tool.",
-            tool_name=tool_name, signature=signature,
+            action=action,
+            code=getattr(authorization, "code", "tournament_contract_unavailable"),
+            message=getattr(
+                authorization,
+                "message",
+                "The request-local tournament authority contract could not authorize this tool.",
+            ),
+            tool_name=tool_name,
+            signature=signature,
         )
+
+    def _tournament_bypasses_task_contract(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+    ) -> bool:
+        contract = self._tournament_contract
+        if contract is None:
+            return False
+        try:
+            return bool(contract.bypasses_task_contract(tool_name, _coerce_args(args)))
+        except Exception:
+            return False
 
     def bound_result(self, result: str | None) -> str:
         if self._execution_contract is None:
@@ -271,9 +295,11 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         """Apply request-local shape checks before tool middleware."""
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        tournament_decision = self._tournament_preflight(tool_name, signature)
+        tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
+        if self._tournament_bypasses_task_contract(tool_name, args):
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         if self._execution_contract is None:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         authorization = self._execution_contract.preflight_tool(tool_name, _coerce_args(args))
@@ -304,10 +330,11 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        tournament_decision = self._tournament_preflight(tool_name, signature)
+        tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
-        if self._execution_contract is not None:
+        bypasses_task_contract = self._tournament_bypasses_task_contract(tool_name, args)
+        if self._execution_contract is not None and not bypasses_task_contract:
             authorization = self._execution_contract.before_tool(tool_name, _coerce_args(args))
             if not authorization.allowed:
                 action = "block" if authorization.halt else "deny"
@@ -371,11 +398,25 @@ class ToolCallGuardrailController:
         result: str | None,
         *,
         failed: bool | None = None,
+        no_dispatch_proven: bool = False,
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        contract = self._tournament_contract
+        if contract is not None and getattr(contract, "release_state", "") == "in_flight":
+            # Once a provider-facing call entered the in-flight state, any
+            # reported failure is ambiguous unless a caller proves no dispatch.
+            ambiguous = bool(failed and not no_dispatch_proven)
+            try:
+                contract.record_external_result(success=not failed, ambiguous=ambiguous)
+            except Exception:
+                contract.release_state = "ambiguous"
+                approval = getattr(contract, "release_approval", None)
+                if approval is not None:
+                    approval.state = "ambiguous"
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1

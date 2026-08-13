@@ -4677,10 +4677,13 @@ class APIServerAdapter(BasePlatformAdapter):
                     if agent_ref is not None:
                         agent_ref[0] = agent
                     effective_task_id = session_id or str(uuid.uuid4())
+                    from agent.turn_origin import TurnProvenance
+
                     result = agent.run_conversation(
                         user_message=user_message,
                         conversation_history=conversation_history,
                         task_id=effective_task_id,
+                        turn_provenance=TurnProvenance.unknown(),
                     )
                     usage = {
                         "input_tokens": getattr(agent, "session_prompt_tokens", 0) or 0,
@@ -4976,10 +4979,13 @@ class APIServerAdapter(BasePlatformAdapter):
                                 session_key=approval_session_key,
                             )
                             register_gateway_notify(approval_session_key, _approval_notify)
+                            from agent.turn_origin import TurnProvenance
+
                             r = agent.run_conversation(
                                 user_message=user_message,
                                 conversation_history=conversation_history,
                                 task_id=effective_task_id,
+                                turn_provenance=TurnProvenance.unknown(),
                             )
                         finally:
                             try:

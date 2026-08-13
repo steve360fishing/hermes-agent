@@ -281,6 +281,7 @@ def build_turn_context(
     stream_callback,
     persist_user_message: Optional[Any],
     persist_user_timestamp: Optional[float] = None,
+    turn_provenance=None,
     task_execution_contract: TaskExecutionContract | None = None,
     *,
     restore_or_build_system_prompt,
@@ -479,6 +480,9 @@ def build_turn_context(
             task_execution_contract.lane,
             task_execution_contract._expired_artifact_history_messages,
         )
+    from agent.turn_origin import coerce_turn_provenance
+
+    turn_provenance = coerce_turn_provenance(turn_provenance)
     if (
         task_execution_contract.lane == ARTIFACT_ONLY
         or task_execution_contract._expired_artifact_history_messages
@@ -507,6 +511,13 @@ def build_turn_context(
         user_msg = {"role": "user", "content": user_message}
         if isinstance(pending_cli_message, dict):
             agent._pending_cli_user_message = None
+    # Preserve the historical in-memory message shape for callers that have
+    # no trusted provenance. Missing metadata is interpreted as UNKNOWN at
+    # every authority boundary; only meaningful runtime-minted provenance is
+    # persisted on the user row.
+    if turn_provenance.origin.value != "unknown":
+        user_msg["turn_origin"] = turn_provenance.origin.value
+        user_msg["turn_actor_identity"] = turn_provenance.actor_identity
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():

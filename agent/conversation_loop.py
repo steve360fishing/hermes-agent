@@ -587,35 +587,55 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
 def _effective_request_system_prompt(agent, base_prompt: str) -> str:
     """Append volatile operator guidance, then the request-local contract."""
     from agent.task_execution_contract import effective_request_system_prompt
+    from agent.tournament_intent_contract import effective_request_system_prompt as tournament_prompt
 
-    return effective_request_system_prompt(agent, base_prompt)
+    return tournament_prompt(agent, effective_request_system_prompt(agent, base_prompt))
+
+
+_TOURNAMENT_TURN_LOCK_INIT = threading.Lock()
 
 
 def _clear_request_contract_after_turn(func):
     @wraps(func)
     def wrapper(agent, *args, **kwargs):
+        # Tournament contracts temporarily bind shared callbacks, persistence,
+        # schemas, and guardrails.  One agent therefore executes one such turn
+        # at a time; the contract token remains the ownership check below.
+        turn_lock = getattr(agent, "_tournament_turn_lock", None)
+        if turn_lock is None:
+            with _TOURNAMENT_TURN_LOCK_INIT:
+                turn_lock = getattr(agent, "_tournament_turn_lock", None)
+                if turn_lock is None:
+                    turn_lock = threading.RLock()
+                    agent._tournament_turn_lock = turn_lock
+        turn_lock.acquire()
         try:
-            return func(agent, *args, **kwargs)
-        finally:
             try:
-                rescue_client = getattr(agent, "_rescue_telemetry_client", None)
-                turn_id = getattr(agent, "_current_turn_id", None)
-                if rescue_client is not None and turn_id:
-                    import uuid
+                return func(agent, *args, **kwargs)
+            finally:
+                try:
+                    rescue_client = getattr(agent, "_rescue_telemetry_client", None)
+                    turn_id = getattr(agent, "_current_turn_id", None)
+                    if rescue_client is not None and turn_id:
+                        import uuid
 
-                    rescue_client.emit(
-                        {
-                            "event": "turn_end",
-                            "event_id": uuid.uuid4().hex,
-                            "turn_id": turn_id,
-                        }
-                    )
-            except Exception:
-                # A missing end event leaves the reporter-owned turn active,
-                # which blocks restart. Do not discard the user's response.
-                logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
-            from agent.task_execution_contract import clear_task_execution_contract
-            clear_task_execution_contract(agent)
+                        rescue_client.emit(
+                            {
+                                "event": "turn_end",
+                                "event_id": uuid.uuid4().hex,
+                                "turn_id": turn_id,
+                            }
+                        )
+                except Exception:
+                    # A missing end event leaves the reporter-owned turn active,
+                    # which blocks restart. Do not discard the user's response.
+                    logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
+                from agent.task_execution_contract import clear_task_execution_contract
+                clear_task_execution_contract(agent)
+                from agent.tournament_intent_contract import clear_tournament_intent_contract
+                clear_tournament_intent_contract(agent)
+        finally:
+            turn_lock.release()
 
     return wrapper
 
@@ -631,6 +651,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_provenance=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -666,6 +687,29 @@ def run_conversation(
         except Exception:
             pass
 
+    # Clear any request-local authority left by an interrupted prior turn.
+    from agent.tournament_intent_contract import (
+        begin_tournament_intent_contract,
+        clear_tournament_intent_contract,
+        preflight_failure_response,
+    )
+
+    if not clear_tournament_intent_contract(agent):
+        response = (
+            "The prior request's private delivery safeguards could not be fully restored. "
+            "This turn was not processed, and no external action was taken. Please retry."
+        )
+        return {
+            "final_response": response,
+            "messages": [{"role": "assistant", "content": response}],
+            "api_calls": 0,
+            "completed": False,
+            "failed": True,
+            "partial": False,
+            "interrupted": False,
+            "turn_exit_reason": "tournament_cleanup_incomplete",
+        }
+
     # Resolve file-artifact policy before any context compression, plugin, or
     # provider work. A contradictory destination must fail without invoking a
     # model or leaving a reduced-capability contract attached to the session.
@@ -679,11 +723,50 @@ def run_conversation(
     _contract_message = (
         persist_user_message if persist_user_message is not None else user_message
     )
+    from agent.turn_origin import coerce_turn_provenance
+
+    turn_provenance = coerce_turn_provenance(turn_provenance)
+    _tournament_contract = begin_tournament_intent_contract(
+        agent,
+        message=_contract_message,
+        task_id=task_id,
+        stream_callback=stream_callback,
+        turn_provenance=turn_provenance,
+    )
+    if _tournament_contract is not None:
+        stream_callback = _tournament_contract.buffer_callback
+        if _tournament_contract.preflight_error:
+            response = preflight_failure_response(_tournament_contract.preflight_error)
+            safe_messages = [
+                {"role": "user", "content": str(_contract_message)},
+                {"role": "assistant", "content": response},
+            ]
+            _tournament_contract.pending_persistence = (safe_messages, None)
+            _tournament_contract.persist_final_bytes()
+            return {
+                "final_response": response,
+                "messages": safe_messages,
+                "api_calls": 0,
+                "completed": False,
+                "failed": True,
+                "partial": False,
+                "interrupted": False,
+                "turn_exit_reason": _tournament_contract.preflight_error,
+                "tournament_intent": _tournament_contract.telemetry(
+                    accepted=False,
+                    code=_tournament_contract.preflight_error,
+                    candidate="",
+                ),
+                "model": getattr(agent, "model", ""),
+                "provider": getattr(agent, "provider", ""),
+            }
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,
         platform=getattr(agent, "platform", None),
         conversation_history=conversation_history,
+        tournament_state=getattr(_tournament_contract, "state", None),
+        tournament_intents=getattr(_tournament_contract, "intents", None),
     )
     if _prebuilt_task_contract.preflight_error:
         _preflight_response = (
@@ -729,6 +812,7 @@ def run_conversation(
             stream_callback,
             persist_user_message,
             persist_user_timestamp,
+            turn_provenance,
             task_execution_contract=_prebuilt_task_contract,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
@@ -989,6 +1073,10 @@ def run_conversation(
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
+            # Durable turn provenance is internal authority metadata, never a
+            # provider message field.  Strict chat APIs reject unknown keys.
+            api_msg.pop("turn_origin", None)
+            api_msg.pop("turn_actor_identity", None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks

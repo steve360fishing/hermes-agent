@@ -910,6 +910,14 @@ def execute_tool_calls_concurrent(agent, assistant_message, messages: list, effe
                     function_result,
                     failed=is_error,
                 )
+            else:
+                function_result = agent._append_guardrail_observation(
+                    function_name,
+                    function_args,
+                    function_result,
+                    failed=True,
+                    no_dispatch_proven=True,
+                )
 
             if is_error:
                 _err_text = _multimodal_text_summary(function_result)
@@ -1628,6 +1636,14 @@ def execute_tool_calls_sequential(agent, assistant_message, messages: list, effe
             )
             result_preview = function_result if agent.verbose_logging else (
                 function_result[:200] if len(function_result) > 200 else function_result
+            )
+        else:
+            function_result = agent._append_guardrail_observation(
+                function_name,
+                function_args,
+                function_result,
+                failed=True,
+                no_dispatch_proven=True,
             )
         if _is_error_result:
             logger.warning("Tool %s returned error (%.2fs): %s", function_name, tool_duration, result_preview)

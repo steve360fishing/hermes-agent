@@ -83,6 +83,29 @@ def _is_model_free_recovery_command(event: Any) -> bool:
         _MODEL_FREE_RECOVERY_COMMANDS
     )
 
+
+def _mint_gateway_turn_provenance(event: Any, source: Any, *, is_internal: bool):
+    """Mint authority after gateway auth; never trust event text or metadata."""
+    from agent.turn_origin import TurnOrigin, TurnProvenance
+
+    if is_internal:
+        trusted = getattr(event, "_trusted_turn_provenance", None)
+        if (
+            isinstance(trusted, TurnProvenance)
+            and not trusted.is_authenticated_direct_user
+        ):
+            return trusted
+        return TurnProvenance.internal(TurnOrigin.RUNTIME_ASYNC_COMPLETION)
+    replayed = getattr(event, "_trusted_turn_provenance", None)
+    if (
+        isinstance(replayed, TurnProvenance)
+        and replayed.origin is TurnOrigin.REPLAYED_PERSISTED_CONTENT
+    ):
+        return replayed
+    return TurnProvenance.authenticated_direct_user(
+        getattr(source, "user_id", None)
+    )
+
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
     r"("  # transient/auxiliary status that should stay in logs, not gateway chats
     r"auxiliary\s+.+\s+failed"
@@ -10325,6 +10348,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     self.pairing_store._record_rate_limit(platform_name, source.user_id)
             return None
 
+        _turn_provenance = _mint_gateway_turn_provenance(
+            event, source, is_internal=is_internal
+        )
+        event._trusted_turn_provenance = _turn_provenance
+
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
         # forwarded it to the user; now the user's reply goes back via
@@ -13162,6 +13190,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 moa_config=getattr(event, "_moa_config", None),
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_provenance=getattr(event, "_trusted_turn_provenance", None),
             )
 
             # Stop persistent typing indicator now that the agent is done.
@@ -14445,6 +14474,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     source=source,
                     message_id=None,
                     channel_prompt=None,
+                    internal=True,
+                )
+                from agent.turn_origin import TurnOrigin, TurnProvenance
+
+                cont_event._trusted_turn_provenance = TurnProvenance.internal(
+                    TurnOrigin.GOAL_MODE_CONTINUATION
                 )
                 self._enqueue_fifo(_quick_key, cont_event, adapter)
         except Exception as exc:
@@ -15114,9 +15149,14 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 )
                 _apply_pre_agent_route_provenance(agent, turn_route)
                 try:
+                    from agent.turn_origin import TurnOrigin, TurnProvenance
+
                     result = agent.run_conversation(
                         user_message=enriched_prompt,
                         task_id=task_id,
+                        turn_provenance=TurnProvenance.internal(
+                            TurnOrigin.RUNTIME_ASYNC_COMPLETION
+                        ),
                     )
                     _apply_openrouter_fallback_notice_to_result(agent, result)
                     return result
@@ -19118,6 +19158,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        turn_provenance=None,
     ) -> Dict[str, Any]:
         """Profile-scoping wrapper around the agent run.
 
@@ -19136,6 +19177,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_provenance=turn_provenance,
             )
 
         profile_home = self._resolve_profile_home_for_source(source)
@@ -19147,6 +19189,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 channel_prompt=channel_prompt, moa_config=moa_config,
                 persist_user_message=persist_user_message,
                 persist_user_timestamp=persist_user_timestamp,
+                turn_provenance=turn_provenance,
             )
 
     def _profile_name_for_source(self, source: SessionSource) -> Optional[str]:
@@ -19268,6 +19311,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         moa_config: Optional[dict] = None,
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
+        turn_provenance=None,
     ) -> Dict[str, Any]:
         """
         Run the agent with the given message and context.
@@ -21332,7 +21376,9 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     }
                 else:
                     result = agent.run_conversation(
-                        _api_run_message, **_conversation_kwargs
+                        _api_run_message,
+                        turn_provenance=turn_provenance,
+                        **_conversation_kwargs,
                     )
             finally:
                 unregister_gateway_notify(_approval_session_key)
@@ -22422,6 +22468,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
+                    turn_provenance=__import__(
+                        "agent.turn_origin", fromlist=["TurnProvenance"]
+                    ).TurnProvenance.authenticated_direct_user(
+                        getattr(next_source, "user_id", None)
+                    ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)
         finally:

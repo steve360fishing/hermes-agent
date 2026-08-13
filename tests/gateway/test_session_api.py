@@ -89,7 +89,7 @@ async def test_run_agent_binds_api_session_context_for_tool_env(adapter, monkeyp
         def __init__(self, session_id: str):
             self.session_id = session_id
 
-        def run_conversation(self, user_message, conversation_history, task_id):
+        def run_conversation(self, user_message, conversation_history, task_id, **kwargs):
             from gateway.session_context import get_session_env
             from tools.environments.local import _make_run_env
 

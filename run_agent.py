@@ -2066,6 +2066,8 @@ class AIAgent:
                     codex_message_items=msg.get("codex_message_items") if role == "assistant" else None,
                     timestamp=_row_timestamp,
                     api_content=_row_api_content,
+                    turn_origin=msg.get("turn_origin"),
+                    turn_actor_identity=msg.get("turn_actor_identity"),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
@@ -6192,6 +6194,7 @@ class AIAgent:
         function_result: str,
         *,
         failed: bool,
+        no_dispatch_proven: bool = False,
     ) -> str:
         function_result = self._tool_guardrails.bound_result(function_result)
         decision = self._tool_guardrails.after_call(
@@ -6199,6 +6202,7 @@ class AIAgent:
             function_args,
             function_result,
             failed=failed,
+            no_dispatch_proven=no_dispatch_proven,
         )
         if decision.action in {"warn", "halt"}:
             function_result = append_toolguard_guidance(function_result, decision)
@@ -6387,6 +6391,7 @@ class AIAgent:
         persist_user_message: Optional[Any] = None,
         persist_user_timestamp: Optional[float] = None,
         moa_config: Optional[dict[str, Any]] = None,
+        turn_provenance=None,
     ) -> Dict[str, Any]:
         """Forwarder — see ``agent.conversation_loop.run_conversation``."""
         from agent.aux_accounting import (
@@ -6429,6 +6434,7 @@ class AIAgent:
                     persist_user_message,
                     persist_user_timestamp=persist_user_timestamp,
                     moa_config=moa_config,
+                    turn_provenance=turn_provenance,
                 )
             finally:
                 reset_accounting_context(acct_token)

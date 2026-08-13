@@ -30,6 +30,7 @@ class _CapturingAgent:
         task_id=None,
         persist_user_message=None,
         persist_user_timestamp=None,
+        **kwargs,
     ):
         type(self).last_run = {
             "user_message": user_message,
