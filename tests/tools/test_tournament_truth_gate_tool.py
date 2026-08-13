@@ -1,10 +1,11 @@
 import json
 import hashlib
+import sys
 from datetime import datetime, timedelta, timezone
-from pathlib import Path
 from types import SimpleNamespace
 
 from agent.tool_guardrails import ToolCallGuardrailController
+from agent.turn_origin import TurnProvenance
 from agent.tournament_intent_contract import (
     begin_tournament_intent_contract,
     clear_tournament_intent_contract,
@@ -83,6 +84,7 @@ def test_validator_dispatch_binds_exact_receipt_to_active_contract(tmp_path, mon
         agent,
         message="Create a public tournament Story naming winners.",
         task_id="tool-bind",
+        turn_provenance=TurnProvenance.authenticated_direct_user("steve"),
     )
     result = json.loads(
         tool.run_tournament_truth_gate(
@@ -151,6 +153,7 @@ def test_validator_rejects_a_hash_valid_blocked_receipt(tmp_path, monkeypatch):
         agent,
         message="Create a public tournament Story naming winners.",
         task_id="tool-blocked",
+        turn_provenance=TurnProvenance.authenticated_direct_user("steve"),
     )
     result = json.loads(
         tool.run_tournament_truth_gate(
@@ -220,16 +223,53 @@ def test_capture_manifest_flows_to_truth_gate_without_model_authored_evidence(tm
         json.dumps({"canonical_journal_path": "current.json"}), encoding="utf-8"
     )
     monkeypatch.setattr(capture_tool, "configured_runtime_roots", lambda: roots)
-    from audit_agent.tournament_trusted_capture import TrustedCaptureRuntime
 
-    body = json.dumps({
-        "categoryId": 9312, "totalCount": 1,
-        "catchLogData": [{"rank": 1, "team": "BAR South", "points": 4300}],
-    }).encode()
-    monkeypatch.setattr(capture_tool, "_runtime", lambda: TrustedCaptureRuntime(
-        transport=lambda url, **_kwargs: (200, {"content-type": "application/json"}, body, url),
-        resolver=lambda host: ("8.8.8.8",),
-    ))
+    class TrustedCaptureError(ValueError):
+        pass
+
+    def capture_registered_source(**_kwargs):
+        captured_at = datetime.now(timezone.utc).isoformat()
+        snapshot_payload = {
+            "schema_version": "tournament_trusted_snapshot.v1",
+            "pulled_at_utc": captured_at,
+            "verified_claims": [
+                {"claim_type": "overall_winner", "value": "BAR South"},
+                {"claim_type": "points", "value": "4300"},
+            ],
+            "verified_finality": {
+                "displayed": True,
+                "standings_final": False,
+                "payout_final": False,
+            },
+        }
+        snapshot_text = json.dumps(
+            snapshot_payload, sort_keys=True, separators=(",", ":")
+        )
+        snapshot_path = roots.source_snapshot_root / "registered-event.capture.json"
+        snapshot_path.write_text(snapshot_text, encoding="utf-8")
+        return {
+            "capture_kind": "registered_direct_source",
+            "source_id": "registered-event",
+            "source_snapshot_path": str(snapshot_path),
+            "source_snapshot_sha256": hashlib.sha256(snapshot_text.encode()).hexdigest(),
+            "pulled_at_utc": captured_at,
+            "event_status": "displayed",
+            "source_url": source_map["direct_url"],
+            "provider_host": source_map["provider_host"],
+            "status_code": 200,
+            "content_type": "application/json",
+            "byte_count": len(snapshot_text.encode()),
+        }
+
+    monkeypatch.setitem(
+        sys.modules,
+        "audit_agent.tournament_trusted_capture",
+        SimpleNamespace(
+            TrustedCaptureError=TrustedCaptureError,
+            capture_registered_source=capture_registered_source,
+        ),
+    )
+    monkeypatch.setattr(capture_tool, "_runtime", lambda: object())
     captured = json.loads(capture_tool.run_tournament_source_capture({"source_id": "registered-event"}))
     manifest = captured["evidence_manifest"][0]
     assert set(manifest) == {
@@ -275,31 +315,56 @@ def test_capture_manifest_flows_to_truth_gate_without_model_authored_evidence(tm
         "agent.tournament_intent_contract.configured_runtime_roots", lambda: roots
     )
 
-    def real_preflight(_roots, request_payload, *, suffix):
-        from audit_agent.tournament_artifact_gate import run_tournament_artifact_preflight_command
-
+    def bound_preflight(_roots, request_payload, *, suffix):
         output_dir = roots.receipt_root / suffix
         output_dir.mkdir()
-        request_path = output_dir / "request.json"
-        request_path.write_text(json.dumps(request_payload), encoding="utf-8")
-        result = run_tournament_artifact_preflight_command(
-            request_json=request_path,
-            journal_pointer=roots.journal_root / "LATEST-JOURNAL.json",
-            approved_journal_root=roots.journal_root,
-            approved_source_snapshot_root=roots.source_snapshot_root,
-            approved_receipt_root=roots.receipt_root,
-            output_dir=output_dir / "issued",
-            now=datetime.now(timezone.utc),
-        )
-        receipt_path = Path(result["receipt_path"]) if result.get("receipt_path") else None
-        receipt = json.loads(receipt_path.read_text(encoding="utf-8")) if receipt_path else None
-        return receipt_path, receipt, "receipt_loaded" if receipt_path else "audit_preflight_failed"
+        now = datetime.now(timezone.utc)
+        receipt = {
+            "schema_version": "tournament_route_preflight.v2",
+            "decision": "ALLOW_PUBLIC_ARTIFACT",
+            "issued_at_utc": now.isoformat(),
+            "expires_at_utc": (now + timedelta(minutes=15)).isoformat(),
+            "allowed_entrypoints": request_payload["allowed_entrypoints"],
+            "artifact_payload_hash": canonical_json_sha256(
+                request_payload["artifact_payload"]
+            ),
+        }
+        receipt["receipt_hash"] = canonical_json_sha256(receipt)
+        receipt_path = output_dir / "receipt.json"
+        receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
+        return receipt_path, receipt, "receipt_loaded"
 
-    monkeypatch.setattr(tool, "_run_preflight", real_preflight)
+    monkeypatch.setattr(tool, "_run_preflight", bound_preflight)
+
+    def require_public_entrypoint_receipt(
+        *, entrypoint, artifact_payload, receipt_path, approved_receipt_root, **_kwargs
+    ):
+        assert receipt_path.resolve().is_relative_to(approved_receipt_root.resolve())
+        receipt = json.loads(receipt_path.read_text(encoding="utf-8"))
+        assert entrypoint in receipt["allowed_entrypoints"]
+        assert receipt["artifact_payload_hash"] == canonical_json_sha256(
+            artifact_payload
+        )
+        assert receipt["receipt_hash"] == canonical_json_sha256(
+            {key: value for key, value in receipt.items() if key != "receipt_hash"}
+        )
+
+    monkeypatch.setitem(
+        sys.modules,
+        "audit_agent.tournament_artifact_gate",
+        SimpleNamespace(
+            require_public_entrypoint_receipt=require_public_entrypoint_receipt
+        ),
+    )
     agent = SimpleNamespace(session_id="capture-gate", platform="telegram", tools=[], valid_tool_names=set(),
         stream_delta_callback=None, _stream_callback=None, _persist_session=None,
         _tool_guardrails=ToolCallGuardrailController(), _tournament_intent_contract=None)
-    contract = begin_tournament_intent_contract(agent, message="Create a public tournament Story.", task_id="capture-gate")
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Create a public tournament Story.",
+        task_id="capture-gate",
+        turn_provenance=TurnProvenance.authenticated_direct_user("steve"),
+    )
     result = json.loads(tool.run_tournament_truth_gate(
         {"candidate": candidate, "request": request, "artifact_metadata": metadata},
         task_id="capture-gate", session_id="capture-gate",

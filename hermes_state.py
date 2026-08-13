@@ -4939,15 +4939,16 @@ class SessionDB:
             msg = {"role": row["role"], "content": content}
             from agent.turn_origin import TurnProvenance
 
-            # Turn provenance belongs to inbound user turns.  Keep assistant
-            # and tool projection shapes provider-compatible; legacy or
-            # malformed user provenance still projects as fail-closed UNKNOWN.
-            if row["role"] == "user":
+            # Turn provenance belongs to inbound user turns. Preserve legacy
+            # projection shapes when no provenance was persisted; authority
+            # consumers coerce a missing or malformed value to UNKNOWN.
+            if row["role"] == "user" and row["turn_origin"]:
                 provenance = TurnProvenance.from_storage(
                     row["turn_origin"], row["turn_actor_identity"]
                 )
-                msg["turn_origin"] = provenance.origin.value
-                msg["turn_actor_identity"] = provenance.actor_identity
+                if provenance.origin.value != "unknown":
+                    msg["turn_origin"] = provenance.origin.value
+                    msg["turn_actor_identity"] = provenance.actor_identity
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay

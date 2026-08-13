@@ -920,8 +920,15 @@ class TestTurnOriginPersistence:
             turn_actor_identity=actor,
         )
         loaded = db.get_messages_as_conversation("origin-session")
-        assert loaded[0]["turn_origin"] == "unknown"
-        assert loaded[0]["turn_actor_identity"] == ""
+        assert "turn_origin" not in loaded[0]
+        assert "turn_actor_identity" not in loaded[0]
+        from agent.turn_origin import TurnOrigin, TurnProvenance
+
+        coerced = TurnProvenance.from_storage(
+            loaded[0].get("turn_origin"), loaded[0].get("turn_actor_identity")
+        )
+        assert coerced.origin is TurnOrigin.UNKNOWN
+        assert coerced.actor_identity == ""
 
     def test_origin_survives_restart_and_resume_projection(self, tmp_path):
         db_path = tmp_path / "origin-restart.db"

@@ -185,12 +185,7 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx, TurnContext)
     assert ctx.user_message == "hello"
     # The user turn was appended and indexed.
-    assert ctx.messages[-1] == {
-        "role": "user",
-        "content": "hello",
-        "turn_origin": "unknown",
-        "turn_actor_identity": "",
-    }
+    assert ctx.messages[-1] == {"role": "user", "content": "hello"}
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
 
@@ -289,8 +284,6 @@ def test_subsequent_normal_turn_filters_expired_artifact_history(
     assert ctx.messages == [{
         "role": "user",
         "content": "Continue the normal work.",
-        "turn_origin": "unknown",
-        "turn_actor_identity": "",
     }]
     assert "normal capabilities" in ctx.task_execution_contract.system_guidance
     assert (
