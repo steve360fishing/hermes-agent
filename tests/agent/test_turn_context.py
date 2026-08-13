@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+
+os.environ.setdefault("LOCALAPPDATA", tempfile.gettempdir())
+os.environ.setdefault("USERPROFILE", tempfile.gettempdir())
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -181,7 +185,12 @@ def test_returns_turn_context_with_user_message_appended():
     assert isinstance(ctx, TurnContext)
     assert ctx.user_message == "hello"
     # The user turn was appended and indexed.
-    assert ctx.messages[-1] == {"role": "user", "content": "hello"}
+    assert ctx.messages[-1] == {
+        "role": "user",
+        "content": "hello",
+        "turn_origin": "unknown",
+        "turn_actor_identity": "",
+    }
     assert ctx.current_turn_user_idx == len(ctx.messages) - 1
     assert ctx.active_system_prompt == "SYSTEM"
 
@@ -277,7 +286,12 @@ def test_subsequent_normal_turn_filters_expired_artifact_history(
             conversation_history=history,
         )
 
-    assert ctx.messages == [{"role": "user", "content": "Continue the normal work."}]
+    assert ctx.messages == [{
+        "role": "user",
+        "content": "Continue the normal work.",
+        "turn_origin": "unknown",
+        "turn_actor_identity": "",
+    }]
     assert "normal capabilities" in ctx.task_execution_contract.system_guidance
     assert (
         "artifact history elided: session=sess-1"

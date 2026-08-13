@@ -14,6 +14,7 @@ import threading
 import uuid
 
 from hermes_constants import get_hermes_home
+from agent.turn_origin import coerce_turn_provenance
 
 
 class ReleaseState(str, Enum):
@@ -172,9 +173,16 @@ class TournamentReleaseStore:
     def _available(self) -> bool:
         return not self._load_error
 
-    def prepare(self, packet: PendingPublicationPacket) -> PendingPublicationPacket:
+    @staticmethod
+    def _trusted_actor(provenance) -> str:
+        trusted = coerce_turn_provenance(provenance)
+        return trusted.actor_identity if trusted.is_authenticated_direct_user else ""
+
+    def prepare(self, packet: PendingPublicationPacket, *, provenance) -> PendingPublicationPacket:
         if not self._available():
             raise ValueError("release state unavailable")
+        if self._trusted_actor(provenance) != packet.actor_identity:
+            raise ValueError("authenticated publication actor required")
         if (
             not all(packet.binding())
             or packet.destination != packet.external_publication_sink
@@ -189,35 +197,43 @@ class TournamentReleaseStore:
             self._persist()
         return packet
 
-    def current(self, task_id: str, session_id: str) -> PendingPublicationPacket | None:
+    def current(self, task_id: str, session_id: str, *, provenance) -> PendingPublicationPacket | None:
         with self._lock:
-            return self._packets.get((str(task_id), str(session_id))) if self._available() else None
-
-    def current_action(self, pending_action_id: str, session_id: str) -> PendingPublicationPacket | None:
-        with self._lock:
-            if not self._available():
+            actor = self._trusted_actor(provenance)
+            packet = self._packets.get((str(task_id), str(session_id)))
+            if not self._available() or not actor or packet is None:
                 return None
-            return next((p for p in self._packets.values() if p.pending_action_id == pending_action_id and p.session_id == str(session_id)), None)
+            return packet if packet.actor_identity == actor else None
 
-    def current_for_session(self, session_id: str) -> PendingPublicationPacket | None:
+    def current_action(self, pending_action_id: str, session_id: str, *, provenance) -> PendingPublicationPacket | None:
+        with self._lock:
+            actor = self._trusted_actor(provenance)
+            if not self._available() or not actor:
+                return None
+            return next((p for p in self._packets.values() if p.pending_action_id == pending_action_id and p.session_id == str(session_id) and p.actor_identity == actor), None)
+
+    def current_for_session(self, session_id: str, *, provenance) -> PendingPublicationPacket | None:
         """Resolve only one live publication object; ambiguity fails closed."""
         now = datetime.now(timezone.utc)
         with self._lock:
-            if not self._available():
+            actor = self._trusted_actor(provenance)
+            if not self._available() or not actor:
                 return None
             current = [
                 packet for packet in self._packets.values()
                 if packet.session_id == str(session_id)
+                and packet.actor_identity == actor
                 and packet.expires_at > now
                 and packet.state in {ReleaseState.PREPARED, ReleaseState.APPROVED}
             ]
             return current[0] if len(current) == 1 else None
 
-    def revoke_session(self, *, session_id: str, authenticated_identity: str) -> int:
+    def revoke_session(self, *, session_id: str, authenticated_identity: str, provenance) -> int:
         """Cancel only non-dispatched packets owned by the authenticated actor."""
         changed = 0
         with self._lock:
-            if not self._available():
+            actor = self._trusted_actor(provenance)
+            if not self._available() or not actor or actor != str(authenticated_identity):
                 return 0
             for packet in self._packets.values():
                 if (
@@ -231,10 +247,11 @@ class TournamentReleaseStore:
                 self._persist()
         return changed
 
-    def approved_for(self, *, session_id: str, destination: str, candidate_sha256: str, identity: str, idempotency_key: str) -> PendingPublicationPacket | None:
+    def approved_for(self, *, session_id: str, destination: str, candidate_sha256: str, identity: str, idempotency_key: str, provenance) -> PendingPublicationPacket | None:
         expected = (destination, candidate_sha256, identity, idempotency_key)
         with self._lock:
-            if not self._available():
+            actor = self._trusted_actor(provenance)
+            if not self._available() or not actor or actor != str(identity):
                 return None
             for packet in self._packets.values():
                 if (
@@ -251,7 +268,10 @@ class TournamentReleaseStore:
                         return packet
         return None
 
-    def approve_current(self, intake: ReleaseApprovalIntake) -> ReleaseStateDecision:
+    def approve_current(self, intake: ReleaseApprovalIntake, *, provenance) -> ReleaseStateDecision:
+        actor = self._trusted_actor(provenance)
+        if not actor or actor != intake.authenticated_identity:
+            return ReleaseStateDecision(False, "approval_actor_unauthenticated")
         if not all((
             intake.destination, intake.candidate_sha256, intake.authenticated_identity,
             intake.idempotency_key, intake.pending_action_id, intake.packet_checksum,
@@ -260,7 +280,9 @@ class TournamentReleaseStore:
         with self._lock:
             if not self._available():
                 return ReleaseStateDecision(False, "release_state_unavailable")
-            packet = self.current_action(intake.pending_action_id, intake.session_id)
+            packet = self.current_action(
+                intake.pending_action_id, intake.session_id, provenance=provenance
+            )
             if packet is None:
                 return ReleaseStateDecision(False, "pending_publication_not_found")
             if packet.expires_at <= datetime.now(timezone.utc):
@@ -282,7 +304,7 @@ class TournamentReleaseStore:
             self._persist()
             return ReleaseStateDecision(True, "release_approval_recorded", packet)
 
-    def transition(self, packet: PendingPublicationPacket, *, expected: ReleaseState, target: ReleaseState) -> bool:
+    def transition(self, packet: PendingPublicationPacket, *, expected: ReleaseState, target: ReleaseState, provenance) -> bool:
         """Persist a monotonic dispatch outcome; mismatched/replayed state fails closed."""
         allowed = {
             ReleaseState.PREPARED: {ReleaseState.APPROVED, ReleaseState.FAILED_PRE_DISPATCH},
@@ -296,9 +318,13 @@ class TournamentReleaseStore:
             ReleaseState.AMBIGUOUS: set(),
         }
         with self._lock:
+            actor = self._trusted_actor(provenance)
             stored = self._packets.get((packet.task_id, packet.session_id))
             if (
                 not self._available()
+                or not actor
+                or stored is None
+                or stored.actor_identity != actor
                 or stored is not packet
                 or stored.state is not expected
                 or target not in allowed[expected]

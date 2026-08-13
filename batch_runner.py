@@ -346,7 +346,13 @@ def _process_single_prompt(
         )
 
         # Run the agent with task_id to ensure each task gets its own isolated VM
-        result = agent.run_conversation(prompt, task_id=task_id)
+        from agent.turn_origin import TurnOrigin, TurnProvenance
+
+        result = agent.run_conversation(
+            prompt,
+            task_id=task_id,
+            turn_provenance=TurnProvenance.internal(TurnOrigin.MODEL_GENERATED),
+        )
         
         # Extract tool usage statistics
         tool_stats = _extract_tool_stats(result["messages"])

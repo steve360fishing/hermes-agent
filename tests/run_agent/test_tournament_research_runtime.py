@@ -1,12 +1,18 @@
 """End-to-end conversation coverage for non-sticky tournament chat handling."""
 
 import json
+import os
 from pathlib import Path
 import shutil
+import tempfile
 from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
+os.environ.setdefault("LOCALAPPDATA", tempfile.gettempdir())
+os.environ.setdefault("USERPROFILE", tempfile.gettempdir())
+
 from run_agent import AIAgent
+from agent.turn_origin import TurnOrigin, TurnProvenance
 
 
 def _response(content):
@@ -51,6 +57,17 @@ def _agent():
     agent.compression_enabled = False
     agent.save_trajectories = False
     agent._disable_streaming = True
+    raw_run_conversation = agent.run_conversation
+
+    def authenticated_run_conversation(*args, **kwargs):
+        kwargs.setdefault(
+            "turn_provenance",
+            TurnProvenance.authenticated_direct_user("steve"),
+        )
+        return raw_run_conversation(*args, **kwargs)
+
+    agent._raw_run_conversation = raw_run_conversation
+    agent.run_conversation = authenticated_run_conversation
     return agent
 
 
@@ -63,7 +80,9 @@ def test_publication_request_fails_safely_and_next_turn_has_no_sticky_contract()
     agent._save_trajectory = lambda *_args: None
     agent._cleanup_task_resources = lambda *_args: None
 
-    first = agent.run_conversation("publish tournament standings")
+    first = agent.run_conversation(
+        "Publish this exact verified tournament caption to the SportFish Hub Instagram account now."
+    )
     provider_tools = agent.client.chat.completions.create.call_args_list[0].kwargs["tools"]
     assert any(
         tool.get("function", {}).get("name") == "tournament_truth_gate"
@@ -78,6 +97,42 @@ def test_publication_request_fails_safely_and_next_turn_has_no_sticky_contract()
     normal = agent.run_conversation("show me search results")
     assert normal["final_response"] == "normal answer"
     assert agent._tool_guardrails.before_call("terminal", {}).action == "allow"
+
+
+def test_runtime_async_completion_preserves_useful_output_without_tournament_finalizer():
+    fixture_path = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "tournament"
+        / "async_completion_origin_incident.json"
+    )
+    payload = json.loads(fixture_path.read_text(encoding="utf-8"))[
+        "canonical_redacted_payload"
+    ]
+    useful_response = (
+        "I preserved the private engineering report. Draft review never needs "
+        "publication approval, and blanket permanent approval grants no authority."
+    )
+    agent = _agent()
+    agent.client.chat.completions.create.return_value = _response(useful_response)
+    agent._persist_session = lambda *_args: None
+    agent._save_trajectory = lambda *_args: None
+    agent._cleanup_task_resources = lambda *_args: None
+
+    result = agent._raw_run_conversation(
+        payload,
+        turn_provenance=TurnProvenance.internal(
+            TurnOrigin.RUNTIME_ASYNC_COMPLETION
+        ),
+    )
+
+    assert result["final_response"] == useful_response
+    assert "tournament_intent" not in result
+    assert result["messages"][0]["turn_origin"] == "runtime_async_completion"
+    wire_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
+    assert all("turn_origin" not in message for message in wire_messages)
+    assert all("turn_actor_identity" not in message for message in wire_messages)
+    assert agent._tool_guardrails._tournament_contract is None
 
 
 def test_private_tournament_chat_does_not_require_an_external_action_receipt():
@@ -172,7 +227,7 @@ def test_mixed_private_public_turn_returns_useful_private_partial_without_public
     agent._cleanup_task_resources = lambda *_args: None
 
     result = agent.run_conversation(
-        "Create a private coding handoff, then publish the tournament Story."
+        "Create a private coding handoff, then publish the tournament Story to the SportFish Hub Instagram account."
     )
 
     assert result["completed"] is False
@@ -221,7 +276,7 @@ def test_mixed_private_file_is_delivered_while_public_candidate_remains_withheld
 
     try:
         result = agent.run_conversation(
-            "Create private_handoff.txt as a private coding handoff, then publish the tournament Story.",
+            "Create private_handoff.txt as a private coding handoff, then publish the tournament Story to the SportFish Hub Instagram account.",
             task_id="mixed-private-artifact-runtime",
         )
 

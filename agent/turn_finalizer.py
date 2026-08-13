@@ -638,8 +638,8 @@ def _finalize_turn_impl(
     tournament_candidate = final_response
     tournament_delivery_response = None
     tournament_materialization_failed = False
+    tournament_contract = getattr(agent, "_tournament_intent_contract", None)
     if deferred_tournament_artifact and not interrupted and not failed:
-        tournament_contract = getattr(agent, "_tournament_intent_contract", None)
         if tournament_contract.state is TournamentIntentState.MIXED_PUBLICATION:
             envelope = parse_mixed_publication_envelope(tournament_candidate or "")
             if envelope is not None:
@@ -692,6 +692,7 @@ def _finalize_turn_impl(
                 "I could not create the verified tournament attachment. No file was sent, "
                 "and no public action was taken."
             ),
+            contract=tournament_contract,
         )
         completed = False
     else:
@@ -700,6 +701,7 @@ def _finalize_turn_impl(
             candidate=tournament_candidate,
             delivery_response=tournament_delivery_response,
             messages=messages,
+            contract=tournament_contract,
         )
     if tournament_failed:
         failed = True
