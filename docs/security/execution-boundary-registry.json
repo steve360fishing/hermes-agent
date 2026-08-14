@@ -1436,6 +1436,15 @@
       "rationale": "propagation boundary for the artifact request contract."
     },
     {
+      "id": "agent/tool_guardrails.py:classify_tournament_tool_action",
+      "contract": "artifact_delivery",
+      "role": "decision",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "classify_tournament_tool_action",
+      "disposition": "covered",
+      "rationale": "Classifies tournament tool effects and destination kinds before artifact-delivery enforcement."
+    },
+    {
       "id": "agent/tool_guardrails.py:ToolCallGuardrailController",
       "contract": "artifact_request",
       "role": "enforcement",
