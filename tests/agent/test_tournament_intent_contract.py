@@ -13,24 +13,38 @@ os.environ.setdefault("USERPROFILE", tempfile.gettempdir())
 import pytest
 
 import agent.tournament_intent_contract as tournament_intent_contract
-from agent.tool_guardrails import ToolCallGuardrailController
+from agent.tool_guardrails import (
+    ToolCallGuardrailController,
+    TournamentDestinationKind,
+    TournamentToolEffect,
+    classify_tournament_tool_action,
+)
 from agent.task_execution_contract import ARTIFACT_ONLY, build_task_execution_contract
 from agent.tournament_intent_contract import (
     TournamentIntentState,
     TournamentReleaseApproval,
+    TournamentResponsePartKind,
     begin_tournament_intent_contract,
     classify_bound_release_approval_intake,
     classify_tournament_intent,
+    bind_tournament_contract,
     clear_tournament_intent_contract,
+    current_tournament_contract,
     finalize_tournament_output,
     intake_authenticated_tournament_release_approval,
     prepare_tournament_publication,
+    parse_mixed_publication_envelope,
 )
 from agent.tournament_release_state import PendingPublicationPacket, TournamentReleaseStore
 from agent.turn_origin import TurnOrigin, TurnProvenance
+from gateway.run import _mint_gateway_turn_provenance
 
 
-_DIRECT = TurnProvenance.authenticated_direct_user("steve")
+_DIRECT = _mint_gateway_turn_provenance(
+    SimpleNamespace(text="test direct request", message_id="message-1"),
+    SimpleNamespace(user_id="steve", platform="telegram", profile="test", chat_id="chat-1", scope_id="telegram:test:chat-1:"),
+    is_internal=False,
+)
 _raw_begin_tournament_intent_contract = begin_tournament_intent_contract
 _raw_classify_bound_release_approval_intake = classify_bound_release_approval_intake
 _raw_intake_authenticated_tournament_release_approval = (
@@ -38,13 +52,23 @@ _raw_intake_authenticated_tournament_release_approval = (
 )
 
 
+def _direct_for(message: object) -> TurnProvenance:
+    text = message if isinstance(message, str) else "test direct request"
+    return _mint_gateway_turn_provenance(
+        SimpleNamespace(text=text, message_id="message-1"),
+        SimpleNamespace(user_id="steve", platform="telegram", profile="test", chat_id="chat-1", scope_id="telegram:test:chat-1:"),
+        is_internal=False,
+    )
+
+
 def begin_tournament_intent_contract(*args, **kwargs):
-    kwargs.setdefault("turn_provenance", _DIRECT)
+    kwargs.setdefault("turn_provenance", _direct_for(kwargs.get("message")))
     return _raw_begin_tournament_intent_contract(*args, **kwargs)
 
 
 def classify_bound_release_approval_intake(*args, **kwargs):
-    kwargs.setdefault("turn_provenance", _DIRECT)
+    message = args[0] if args else kwargs.get("message")
+    kwargs.setdefault("turn_provenance", _direct_for(message))
     return _raw_classify_bound_release_approval_intake(*args, **kwargs)
 
 
@@ -89,8 +113,11 @@ class _AuthorizedTestStore(TournamentReleaseStore):
 @pytest.fixture(autouse=True)
 def _isolated_release_store(monkeypatch, tmp_path):
     """Never let unit approvals touch the operator's real Hermes state."""
+    bind_tournament_contract(None)
     store = _AuthorizedTestStore(state_path=tmp_path / "release-state.json")
     monkeypatch.setattr(tournament_intent_contract, "_PENDING_PUBLICATIONS", store)
+    yield
+    bind_tournament_contract(None)
 
 
 PRIVATE_CASES = (
@@ -277,7 +304,7 @@ def test_plan_ready_document_cannot_use_trusted_pending_context_as_authority():
     assert agent._tool_guardrails.before_call("memory", {}).action == "allow"
 
 
-def test_finalizer_uses_the_owning_contract_when_shared_agent_reference_is_cleared():
+def test_finalizer_uses_the_explicit_owning_contract_without_shared_agent_state():
     candidate = "Verified public tournament copy"
     agent = _agent()
     contract = begin_tournament_intent_contract(
@@ -290,7 +317,6 @@ def test_finalizer_uses_the_owning_contract_when_shared_agent_reference_is_clear
         candidate=candidate,
         expires_at=datetime.now(timezone.utc) + timedelta(minutes=5),
     )
-    agent._tournament_intent_contract = None
     messages = [{"role": "user", "content": "Create public tournament copy for Instagram review."}]
     response, telemetry, failed = finalize_tournament_output(
         agent, candidate=candidate, messages=messages, contract=contract
@@ -328,7 +354,7 @@ def test_stale_finalizer_cannot_clear_a_different_turn_token():
     assert response == candidate
     assert telemetry and telemetry["code"] == "receipt_verified"
     assert not failed
-    assert agent._tournament_intent_contract is second
+    assert current_tournament_contract() is second
 
 
 def test_authenticated_direct_origin_still_installs_real_public_draft_contract():
@@ -340,11 +366,79 @@ def test_authenticated_direct_origin_still_installs_real_public_draft_contract()
             "to me here for review. Do not publish or send it anywhere."
         ),
         task_id="authenticated-public-draft",
-        turn_provenance=_DIRECT,
+        turn_provenance=_direct_for(
+            "Create the public-facing Tournaments to Follow copy and give it "
+            "to me here for review. Do not publish or send it anywhere."
+        ),
     )
     assert contract is not None
     assert contract.state is TournamentIntentState.PUBLIC_FACING_DRAFT
     assert contract.actor_identity == _DIRECT.actor_identity
+
+
+def test_effective_or_persist_text_cannot_override_sealed_authority_text():
+    agent = _agent()
+    private_authority = _direct_for(
+        "Give me a detailed private Codex prompt about the tournament blocker."
+    )
+    assert _raw_begin_tournament_intent_contract(
+        agent,
+        message="Publish the tournament Story to Instagram now.",
+        task_id="plugin-cannot-escalate",
+        turn_provenance=private_authority,
+    ) is None
+
+    public_authority = _direct_for(
+        "Publish the tournament Story to the SportFish Hub Instagram account now."
+    )
+    contract = _raw_begin_tournament_intent_contract(
+        agent,
+        message="Plugin rewrote this into an ordinary private note.",
+        task_id="plugin-cannot-deescalate",
+        turn_provenance=public_authority,
+    )
+    assert contract is not None
+    assert contract.state is TournamentIntentState.PUBLICATION_REQUEST
+
+
+@pytest.mark.parametrize(
+    ("platform", "chat_id", "session_scope", "gateway_session_key"),
+    (
+        (
+            "discord", "chat-1", "discord:test:chat-1:",
+            "agent:test:telegram:dm:chat-1",
+        ),
+        (
+            "telegram", "chat-2", "telegram:test:chat-2:",
+            "agent:test:telegram:dm:chat-1",
+        ),
+        (
+            "telegram", "chat-1", "telegram:test:chat-1:",
+            "agent:test:telegram:dm:another-session",
+        ),
+    ),
+    ids=("wrong-platform", "wrong-chat", "wrong-session"),
+)
+def test_sealed_direct_envelope_must_match_current_agent_request_binding(
+    platform, chat_id, session_scope, gateway_session_key
+):
+    message = "Publish the tournament Story to the SportFish Hub Instagram account now."
+    provenance = _mint_gateway_turn_provenance(
+        SimpleNamespace(text=message, message_id="message-wrong-binding"),
+        SimpleNamespace(user_id="steve", platform=platform, profile="test", chat_id=chat_id, scope_id=session_scope),
+        is_internal=False,
+    )
+    agent = _agent()
+    agent._gateway_session_key = gateway_session_key
+
+    assert _raw_begin_tournament_intent_contract(
+        agent,
+        message=message,
+        task_id="wrong-request-binding",
+        turn_provenance=provenance,
+    ) is None
+    assert current_tournament_contract() is None
+    assert agent._tool_guardrails.before_call("memory", {}).action == "allow"
 
 
 @pytest.mark.parametrize(
@@ -481,7 +575,7 @@ def test_p17_exact_authenticated_packet_intake_records_authority_but_never_dispa
     assert resolved is packet
     assert begin_tournament_intent_contract(agent, message=phrase, task_id="approval-turn") is None
     assert packet.state.value == "approved"
-    assert agent._tournament_intent_contract is None
+    assert current_tournament_contract() is None
 
     copied = _agent()
     copied._user_id = "copied-actor"
@@ -583,7 +677,7 @@ def test_cron_platform_bypasses_before_classifier_and_leaves_agent_untouched(
     assert agent._stream_callback is stream_callback
     assert agent._persist_session is persist_callback
     assert agent._tool_guardrails._tournament_contract is original_guardrail_contract
-    assert agent._tournament_intent_contract is None
+    assert current_tournament_contract() is None
     assert "tournament_truth_gate" not in agent.valid_tool_names
     assert agent._tool_guardrails.before_call("terminal", {}).action == "allow"
 
@@ -654,7 +748,7 @@ def test_public_tournament_txt_composes_truth_and_exact_artifact_guards(
     assert agent._tool_guardrails.before_call("write_file", args).action == "allow"
 
 
-def test_public_contract_cleanup_removes_only_request_local_tool_wiring():
+def test_public_contract_cleanup_keeps_stable_tool_wiring_but_clears_authority():
     agent = _agent()
     contract = begin_tournament_intent_contract(
         agent,
@@ -663,10 +757,10 @@ def test_public_contract_cleanup_removes_only_request_local_tool_wiring():
     )
     assert contract is not None
     clear_tournament_intent_contract(agent)
-    assert agent._tournament_intent_contract is None
+    assert current_tournament_contract() is None
     assert agent._tool_guardrails._tournament_contract is None
-    assert "tournament_truth_gate" not in agent.valid_tool_names
-    assert not any(
+    assert "tournament_truth_gate" in agent.valid_tool_names
+    assert any(
         tool.get("function", {}).get("name") == "tournament_truth_gate"
         for tool in agent.tools
     )
@@ -703,6 +797,218 @@ def test_public_contract_keeps_safe_internal_research_capture_and_private_artifa
     assert agent._tool_guardrails.before_call(tool_name, args).action == "allow"
 
 
+@pytest.mark.parametrize(
+    ("tool_name", "args", "expected_effect"),
+    (
+        ("web_search", {"query": "official standings"}, TournamentToolEffect.READ_RESEARCH),
+        (
+            "tournament_source_capture",
+            {"registered_source_id": "official-results"},
+            TournamentToolEffect.TRUSTED_CAPTURE,
+        ),
+        ("memory", {"action": "store", "content": "private preference"}, TournamentToolEffect.PRIVATE_MEMORY),
+        (
+            "terminal",
+            {"effect": "internal_diagnostic", "command": "git status --short"},
+            TournamentToolEffect.INTERNAL_DIAGNOSTIC,
+        ),
+        (
+            "write_file",
+            {"purpose": "private_handoff", "path": "private-codex-handoff.txt", "content": "diagnosis"},
+            TournamentToolEffect.PRIVATE_HANDOFF,
+        ),
+    ),
+)
+def test_c15_safe_effects_remain_usable_during_public_contract(
+    tool_name, args, expected_effect
+):
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Publish the exact verified tournament Story to the SportFish Hub Instagram account now.",
+        task_id="c15-safe-effects",
+    )
+    model = classify_tournament_tool_action(
+        tool_name,
+        args,
+        execution_contract=agent._tool_guardrails._execution_contract,
+        tournament_contract=contract,
+    )
+    assert model.effect is expected_effect
+    assert agent._tool_guardrails.before_call(tool_name, args).action == "allow"
+
+
+def test_c15_arbitrary_snapshot_root_write_is_denied_without_or_with_contract(
+    monkeypatch, tmp_path
+):
+    receipt_root = tmp_path / "receipts"
+    journal_root = tmp_path / "journal"
+    snapshot_root = tmp_path / "snapshots"
+    for root in (receipt_root, journal_root, snapshot_root):
+        root.mkdir()
+    monkeypatch.setattr(
+        "hermes_cli.config.load_config_readonly",
+        lambda: {
+            "tournament_truth_gate": {
+                "receipt_root": str(receipt_root),
+                "journal_root": str(journal_root),
+                "source_snapshot_root": str(snapshot_root),
+            }
+        },
+    )
+    args = {
+        "path": str(snapshot_root / "model-authored.json"),
+        "content": "untrusted bytes",
+    }
+    controller = ToolCallGuardrailController()
+    decision = controller.before_call("write_file", args)
+    assert decision.action == "deny"
+    assert decision.code == "trusted_snapshot_write_requires_capture_tool"
+
+    agent = _agent()
+    begin_tournament_intent_contract(
+        agent,
+        message="Create the public tournament Story for Instagram review.",
+        task_id="snapshot-root-deny",
+    )
+    decision = agent._tool_guardrails.before_call("write_file", args)
+    assert decision.action == "deny"
+    assert decision.code == "trusted_snapshot_write_requires_capture_tool"
+
+
+@pytest.mark.parametrize(
+    "destination",
+    (
+        "instagram:sportfish-hub",
+        "cms:sportfish-hub",
+        "newsletter:weekly",
+        "email:subscribers",
+    ),
+)
+def test_c15_external_publication_never_bypasses_gate_without_contract(destination):
+    controller = ToolCallGuardrailController()
+    decision = controller.before_call(
+        "send_message",
+        {"action": "send", "target": destination, "message": "Tournament winner"},
+    )
+    assert decision.action == "deny"
+    assert decision.code == "external_publication_contract_required"
+
+
+def test_c15_declared_public_channel_never_bypasses_gate_without_contract():
+    controller = ToolCallGuardrailController()
+    decision = controller.before_call(
+        "send_message",
+        {"action": "send", "target": "slack:#public", "message": "Tournament winner"},
+    )
+    assert decision.action == "deny"
+    assert decision.code == "external_publication_contract_required"
+
+
+def test_c15_claim_bearing_public_write_never_bypasses_gate_without_contract():
+    controller = ToolCallGuardrailController()
+    decision = controller.before_call(
+        "write_file",
+        {
+            "effect": "public_candidate",
+            "visibility": "public",
+            "path": "public-caption.txt",
+            "content": "Tournament winner",
+        },
+    )
+    assert decision.action == "deny"
+    assert decision.code == "public_candidate_contract_required"
+
+
+def test_c15_local_filename_vocabulary_does_not_become_external_publication_effect():
+    controller = ToolCallGuardrailController()
+    args = {
+        "path": "newsletter-tournament-diagnostic.txt",
+        "content": "Private Codex handoff",
+    }
+    model = classify_tournament_tool_action("write_file", args)
+    assert model.effect is TournamentToolEffect.UNKNOWN_MUTATION
+    assert controller.before_call("write_file", args).action == "allow"
+
+
+@pytest.mark.parametrize("destination", ("telegram:private:8788759653", "telegram:8788759653"))
+def test_c15_normal_private_telegram_delivery_is_unaffected_without_contract(destination):
+    controller = ToolCallGuardrailController()
+    model = classify_tournament_tool_action(
+        "send_message", {"action": "send", "target": destination, "message": "Private note"}
+    )
+    assert model.destination_kind is TournamentDestinationKind.PRIVATE_SURFACE
+    assert controller.before_call(
+        "send_message",
+        {"action": "send", "target": destination, "message": "Private note"},
+    ).action == "allow"
+
+
+def test_c15_private_telegram_surface_cannot_consume_instagram_release_authority():
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Publish this exact verified tournament caption to the SportFish Hub Instagram account now.",
+        task_id="private-surface-not-public-sink",
+    )
+    candidate = "Verified tournament winner"
+    _bind_test_receipt(contract, candidate)
+    _, approval = _attach_exact_approval(
+        contract,
+        candidate,
+        idempotency_key="private-surface-not-public-sink",
+    )
+    private_decision = agent._tool_guardrails.before_call(
+        "send_message",
+        {
+            "action": "send",
+            "target": "telegram:private:chat-1",
+            "message": candidate,
+        },
+    )
+    assert private_decision.action == "allow"
+    assert approval.state == "available"
+    assert contract.release_state == "prepared_not_released"
+
+    wrong_private_decision = agent._tool_guardrails.before_call(
+        "send_message",
+        {
+            "action": "send",
+            "target": "telegram:private:some-other-chat",
+            "message": candidate,
+        },
+    )
+    assert wrong_private_decision.action == "deny"
+    assert wrong_private_decision.code == "private_delivery_destination_mismatch"
+    assert approval.state == "available"
+
+    unbound_private_decision = agent._tool_guardrails.before_call(
+        "send_message",
+        {
+            "action": "send",
+            "target": "telegram",
+            "message": candidate,
+        },
+    )
+    assert unbound_private_decision.action == "deny"
+    assert unbound_private_decision.code == "private_delivery_destination_mismatch"
+    assert approval.state == "available"
+
+    public_decision = agent._tool_guardrails.before_call(
+        "send_message",
+        {
+            "action": "send",
+            "target": "instagram:sportfish-hub",
+            "message": candidate,
+            "actor_identity": contract.actor_identity,
+            "idempotency_key": "private-surface-not-public-sink",
+        },
+    )
+    assert public_decision.action == "allow"
+    assert approval.state == "in_flight"
+    assert contract.release_state == "in_flight"
+
+
 def test_missing_registered_truth_gate_fails_before_provider_request(monkeypatch):
     from tools.registry import registry
 
@@ -717,7 +1023,7 @@ def test_missing_registered_truth_gate_fails_before_provider_request(monkeypatch
     assert contract.preflight_error == "truth_gate_unavailable"
 
 
-def test_cleanup_preserves_preexisting_capture_schema_when_only_truth_gate_was_injected():
+def test_cleanup_preserves_permanent_truth_and_capture_schemas():
     agent = _agent()
     capture = {"type": "function", "function": {"name": "tournament_source_capture"}}
     agent.tools.append(capture)
@@ -725,10 +1031,17 @@ def test_cleanup_preserves_preexisting_capture_schema_when_only_truth_gate_was_i
     contract = begin_tournament_intent_contract(
         agent, message="Create a public tournament Story naming winners.", task_id="asymmetric"
     )
-    assert contract.added_tool_schemas == {"tournament_truth_gate"}
+    assert contract.added_tool_schemas == set()
     clear_tournament_intent_contract(agent)
-    assert agent.tools == [capture]
-    assert agent.valid_tool_names == {"tournament_source_capture"}
+    assert capture in agent.tools
+    assert any(
+        tool.get("function", {}).get("name") == "tournament_truth_gate"
+        for tool in agent.tools
+    )
+    assert agent.valid_tool_names == {
+        "tournament_source_capture",
+        "tournament_truth_gate",
+    }
 
 
 def test_public_draft_missing_receipt_blocks_claim_bytes_without_opaque_tokens():
@@ -753,7 +1066,7 @@ def test_public_draft_missing_receipt_blocks_claim_bytes_without_opaque_tokens()
     assert "receipt_missing_or_consumed" in response
     assert "Boat A won" not in response
     assert messages[-1]["content"] == response
-    assert agent._tournament_intent_contract is None
+    assert current_tournament_contract() is None
 
 
 def test_public_draft_valid_receipt_releases_exact_candidate_once():
@@ -772,7 +1085,7 @@ def test_public_draft_valid_receipt_releases_exact_candidate_once():
     assert response == "Verified winner copy"
     assert telemetry["code"] == "receipt_verified"
     assert contract.receipt_used is True
-    assert agent._tournament_intent_contract is None
+    assert current_tournament_contract() is None
 
 
 def test_public_draft_ignores_and_does_not_consume_irrelevant_release_approval():
@@ -879,6 +1192,75 @@ def test_mixed_publication_preserves_private_output_and_withholds_public_candida
     assert "receipt_missing_or_consumed" not in response
     assert streamed == [response, None]
     assert persisted[-1][0][-1]["content"] == response
+
+
+def test_c16_mixed_envelope_is_parsed_into_explicit_private_and_public_parts():
+    envelope = parse_mixed_publication_envelope(
+        '{"private_response":"Private explanation.","public_candidate":"Verified caption."}'
+    )
+    assert envelope is not None
+    assert envelope.private_explanation.kind is TournamentResponsePartKind.PRIVATE_EXPLANATION
+    assert envelope.private_explanation.text == "Private explanation."
+    assert envelope.public_candidate.kind is TournamentResponsePartKind.PUBLIC_CANDIDATE
+    assert envelope.public_candidate.text == "Verified caption."
+
+
+def test_c16_post_gate_noop_transform_preserves_hash_and_changed_transform_holds():
+    candidate = "Verified tournament winner copy"
+
+    noop_agent = _agent()
+    noop_contract = begin_tournament_intent_contract(
+        noop_agent,
+        message="Create a public tournament Story for Instagram review.",
+        task_id="noop-transform",
+    )
+    _bind_test_receipt(noop_contract, candidate)
+    noop_messages = [{"role": "user", "content": "draft"}]
+    response, telemetry, failed = finalize_tournament_output(
+        noop_agent,
+        candidate=candidate,
+        delivery_response=candidate,
+        messages=noop_messages,
+        contract=noop_contract,
+    )
+    assert failed is False
+    assert response == candidate
+    assert telemetry["code"] == "receipt_verified"
+
+    changed_agent = _agent()
+    changed_contract = begin_tournament_intent_contract(
+        changed_agent,
+        message="Create a public tournament Story for Instagram review.",
+        task_id="changed-transform",
+    )
+    _bind_test_receipt(changed_contract, candidate)
+    changed_messages = [{"role": "user", "content": "draft"}]
+    response, telemetry, failed = finalize_tournament_output(
+        changed_agent,
+        candidate=candidate,
+        delivery_response=f"**{candidate}**",
+        messages=changed_messages,
+        contract=changed_contract,
+    )
+    assert failed is True
+    assert telemetry["code"] == "candidate_bytes_mismatch"
+    assert response.startswith("DRAFT_VALIDATION_HOLD")
+    assert "release approval" not in response.casefold()
+    assert f"**{candidate}**" not in response
+
+
+def test_c16_transform_before_gate_is_authorized_only_when_receipt_binds_final_bytes():
+    original = "Tournament winner copy"
+    transformed = "Tournament winner copy\n\nSource: official results"
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent,
+        message="Create a public tournament Story for Instagram review.",
+        task_id="pre-gate-transform",
+    )
+    _bind_test_receipt(contract, transformed)
+    assert contract.verify_receipt(original).code == "candidate_bytes_mismatch"
+    assert contract.verify_receipt(transformed).allowed is True
 
 
 def test_mixed_publication_exact_receipt_prepares_only_the_public_candidate():
@@ -1033,7 +1415,10 @@ def test_p10_valid_truth_prepares_exact_packet_without_dispatch():
     assert response.startswith("PREPARED_NOT_RELEASED")
     assert contract.pending_publication is not None
     assert contract.pending_publication.external_publication_sink == "instagram:sportfish-hub"
-    assert contract.pending_publication.private_delivery_surface == "platform:telegram"
+    assert (
+        contract.pending_publication.private_delivery_surface
+        == "platform:telegram:chat-1"
+    )
     assert contract.pending_publication.pending_action_id in response
     assert contract.pending_publication.checksum() in response
     assert telemetry["code"] == "release_approval_required"
@@ -1115,7 +1500,7 @@ def test_bound_intake_turn_never_installs_contract_or_dispatches():
     clear_tournament_intent_contract(agent)
     message = f"APPROVE_TOURNAMENT_RELEASE action_id={packet.pending_action_id} checksum={packet.checksum()}"
     assert begin_tournament_intent_contract(agent, message=message, task_id="new-intake") is None
-    assert agent._tournament_intent_contract is None
+    assert current_tournament_contract() is None
     assert packet.state.value == "approved"
 
 
@@ -1382,6 +1767,9 @@ def _agent(*, platform: str = "telegram"):
     return SimpleNamespace(
         session_id="session-1",
         platform=platform,
+        _chat_id="chat-1",
+        _thread_id=None,
+        _gateway_session_key="agent:test:telegram:dm:chat-1",
         tools=[],
         valid_tool_names=set(),
         stream_delta_callback=None,

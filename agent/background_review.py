@@ -24,6 +24,7 @@ import os
 from typing import Any, Dict, List, Optional
 
 from agent.thread_scoped_output import thread_scoped_silence
+from agent.turn_origin import TurnOrigin, TurnProvenance
 
 logger = logging.getLogger(__name__)
 
@@ -945,6 +946,9 @@ def _run_review_in_thread(
                         "at runtime — do not attempt them."
                     ),
                     conversation_history=_review_history,
+                    turn_provenance=TurnProvenance.internal(
+                        TurnOrigin.MODEL_GENERATED
+                    ),
                 )
                 if (
                     _routing_spec is not None

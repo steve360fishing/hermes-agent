@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+from types import SimpleNamespace
 
 from agent.tournament_release_state import (
     PendingPublicationPacket,
@@ -9,9 +10,17 @@ from agent.tournament_release_state import (
     TournamentReleaseStore,
 )
 from agent.turn_origin import TurnProvenance
+from gateway.run import _mint_gateway_turn_provenance
 
 
-_DIRECT = TurnProvenance.authenticated_direct_user("steve")
+_DIRECT = _mint_gateway_turn_provenance(
+    SimpleNamespace(text="test direct request", message_id="message-1"),
+    SimpleNamespace(
+        user_id="steve", platform="telegram", profile="test",
+        chat_id="chat-1", thread_id=None, scope_id="session-1",
+    ),
+    is_internal=False,
+)
 _UNTRUSTED = TurnProvenance.unknown()
 
 

@@ -910,9 +910,45 @@ def test_terminal_receipt_cannot_regress_and_registry_is_cleaned(monkeypatch, tm
 
     receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
     assert receipt["state"] == "delivered"
+    assert receipt["attachment_dispatch_attempted"] is True
+    assert receipt["attachment_delivered"] is True
+    assert receipt["attachment_message_id_confirmed"] is True
     assert receipt["attempt_count"] == 0
     assert os.path.abspath(contract.artifact_output_path) not in _ARTIFACT_RECEIPTS
     assert not Path(contract.artifact_root).exists()
+
+
+def test_ambiguous_receipt_separates_attempt_from_delivery(monkeypatch, tmp_path):
+    from agent.task_execution_contract import (
+        record_artifact_dispatch,
+        record_artifact_written,
+    )
+
+    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+    contract = _contract("Give me evidence.txt as a file.")
+    Path(contract.artifact_output_path).write_bytes(b"payload")
+    assert record_artifact_written(contract) is True
+
+    assert record_artifact_dispatch(
+        contract.artifact_output_path,
+        state="dispatching",
+        transport_attempt=True,
+    )
+    assert record_artifact_dispatch(
+        contract.artifact_output_path,
+        state="ambiguous",
+        error_code="document_dispatch_exception",
+    )
+
+    receipt = json.loads(
+        Path(contract.artifact_receipt_path).read_text(encoding="utf-8")
+    )
+    assert receipt["state"] == "ambiguous"
+    assert receipt["attachment_dispatch_attempted"] is True
+    assert receipt["attachment_delivered"] is False
+    assert receipt["attachment_message_id_confirmed"] is False
+    assert receipt["attempt_count"] == 1
 
 
 def test_concurrent_receipt_transitions_are_serialized(monkeypatch, tmp_path):

@@ -187,14 +187,16 @@ def _finalize_turn_impl(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+    from agent.tournament_intent_contract import current_tournament_contract
 
     task_contract = getattr(agent, "_task_execution_contract", None)
+    tournament_contract = current_tournament_contract()
     tournament_telemetry = None
     artifact_only = getattr(task_contract, "lane", None) == "artifact_only"
     deferred_tournament_artifact = bool(
         artifact_only
         and getattr(task_contract, "artifact_file_requested", False)
-        and getattr(agent, "_tournament_intent_contract", None) is not None
+        and tournament_contract is not None
     )
     stale_artifact_reference = (
         not artifact_only
@@ -638,12 +640,11 @@ def _finalize_turn_impl(
     tournament_candidate = final_response
     tournament_delivery_response = None
     tournament_materialization_failed = False
-    tournament_contract = getattr(agent, "_tournament_intent_contract", None)
     if deferred_tournament_artifact and not interrupted and not failed:
         if tournament_contract.state is TournamentIntentState.MIXED_PUBLICATION:
             envelope = parse_mixed_publication_envelope(tournament_candidate or "")
             if envelope is not None:
-                private_response, _public_candidate = envelope
+                private_response = envelope.private_explanation.text
                 tournament_delivery_response, failed, _turn_exit_reason = _finalize_artifact_obligation(
                     agent,
                     task_contract=task_contract,
@@ -841,10 +842,9 @@ def _finalize_turn_impl(
     # Clear interrupt state after handling
     agent.clear_interrupt()
 
-    # Tournament cleanup restores the caller's original callback. Ordinary
-    # turns still clear the turn-local callback to prevent leakage.
-    if tournament_telemetry is None:
-        agent._stream_callback = None
+    # ``_stream_callback`` is the generic per-turn callback installed by the
+    # turn builder. Tournament buffering is request-local and needs no restore.
+    agent._stream_callback = None
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.
     _should_review_skills = False

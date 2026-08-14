@@ -832,7 +832,8 @@ CREATE TABLE IF NOT EXISTS messages (
     compacted INTEGER NOT NULL DEFAULT 0,
     api_content TEXT,
     turn_origin TEXT,
-    turn_actor_identity TEXT
+    turn_actor_identity TEXT,
+    turn_provenance_json TEXT
 );
 
 CREATE TABLE IF NOT EXISTS session_model_usage (
@@ -4173,6 +4174,7 @@ class SessionDB:
         api_content: Optional[str] = None,
         turn_origin: Optional[str] = None,
         turn_actor_identity: Optional[str] = None,
+        turn_provenance_json: Optional[str] = None,
     ) -> int:
         """
         Append a message to a session. Returns the message row ID.
@@ -4233,8 +4235,8 @@ class SessionDB:
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content,
-                   turn_origin, turn_actor_identity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   turn_origin, turn_actor_identity, turn_provenance_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4257,6 +4259,7 @@ class SessionDB:
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(turn_origin) if isinstance(turn_origin, str) else None,
                     _scrub_surrogates(turn_actor_identity) if isinstance(turn_actor_identity, str) else None,
+                    _scrub_surrogates(turn_provenance_json) if isinstance(turn_provenance_json, str) else None,
                 ),
             )
             msg_id = cursor.lastrowid
@@ -4332,8 +4335,8 @@ class SessionDB:
                    tool_calls, tool_name, effect_disposition, timestamp, token_count, finish_reason,
                    reasoning, reasoning_content, reasoning_details, codex_reasoning_items,
                    codex_message_items, platform_message_id, observed, active, api_content,
-                   turn_origin, turn_actor_identity)
-                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+                   turn_origin, turn_actor_identity, turn_provenance_json)
+                   VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
                 (
                     session_id,
                     role,
@@ -4356,6 +4359,7 @@ class SessionDB:
                     _scrub_surrogates(api_content) if isinstance(api_content, str) else None,
                     _scrub_surrogates(msg.get("turn_origin")) if isinstance(msg.get("turn_origin"), str) else None,
                     _scrub_surrogates(msg.get("turn_actor_identity")) if isinstance(msg.get("turn_actor_identity"), str) else None,
+                    _scrub_surrogates(msg.get("turn_provenance_json")) if isinstance(msg.get("turn_provenance_json"), str) else None,
                 ),
             )
             inserted += 1
@@ -4885,7 +4889,7 @@ class SessionDB:
                 "SELECT role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
                 "finish_reason, reasoning, reasoning_content, reasoning_details, "
                 "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-                "api_content, turn_origin, turn_actor_identity "
+                "api_content, turn_origin, turn_actor_identity, turn_provenance_json "
                 f"FROM messages WHERE session_id IN ({placeholders})"
                 # Order by AUTOINCREMENT id (true insertion order), NOT timestamp:
                 # append_message stamps rows with time.time(), which is not
@@ -4913,7 +4917,7 @@ class SessionDB:
         "role, content, tool_call_id, tool_calls, tool_name, effect_disposition, "
         "finish_reason, reasoning, reasoning_content, reasoning_details, "
         "codex_reasoning_items, codex_message_items, platform_message_id, observed, timestamp, "
-        "api_content, turn_origin, turn_actor_identity"
+        "api_content, turn_origin, turn_actor_identity, turn_provenance_json"
     )
 
     def _rows_to_conversation(
@@ -4943,12 +4947,18 @@ class SessionDB:
             # projection shapes when no provenance was persisted; authority
             # consumers coerce a missing or malformed value to UNKNOWN.
             if row["role"] == "user" and row["turn_origin"]:
+                try:
+                    provenance_metadata = json.loads(row["turn_provenance_json"] or "{}")
+                except (TypeError, json.JSONDecodeError):
+                    provenance_metadata = None
                 provenance = TurnProvenance.from_storage(
-                    row["turn_origin"], row["turn_actor_identity"]
+                    row["turn_origin"], row["turn_actor_identity"], provenance_metadata
                 )
                 if provenance.origin.value != "unknown":
                     msg["turn_origin"] = provenance.origin.value
                     msg["turn_actor_identity"] = provenance.actor_identity
+                    if provenance.origin.value == "replayed_persisted_content":
+                        msg["turn_provenance_json"] = row["turn_provenance_json"]
             # api_content is the byte-fidelity sidecar: the exact string sent
             # to the API when it differed from the clean content. Returned
             # VERBATIM — no sanitize_context, no strip — because the replay

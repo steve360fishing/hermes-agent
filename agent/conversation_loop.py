@@ -22,7 +22,6 @@ import os
 import random
 import re
 import ssl
-import threading
 import time
 import uuid
 from functools import wraps
@@ -592,50 +591,31 @@ def _effective_request_system_prompt(agent, base_prompt: str) -> str:
     return tournament_prompt(agent, effective_request_system_prompt(agent, base_prompt))
 
 
-_TOURNAMENT_TURN_LOCK_INIT = threading.Lock()
-
-
 def _clear_request_contract_after_turn(func):
     @wraps(func)
     def wrapper(agent, *args, **kwargs):
-        # Tournament contracts temporarily bind shared callbacks, persistence,
-        # schemas, and guardrails.  One agent therefore executes one such turn
-        # at a time; the contract token remains the ownership check below.
-        turn_lock = getattr(agent, "_tournament_turn_lock", None)
-        if turn_lock is None:
-            with _TOURNAMENT_TURN_LOCK_INIT:
-                turn_lock = getattr(agent, "_tournament_turn_lock", None)
-                if turn_lock is None:
-                    turn_lock = threading.RLock()
-                    agent._tournament_turn_lock = turn_lock
-        turn_lock.acquire()
         try:
-            try:
-                return func(agent, *args, **kwargs)
-            finally:
-                try:
-                    rescue_client = getattr(agent, "_rescue_telemetry_client", None)
-                    turn_id = getattr(agent, "_current_turn_id", None)
-                    if rescue_client is not None and turn_id:
-                        import uuid
-
-                        rescue_client.emit(
-                            {
-                                "event": "turn_end",
-                                "event_id": uuid.uuid4().hex,
-                                "turn_id": turn_id,
-                            }
-                        )
-                except Exception:
-                    # A missing end event leaves the reporter-owned turn active,
-                    # which blocks restart. Do not discard the user's response.
-                    logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
-                from agent.task_execution_contract import clear_task_execution_contract
-                clear_task_execution_contract(agent)
-                from agent.tournament_intent_contract import clear_tournament_intent_contract
-                clear_tournament_intent_contract(agent)
+            return func(agent, *args, **kwargs)
         finally:
-            turn_lock.release()
+            try:
+                rescue_client = getattr(agent, "_rescue_telemetry_client", None)
+                turn_id = getattr(agent, "_current_turn_id", None)
+                if rescue_client is not None and turn_id:
+                    rescue_client.emit(
+                        {
+                            "event": "turn_end",
+                            "event_id": uuid.uuid4().hex,
+                            "turn_id": turn_id,
+                        }
+                    )
+            except Exception:
+                # A missing end event leaves the reporter-owned turn active,
+                # which blocks restart. Do not discard the user's response.
+                logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
+            from agent.task_execution_contract import clear_task_execution_contract
+            clear_task_execution_contract(agent)
+            from agent.tournament_intent_contract import clear_tournament_intent_contract
+            clear_tournament_intent_contract(agent)
 
     return wrapper
 
@@ -687,28 +667,14 @@ def run_conversation(
         except Exception:
             pass
 
-    # Clear any request-local authority left by an interrupted prior turn.
+    # A stale ContextVar is candidate-local quarantine, never a turn refusal.
     from agent.tournament_intent_contract import (
         begin_tournament_intent_contract,
         clear_tournament_intent_contract,
         preflight_failure_response,
     )
 
-    if not clear_tournament_intent_contract(agent):
-        response = (
-            "The prior request's private delivery safeguards could not be fully restored. "
-            "This turn was not processed, and no external action was taken. Please retry."
-        )
-        return {
-            "final_response": response,
-            "messages": [{"role": "assistant", "content": response}],
-            "api_calls": 0,
-            "completed": False,
-            "failed": True,
-            "partial": False,
-            "interrupted": False,
-            "turn_exit_reason": "tournament_cleanup_incomplete",
-        }
+    clear_tournament_intent_contract(agent)
 
     # Resolve file-artifact policy before any context compression, plugin, or
     # provider work. A contradictory destination must fail without invoking a
@@ -720,12 +686,14 @@ def run_conversation(
 
     clear_task_execution_contract(agent)
     task_id = task_id or str(uuid.uuid4())
-    _contract_message = (
-        persist_user_message if persist_user_message is not None else user_message
-    )
     from agent.turn_origin import coerce_turn_provenance
 
     turn_provenance = coerce_turn_provenance(turn_provenance)
+    _contract_message = (
+        turn_provenance.authority_text
+        if turn_provenance.is_authenticated_direct_user
+        else (persist_user_message if persist_user_message is not None else user_message)
+    )
     _tournament_contract = begin_tournament_intent_contract(
         agent,
         message=_contract_message,
@@ -1075,8 +1043,21 @@ def run_conversation(
             _api_content = api_msg.pop("api_content", None)
             # Durable turn provenance is internal authority metadata, never a
             # provider message field.  Strict chat APIs reject unknown keys.
-            api_msg.pop("turn_origin", None)
-            api_msg.pop("turn_actor_identity", None)
+            for _provenance_key in (
+                "turn_origin",
+                "turn_actor_identity",
+                "turn_platform",
+                "turn_profile",
+                "turn_chat_id",
+                "turn_thread_id",
+                "turn_message_id",
+                "turn_event_id",
+                "turn_session_scope",
+                "turn_authority_text_sha256",
+                "turn_captured_at_unix_ms",
+                "turn_binding_sha256",
+            ):
+                api_msg.pop(_provenance_key, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks

@@ -40,6 +40,7 @@ import tempfile
 import threading
 import time
 import sqlite3
+from types import SimpleNamespace
 from collections import OrderedDict
 from contextvars import copy_context
 from pathlib import Path
@@ -73,6 +74,19 @@ _TELEGRAM_COMMAND_MENTION_RE = re.compile(r"(?<![\w:/])/([A-Za-z0-9][A-Za-z0-9_-
 _MODEL_FREE_RECOVERY_COMMANDS = frozenset({"new", "reset", "stop"})
 
 
+@dataclasses.dataclass(frozen=True)
+class AttachmentDeliveryOutcome:
+    """Independent proof state for one post-stream document obligation."""
+
+    path: str
+    dispatch_attempted: bool
+    delivered: bool
+    message_id_confirmed: bool
+    message_id: str = ""
+    state: str = "not_attempted"
+    error_code: str = ""
+
+
 def _is_model_free_recovery_command(event: Any) -> bool:
     """Keep reset/stop controls reachable even when a plugin is unhealthy."""
     try:
@@ -84,14 +98,28 @@ def _is_model_free_recovery_command(event: Any) -> bool:
     )
 
 
-def _mint_gateway_turn_provenance(event: Any, source: Any, *, is_internal: bool):
-    """Mint authority after gateway auth; never trust event text or metadata."""
-    from agent.turn_origin import TurnOrigin, TurnProvenance
+def _mint_gateway_turn_provenance(
+    event: Any,
+    source: Any,
+    *,
+    is_internal: bool,
+    authority_text: object = None,
+):
+    """Mint one authenticated ingress envelope after gateway authorization.
+
+    ``authority_text`` is captured before any pre-dispatch plugin can rewrite
+    the model-facing text.  Event metadata and persisted provenance never
+    supply direct-user authority.
+    """
+    from agent.turn_origin import (
+        TurnOrigin, TurnProvenance, _mint_gateway_authenticated_ingress,
+    )
 
     if is_internal:
         trusted = getattr(event, "_trusted_turn_provenance", None)
         if (
             isinstance(trusted, TurnProvenance)
+            and trusted.origin is not TurnOrigin.AUTHENTICATED_DIRECT_USER
             and not trusted.is_authenticated_direct_user
         ):
             return trusted
@@ -102,8 +130,45 @@ def _mint_gateway_turn_provenance(event: Any, source: Any, *, is_internal: bool)
         and replayed.origin is TurnOrigin.REPLAYED_PERSISTED_CONTENT
     ):
         return replayed
-    return TurnProvenance.authenticated_direct_user(
-        getattr(source, "user_id", None)
+    platform = getattr(source, "platform", "")
+    return _mint_gateway_authenticated_ingress(
+        getattr(source, "user_id", None),
+        authority_text=(getattr(event, "text", "") if authority_text is None else authority_text),
+        platform=getattr(platform, "value", platform),
+        profile=getattr(source, "profile", None),
+        chat_id=getattr(source, "chat_id", None),
+        thread_id=getattr(source, "thread_id", None),
+        message_id=getattr(event, "message_id", None),
+        event_id=getattr(event, "platform_update_id", None),
+        session_scope=_canonical_authority_scope(source),
+    )
+
+
+def _snapshot_authority_source(source: Any) -> Any:
+    """Copy only ingress identity scalars before plugin dispatch mutates events."""
+    return SimpleNamespace(
+        platform=getattr(source, "platform", None),
+        profile=getattr(source, "profile", None),
+        chat_id=getattr(source, "chat_id", None),
+        chat_type=getattr(source, "chat_type", None),
+        user_id=getattr(source, "user_id", None),
+        user_name=getattr(source, "user_name", None),
+        thread_id=getattr(source, "thread_id", None),
+        scope_id=getattr(source, "scope_id", None),
+    )
+
+
+def _canonical_authority_scope(source: Any) -> str:
+    """Stable source scope when adapters omit an explicit scope id (Telegram DM)."""
+    explicit = str(getattr(source, "scope_id", "") or "").strip()
+    if explicit:
+        return explicit
+    platform = getattr(getattr(source, "platform", None), "value", getattr(source, "platform", ""))
+    return ":".join(
+        str(value or "") for value in (
+            platform, getattr(source, "profile", None), getattr(source, "chat_id", None),
+            getattr(source, "thread_id", None),
+        )
     )
 
 _TELEGRAM_NOISY_STATUS_RE = re.compile(
@@ -10244,6 +10309,26 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         # Internal events (e.g. background-process completion notifications)
         # are system-generated and must skip user authorization.
         is_internal = bool(getattr(event, "internal", False))
+        # Bind authority to immutable ingress inputs before any plugin can
+        # rewrite model-facing text. Later authorization uses this source
+        # snapshot, never an event replacement supplied by a plugin.
+        _authority_source = _snapshot_authority_source(source)
+        _authority_text = event.text if isinstance(event.text, str) else ""
+        _authority_message_id = getattr(event, "message_id", None)
+        _authority_event_id = getattr(event, "platform_update_id", None)
+        # Authorize against the complete ingress source before plugins run.
+        # The reduced snapshot below is intentionally only the immutable
+        # provenance binding surface; it omits transport/authentication fields
+        # such as delivered_via_upstream_relay that authorization requires.
+        _authority_authorized = is_internal or self._is_user_authorized(source)
+        _sealed_turn_provenance = None
+        if _authority_authorized:
+            _sealed_turn_provenance = _mint_gateway_turn_provenance(
+                event,
+                _authority_source,
+                is_internal=is_internal,
+                authority_text=_authority_text,
+            )
 
         # scale-to-zero (Phase 0, 0.B/F13): stamp the gateway-scoped last-inbound
         # clock for real (user-originated) inbound only. Internal/system events
@@ -10294,37 +10379,54 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if _action == "allow":
                     break
 
+        _binding_changed = any(
+            getattr(source, name, None) != getattr(_authority_source, name, None)
+            for name in ("platform", "profile", "chat_id", "thread_id", "user_id")
+        ) or (
+            getattr(event, "message_id", None) != _authority_message_id
+            or getattr(event, "platform_update_id", None) != _authority_event_id
+        )
+        if _binding_changed:
+            logger.warning("Rejecting pre-dispatch source-binding mutation")
+            return None
+        # A plugin must never observe or inject provenance.  Attach only the
+        # locally sealed envelope after its rewrite/consume decision completes.
+        if _sealed_turn_provenance is not None:
+            event._trusted_turn_provenance = _sealed_turn_provenance
+        elif hasattr(event, "_trusted_turn_provenance"):
+            delattr(event, "_trusted_turn_provenance")
+
         if is_internal:
             pass
-        elif source.user_id is None:
+        elif _authority_source.user_id is None:
             # Messages with no user identity (Telegram service messages,
             # channel forwards, anonymous admin posts, sender_chat) can't
             # be paired, but they can still be authorized via a
             # chat-scoped allowlist (e.g. TELEGRAM_GROUP_ALLOWED_CHATS
             # authorizes every member of the listed chat regardless of
             # sender). Defer to _is_user_authorized so that path runs.
-            if not self._is_user_authorized(source):
+            if not _authority_authorized:
                 logger.debug("Ignoring message with no user_id from %s", source.platform.value)
                 return None
-        elif not self._is_user_authorized(source):
-            logger.warning("Unauthorized user: %s (%s) on %s", source.user_id, source.user_name, source.platform.value)
+        elif not _authority_authorized:
+            logger.warning("Unauthorized user: %s (%s) on %s", _authority_source.user_id, _authority_source.user_name, _authority_source.platform.value)
             # In DMs: offer pairing code. In groups: silently ignore.
             if (
-                source.chat_type == "dm"
+                _authority_source.chat_type == "dm"
                 and self._get_unauthorized_dm_behavior(
-                    source.platform,
-                    profile=source.profile,
+                    _authority_source.platform,
+                    profile=_authority_source.profile,
                 )
                 == "pair"
             ):
-                platform_name = source.platform.value if source.platform else "unknown"
+                platform_name = _authority_source.platform.value if _authority_source.platform else "unknown"
                 # Rate-limit ALL pairing responses (code or rejection) to
                 # prevent spamming the user with repeated messages when
                 # multiple DMs arrive in quick succession.
-                if self.pairing_store._is_rate_limited(platform_name, source.user_id):
+                if self.pairing_store._is_rate_limited(platform_name, _authority_source.user_id):
                     return None
                 code = self.pairing_store.generate_code(
-                    platform_name, source.user_id, source.user_name or ""
+                    platform_name, _authority_source.user_id, _authority_source.user_name or ""
                 )
                 if code:
                     adapter = self._adapter_for_source(source)
@@ -10345,13 +10447,8 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                             "Please try again later!"
                         )
                     # Record rate limit so subsequent messages are silently ignored
-                    self.pairing_store._record_rate_limit(platform_name, source.user_id)
+                    self.pairing_store._record_rate_limit(platform_name, _authority_source.user_id)
             return None
-
-        _turn_provenance = _mint_gateway_turn_provenance(
-            event, source, is_internal=is_internal
-        )
-        event._trusted_turn_provenance = _turn_provenance
 
         # Intercept messages that are responses to a pending /update prompt.
         # The update process (detached) wrote .update_prompt.json; the watcher
@@ -13760,7 +13857,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 if response:
                     _media_adapter = self._adapter_for_source(source)
                     if _media_adapter:
-                        await self._deliver_media_from_response(
+                        _attachment_outcomes = await self._deliver_media_from_response(
                             response,
                             event,
                             _media_adapter,
@@ -13768,6 +13865,32 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                                 agent_result.get("fallback_notice") or ""
                             ),
                         )
+                        # Streaming text and document delivery are independent
+                        # obligations.  Preserve the typed attachment result on
+                        # the ingress event so BasePlatformAdapter's real
+                        # processing-complete path cannot report SUCCESS merely
+                        # because the visible text bubble already arrived.
+                        event._attachment_delivery_outcomes = _attachment_outcomes
+                        unconfirmed = tuple(
+                            outcome
+                            for outcome in _attachment_outcomes
+                            if not outcome.message_id_confirmed
+                        )
+                        if unconfirmed:
+                            agent_result["attachment_delivery_state"] = (
+                                "failed_pre_dispatch"
+                                if all(
+                                    outcome.state == "failed_pre_dispatch"
+                                    and not outcome.dispatch_attempted
+                                    for outcome in unconfirmed
+                                )
+                                else "ambiguous"
+                            )
+                            logger.warning(
+                                "Streamed response has an unconfirmed attachment "
+                                "for session %s; turn completion remains failed.",
+                                session_entry.session_id,
+                            )
                 # Streaming already delivered the body text, but the footer was
                 # intentionally held back (see the `not already_sent` gate above).
                 # Send it now as a small trailing message so Telegram/Discord/etc.
@@ -14842,7 +14965,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         adapter,
         *,
         fallback_notice: str = "",
-    ) -> None:
+    ) -> tuple[AttachmentDeliveryOutcome, ...]:
         """Extract MEDIA: tags and local file paths from a response and deliver them.
 
         Called after streaming has already sent the text to the user, so the
@@ -14852,6 +14975,7 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         from pathlib import Path
         from urllib.parse import quote as _quote
 
+        outcomes: list[AttachmentDeliveryOutcome] = []
         try:
             # Capture [[as_document]] before extract_media strips it, so the
             # dispatch partition below can route image-extension files
@@ -14859,7 +14983,12 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
             # send_multiple_images (Telegram sendPhoto recompresses to ~1280px).
             force_document_attachments = "[[as_document]]" in response
 
-            from gateway.platforms.base import BasePlatformAdapter, should_send_media_as_audio
+            from gateway.platforms.base import (
+                BasePlatformAdapter,
+                confirmed_platform_message_id,
+                document_dispatch_error_code,
+                should_send_media_as_audio,
+            )
 
             media_files, cleaned = adapter.extract_media(response)
             media_files = BasePlatformAdapter.filter_media_delivery_paths(media_files)
@@ -14891,15 +15020,43 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                         metadata=_thread_meta,
                         **({"caption": fallback_notice} if fallback_notice else {}),
                     )
-                except Exception:
+                except Exception as exc:
+                    logger.warning(
+                        "[%s] Post-stream document delivery failed: "
+                        "phase=provider_dispatch code=document_dispatch_exception "
+                        "exception_class=%s",
+                        adapter.name,
+                        type(exc).__name__,
+                    )
                     result = None
-                if getattr(result, "success", False):
+                raw_message_id = getattr(result, "message_id", None)
+                confirmed_message_id = confirmed_platform_message_id(
+                    getattr(event.source, "platform", None), raw_message_id
+                )
+                if getattr(result, "success", False) and confirmed_message_id:
                     record_artifact_dispatch(
                         file_path,
                         state="delivered",
-                        message_id=getattr(result, "message_id", None),
+                        message_id=confirmed_message_id,
+                    )
+                    outcomes.append(
+                        AttachmentDeliveryOutcome(
+                            path=file_path,
+                            dispatch_attempted=True,
+                            delivered=True,
+                            message_id_confirmed=True,
+                            message_id=confirmed_message_id,
+                            state="delivered",
+                        )
                     )
                     return True
+                error_code = (
+                    "document_dispatch_exception"
+                    if result is None
+                    else document_dispatch_error_code(
+                        getattr(event.source, "platform", None), result
+                    )
+                )
                 try:
                     notice_result = await adapter.send(
                         chat_id=event.source.chat_id,
@@ -14912,13 +15069,37 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                 notice_ok = getattr(notice_result, "success", False)
                 correlation_id = record_artifact_dispatch(
                     file_path,
-                    state="ambiguous",
+                    state=(
+                        "failed_pre_dispatch"
+                        if getattr(result, "retryable", False) is True
+                        else "ambiguous"
+                    ),
                     error_code=(
-                        str(getattr(result, "error", "document_dispatch_failed"))
+                        error_code
                         if notice_ok
                         else "failure_notice_undelivered"
                     ),
                 ) or correlation_id
+                outcomes.append(
+                    AttachmentDeliveryOutcome(
+                        path=file_path,
+                        dispatch_attempted=(
+                            getattr(result, "retryable", False) is not True
+                        ),
+                        delivered=False,
+                        message_id_confirmed=False,
+                        state=(
+                            "failed_pre_dispatch"
+                            if getattr(result, "retryable", False) is True
+                            else "ambiguous"
+                        ),
+                        error_code=(
+                            error_code
+                            if notice_ok
+                            else "failure_notice_undelivered"
+                        ),
+                    )
+                )
                 if not notice_ok:
                     logger.error(
                         "[%s] Artifact and failure-notice delivery both failed",
@@ -14994,7 +15175,13 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         await _deliver_document(media_path)
                 except Exception as e:
-                    logger.warning("[%s] Post-stream media delivery failed: %s", adapter.name, e)
+                    logger.warning(
+                        "[%s] Post-stream media delivery failed: "
+                        "phase=provider_dispatch code=media_dispatch_exception "
+                        "exception_class=%s",
+                        adapter.name,
+                        type(e).__name__,
+                    )
 
             for file_path in non_image_local:
                 try:
@@ -15013,10 +15200,17 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     else:
                         await _deliver_document(file_path)
                 except Exception as e:
-                    logger.warning("[%s] Post-stream file delivery failed: %s", adapter.name, e)
+                    logger.warning(
+                        "[%s] Post-stream file delivery failed: "
+                        "phase=provider_dispatch code=document_dispatch_exception "
+                        "exception_class=%s",
+                        adapter.name,
+                        type(e).__name__,
+                    )
 
         except Exception as e:
             logger.warning("Post-stream media extraction failed: %s", e)
+        return tuple(outcomes)
 
 
 
@@ -22468,10 +22662,16 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
                     _interrupt_depth=_interrupt_depth + 1,
                     event_message_id=next_message_id,
                     channel_prompt=next_channel_prompt,
-                    turn_provenance=__import__(
-                        "agent.turn_origin", fromlist=["TurnProvenance"]
-                    ).TurnProvenance.authenticated_direct_user(
-                        getattr(next_source, "user_id", None)
+                    # A queued event carries the exact envelope minted at its
+                    # own ingress.  Raw interrupt text has no event envelope
+                    # and must stay UNKNOWN rather than borrowing this chat's
+                    # authenticated identity.
+                    turn_provenance=(
+                        getattr(pending_event, "_trusted_turn_provenance", None)
+                        if pending_event is not None
+                        else __import__(
+                            "agent.turn_origin", fromlist=["TurnProvenance"]
+                        ).TurnProvenance.unknown()
                     ),
                 )
                 return _preserve_queued_followup_history_offset(result, followup_result)

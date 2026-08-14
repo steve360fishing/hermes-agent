@@ -5,15 +5,48 @@ from datetime import datetime, timedelta, timezone
 from types import SimpleNamespace
 
 from agent.tool_guardrails import ToolCallGuardrailController
-from agent.turn_origin import TurnProvenance
 from agent.tournament_intent_contract import (
     begin_tournament_intent_contract,
     clear_tournament_intent_contract,
     finalize_tournament_output,
 )
+from gateway.run import _mint_gateway_turn_provenance
 from agent.tournament_truth_support import canonical_json_sha256
 from tools import tournament_truth_gate_tool as tool
 from tools import tournament_source_capture_tool as capture_tool
+
+
+def _bound_direct_provenance(message: str, session_id: str):
+    """Use the gateway ingress mint and the matching agent request identity."""
+    return _mint_gateway_turn_provenance(
+        SimpleNamespace(text=message, message_id=f"message-{session_id}"),
+        SimpleNamespace(
+            user_id="steve",
+            platform="telegram",
+            profile="test",
+            chat_id="chat-1",
+            thread_id=None,
+            scope_id=f"agent:test:telegram:chat-1:{session_id}",
+        ),
+        is_internal=False,
+    )
+
+
+def _bound_agent(session_id: str):
+    return SimpleNamespace(
+        session_id=session_id,
+        platform="telegram",
+        _chat_id="chat-1",
+        _thread_id="",
+        _gateway_session_key=f"agent:test:telegram:chat-1:{session_id}",
+        tools=[],
+        valid_tool_names=set(),
+        stream_delta_callback=None,
+        _stream_callback=None,
+        _persist_session=None,
+        _tool_guardrails=ToolCallGuardrailController(),
+        _tournament_intent_contract=None,
+    )
 
 
 def _trusted_snapshot(path):
@@ -56,7 +89,7 @@ def test_validator_dispatch_binds_exact_receipt_to_active_contract(tmp_path, mon
             {
                 "surface": "story",
                 "content": "Verified public copy",
-                "destination": "platform:telegram",
+                "destination": "platform:telegram:chat-1",
             }
         ),
     }
@@ -69,22 +102,14 @@ def test_validator_dispatch_binds_exact_receipt_to_active_contract(tmp_path, mon
         "_run_preflight",
         lambda *_args, **_kwargs: (receipt_path, receipt, "receipt_loaded"),
     )
-    agent = SimpleNamespace(
-        session_id="session-tool",
-        platform="telegram",
-        tools=[],
-        valid_tool_names=set(),
-        stream_delta_callback=None,
-        _stream_callback=None,
-        _persist_session=None,
-        _tool_guardrails=ToolCallGuardrailController(),
-        _tournament_intent_contract=None,
-    )
+    agent = _bound_agent("session-tool")
     contract = begin_tournament_intent_contract(
         agent,
         message="Create a public tournament Story naming winners.",
         task_id="tool-bind",
-        turn_provenance=TurnProvenance.authenticated_direct_user("steve"),
+        turn_provenance=_bound_direct_provenance(
+            "Create a public tournament Story naming winners.", "session-tool"
+        ),
     )
     result = json.loads(
         tool.run_tournament_truth_gate(
@@ -138,22 +163,14 @@ def test_validator_rejects_a_hash_valid_blocked_receipt(tmp_path, monkeypatch):
     receipt_path.write_text(json.dumps(receipt), encoding="utf-8")
     monkeypatch.setattr(tool, "configured_runtime_roots", lambda: roots)
     monkeypatch.setattr(tool, "_run_preflight", lambda *_args, **_kwargs: (receipt_path, receipt, "receipt_loaded"))
-    agent = SimpleNamespace(
-        session_id="session-blocked",
-        platform="telegram",
-        tools=[],
-        valid_tool_names=set(),
-        stream_delta_callback=None,
-        _stream_callback=None,
-        _persist_session=None,
-        _tool_guardrails=ToolCallGuardrailController(),
-        _tournament_intent_contract=None,
-    )
+    agent = _bound_agent("session-blocked")
     begin_tournament_intent_contract(
         agent,
         message="Create a public tournament Story naming winners.",
         task_id="tool-blocked",
-        turn_provenance=TurnProvenance.authenticated_direct_user("steve"),
+        turn_provenance=_bound_direct_provenance(
+            "Create a public tournament Story naming winners.", "session-blocked"
+        ),
     )
     result = json.loads(
         tool.run_tournament_truth_gate(
@@ -356,14 +373,14 @@ def test_capture_manifest_flows_to_truth_gate_without_model_authored_evidence(tm
             require_public_entrypoint_receipt=require_public_entrypoint_receipt
         ),
     )
-    agent = SimpleNamespace(session_id="capture-gate", platform="telegram", tools=[], valid_tool_names=set(),
-        stream_delta_callback=None, _stream_callback=None, _persist_session=None,
-        _tool_guardrails=ToolCallGuardrailController(), _tournament_intent_contract=None)
+    agent = _bound_agent("capture-gate")
     contract = begin_tournament_intent_contract(
         agent,
         message="Create a public tournament Story.",
         task_id="capture-gate",
-        turn_provenance=TurnProvenance.authenticated_direct_user("steve"),
+        turn_provenance=_bound_direct_provenance(
+            "Create a public tournament Story.", "capture-gate"
+        ),
     )
     result = json.loads(tool.run_tournament_truth_gate(
         {"candidate": candidate, "request": request, "artifact_metadata": metadata},

@@ -2068,6 +2068,16 @@ class AIAgent:
                     api_content=_row_api_content,
                     turn_origin=msg.get("turn_origin"),
                     turn_actor_identity=msg.get("turn_actor_identity"),
+                    turn_provenance_json=(
+                        json.dumps({
+                            key.removeprefix("turn_"): value
+                            for key, value in msg.items()
+                            if key.startswith("turn_") and key not in {
+                                "turn_origin", "turn_actor_identity"
+                            }
+                        }, sort_keys=True, separators=(",", ":"))
+                        if msg.get("turn_origin") else None
+                    ),
                 )
                 msg[_DB_PERSISTED_MARKER] = True
             # The intrinsic markers are now the sole source of truth. Reset the
