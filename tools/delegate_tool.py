@@ -18,6 +18,7 @@ never the child's intermediate tool calls or reasoning.
 """
 
 import enum
+import inspect
 import json
 import logging
 from copy import deepcopy
@@ -2109,11 +2110,24 @@ def _run_single_child(
 
         def _run_with_thread_capture():
             _worker_thread_holder["t"] = threading.current_thread()
+            conversation_kwargs = {
+                "user_message": goal,
+                "task_id": child_task_id,
+                "stream_callback": _relay_child_text,
+            }
+            try:
+                parameters = inspect.signature(child.run_conversation).parameters
+            except (TypeError, ValueError):
+                parameters = {}
+            if "turn_provenance" in parameters or any(
+                parameter.kind is inspect.Parameter.VAR_KEYWORD
+                for parameter in parameters.values()
+            ):
+                conversation_kwargs["turn_provenance"] = TurnProvenance.internal(
+                    TurnOrigin.DELEGATED_AGENT
+                )
             return child.run_conversation(
-                user_message=goal,
-                task_id=child_task_id,
-                stream_callback=_relay_child_text,
-                turn_provenance=TurnProvenance.internal(TurnOrigin.DELEGATED_AGENT),
+                **conversation_kwargs,
             )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)

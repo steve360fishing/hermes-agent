@@ -88,13 +88,19 @@ def _open_verified_document_descriptor(file_path: str) -> int:
         raise _UnsafeDocumentPath(code) from exc
 
 
-def _record_document_transport_attempt(file_path: str) -> None:
+def _record_document_transport_attempt(
+    file_path: str,
+    *,
+    state: str = "dispatching",
+    error_code: str = "",
+) -> None:
     from agent.task_execution_contract import record_artifact_dispatch
 
     record_artifact_dispatch(
         file_path,
-        state="dispatching",
-        transport_attempt=True,
+        state=state,
+        error_code=error_code,
+        transport_attempt=state == "dispatching",
     )
 
 
@@ -105,17 +111,6 @@ def _record_document_preflight_failure(file_path: str, error_code: str) -> None:
     record_artifact_dispatch(
         file_path,
         state="failed_pre_dispatch",
-        error_code=error_code,
-    )
-
-
-def _record_document_ambiguous(file_path: str, error_code: str) -> None:
-    """Quarantine a provider-bound attempt whose effect is not proven."""
-    from agent.task_execution_contract import record_artifact_dispatch
-
-    record_artifact_dispatch(
-        file_path,
-        state="ambiguous",
         error_code=error_code,
     )
 
@@ -7093,7 +7088,11 @@ class TelegramAdapter(BasePlatformAdapter):
                     if raw_message_id is None or not str(raw_message_id).strip()
                     else "document_message_id_invalid"
                 )
-                _record_document_ambiguous(file_path, code)
+                _record_document_transport_attempt(
+                    file_path,
+                    state="ambiguous",
+                    error_code=code,
+                )
                 logger.warning(
                     "[%s] Telegram document delivery unconfirmed "
                     "phase=provider_ack code=%s provider_status= exception_class=",
@@ -7117,7 +7116,11 @@ class TelegramAdapter(BasePlatformAdapter):
             )
         except Exception as e:
             code = "document_dispatch_exception"
-            _record_document_ambiguous(file_path, code)
+            _record_document_transport_attempt(
+                file_path,
+                state="ambiguous",
+                error_code=code,
+            )
             logger.warning(
                 "[%s] Failed to send document: phase=provider_dispatch "
                 "code=%s provider_status=%s exception_class=%s",

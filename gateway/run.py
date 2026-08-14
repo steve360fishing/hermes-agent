@@ -10316,9 +10316,11 @@ class GatewayRunner(GatewayAuthorizationMixin, GatewayKanbanWatchersMixin, Gatew
         _authority_text = event.text if isinstance(event.text, str) else ""
         _authority_message_id = getattr(event, "message_id", None)
         _authority_event_id = getattr(event, "platform_update_id", None)
-        _authority_authorized = is_internal or self._is_user_authorized(
-            _authority_source
-        )
+        # Authorize against the complete ingress source before plugins run.
+        # The reduced snapshot below is intentionally only the immutable
+        # provenance binding surface; it omits transport/authentication fields
+        # such as delivered_via_upstream_relay that authorization requires.
+        _authority_authorized = is_internal or self._is_user_authorized(source)
         _sealed_turn_provenance = None
         if _authority_authorized:
             _sealed_turn_provenance = _mint_gateway_turn_provenance(
