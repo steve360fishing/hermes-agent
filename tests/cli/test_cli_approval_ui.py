@@ -373,6 +373,7 @@ class TestCliApprovalUi:
 
                 seen["approval"] = _get_approval_callback()
                 seen["sudo"] = _get_sudo_password_callback()
+                seen["turn_provenance"] = kwargs["turn_provenance"]
                 return {
                     "final_response": "done",
                     "messages": [],
@@ -384,7 +385,9 @@ class TestCliApprovalUi:
              patch.object(cli_module, "_cprint"), \
              patch.object(cli_module, "ChatConsole") as chat_console:
             chat_console.return_value.print = MagicMock()
-            cli._handle_background_command("/btw check weather")
+            cli._handle_background_command(
+                "/btw prepare tournament publication release approval notes"
+            )
 
             # Join the worker thread deterministically rather than polling a
             # wall-clock deadline — under load the thread's finally-block pop
@@ -396,6 +399,11 @@ class TestCliApprovalUi:
         assert seen["approval"].__func__ is HermesCLI._approval_callback
         assert seen["sudo"].__self__ is cli
         assert seen["sudo"].__func__ is HermesCLI._sudo_password_callback
+        from agent.turn_origin import TurnOrigin
+
+        provenance = seen["turn_provenance"]
+        assert provenance.origin is TurnOrigin.MODEL_GENERATED
+        assert not provenance.is_authenticated_direct_user
         assert not cli._background_tasks
 
 

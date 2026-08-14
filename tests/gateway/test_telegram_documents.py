@@ -693,6 +693,38 @@ class TestSendDocument:
         assert call_kwargs["caption"] == "Here's the report"
 
     @pytest.mark.asyncio
+    @pytest.mark.parametrize(
+        "message_id",
+        [None, "", "   ", "abc", "12.5", -1, 0, 1.5, True],
+    )
+    async def test_send_document_requires_nonempty_telegram_message_id(
+        self, connected_adapter, tmp_path, message_id
+    ):
+        """A transport response without a Telegram id is not delivery proof."""
+        test_file = tmp_path / "report.txt"
+        test_file.write_bytes(b"artifact bytes")
+        connected_adapter._bot.send_document = AsyncMock(
+            return_value=SimpleNamespace(message_id=message_id)
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(test_file)
+        )
+
+        assert result.success is False
+        assert result.message_id in (None, "")
+        assert result.error in {
+            "document_message_id_missing",
+            "document_message_id_invalid",
+        }
+        assert result.retryable is False
+        diagnostic = result.raw_response["document_diagnostic"]
+        assert diagnostic["phase"] == "provider_ack"
+        assert diagnostic["code"] == result.error
+        assert diagnostic["provider_status"] == ""
+        assert diagnostic["exception_class"] == ""
+
+    @pytest.mark.asyncio
     async def test_send_document_custom_filename(self, connected_adapter, tmp_path):
         """The file_name parameter overrides the basename for display."""
         test_file = tmp_path / "doc_abc123_ugly.csv"
@@ -798,10 +830,13 @@ class TestSendDocument:
 
         assert result.success is False
         assert result.error == "document_path_changed"
+        assert result.retryable is True
         connected_adapter._bot.send_document.assert_not_awaited()
         receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
-        assert receipt["state"] == "failed_preflight"
+        assert receipt["state"] == "failed_pre_dispatch"
+        assert receipt["retryable"] is True
         assert receipt["attempt_count"] == 0
+        assert artifact.exists()
 
     @pytest.mark.asyncio
     async def test_send_document_rejects_same_inode_content_rewrite(
@@ -921,7 +956,7 @@ class TestSendDocument:
         assert "Not connected" in result.error
 
     @pytest.mark.asyncio
-    async def test_registered_document_not_connected_terminalizes_before_dispatch(
+    async def test_registered_document_not_connected_stays_retryable_before_dispatch(
         self, adapter, tmp_path, monkeypatch
     ):
         """No Telegram bot is a preflight failure, never an ambiguous attempt."""
@@ -946,18 +981,73 @@ class TestSendDocument:
 
         assert result.success is False
         assert result.error == "Not connected"
+        assert result.retryable is True
         receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
-        assert receipt["state"] == "failed_preflight"
+        assert receipt["state"] == "failed_pre_dispatch"
+        assert receipt["retryable"] is True
         assert receipt["error_code"] == "telegram_not_connected"
         assert receipt["attempt_count"] == 0
-        # Both gateway dispatchers may record ambiguity after a failed result;
-        # a terminal preflight receipt must remain untouched and retry-free.
+        assert artifact.read_bytes() == b"trusted"
+        # A generic caller cannot overwrite proven no-provider-call state with
+        # ambiguity.  Only an explicit later provider attempt can advance it.
         assert record_artifact_dispatch(
             str(artifact), state="ambiguous", error_code="document_dispatch_failed"
-        ) is None
+        )
         receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
-        assert receipt["state"] == "failed_preflight"
+        assert receipt["state"] == "failed_pre_dispatch"
         assert receipt["attempt_count"] == 0
+
+        adapter._bot = AsyncMock()
+        adapter._bot.send_document = AsyncMock(
+            return_value=SimpleNamespace(message_id=303)
+        )
+        retry_result = await adapter.send_document(
+            chat_id="12345", file_path=str(artifact)
+        )
+        assert retry_result.success is True
+        assert retry_result.message_id == "303"
+        assert adapter._bot.send_document.await_count == 1
+
+    @pytest.mark.asyncio
+    async def test_descriptor_open_race_is_retryable_pre_dispatch(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import (
+            build_task_execution_contract,
+            record_artifact_written,
+        )
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver race.txt containing safe text.",
+            task_id="descriptor-open-race",
+            platform="telegram",
+        )
+        artifact = Path(contract.artifact_output_path)
+        artifact.write_bytes(b"trusted")
+        assert record_artifact_written(contract) is True
+        monkeypatch.setattr(
+            "plugins.platforms.telegram.adapter._open_verified_document_descriptor",
+            MagicMock(side_effect=FileNotFoundError("raced before open")),
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(artifact)
+        )
+
+        assert result.success is False
+        assert result.error == "document_path_missing"
+        assert result.retryable is True
+        connected_adapter._bot.send_document.assert_not_awaited()
+        receipt = json.loads(
+            Path(contract.artifact_receipt_path).read_text(encoding="utf-8")
+        )
+        assert receipt["state"] == "failed_pre_dispatch"
+        assert receipt["retryable"] is True
+        assert receipt["attachment_dispatch_attempted"] is False
+        assert receipt["attempt_count"] == 0
+        assert artifact.read_bytes() == b"trusted"
 
     @pytest.mark.asyncio
     async def test_send_document_caption_truncated(self, connected_adapter, tmp_path):
@@ -1000,7 +1090,47 @@ class TestSendDocument:
 
         assert result.success is False
         assert result.error == "document_dispatch_exception"
+        assert result.retryable is False
         connected_adapter.send.assert_not_awaited()
+
+    @pytest.mark.asyncio
+    async def test_provider_exception_quarantines_registered_artifact_without_retry(
+        self, connected_adapter, tmp_path, monkeypatch
+    ):
+        from agent.task_execution_contract import (
+            build_task_execution_contract,
+            record_artifact_written,
+        )
+
+        monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
+        monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
+        contract = build_task_execution_contract(
+            "Create and deliver evidence.txt containing safe text.",
+            task_id="provider-unknown-outcome",
+            platform="telegram",
+        )
+        artifact = Path(contract.artifact_output_path)
+        artifact.write_bytes(b"trusted")
+        assert record_artifact_written(contract) is True
+        connected_adapter._bot.send_document = AsyncMock(
+            side_effect=RuntimeError("provider accepted then disconnected")
+        )
+
+        result = await connected_adapter.send_document(
+            chat_id="12345", file_path=str(artifact)
+        )
+
+        assert result.success is False
+        assert result.retryable is False
+        assert connected_adapter._bot.send_document.await_count == 1
+        receipt = json.loads(
+            Path(contract.artifact_receipt_path).read_text(encoding="utf-8")
+        )
+        assert receipt["state"] == "ambiguous"
+        assert receipt["attachment_dispatch_attempted"] is True
+        assert receipt["attachment_delivered"] is False
+        assert receipt["attachment_message_id_confirmed"] is False
+        assert receipt["attempt_count"] == 1
 
     @pytest.mark.asyncio
     async def test_send_document_reply_to(self, connected_adapter, tmp_path):

@@ -442,6 +442,55 @@ def test_normal_turn_blocks_expired_bare_artifact_path_in_prose(monkeypatch):
     assert result["turn_exit_reason"] == "expired_artifact_path_reuse_blocked"
 
 
+def test_public_candidate_hold_preserves_preceding_private_explanation():
+    """A receipt HOLD replaces only the typed public candidate, never private context."""
+    from agent.tournament_intent_contract import (
+        TournamentIntentContract,
+        TournamentIntentState,
+        finalize_tournament_output,
+    )
+
+    agent = _StubAgent(raise_in=())
+    private_explanation = "I found the source conflict and need a verified snapshot."
+    public_candidate = "Public tournament caption with an unsupported claim."
+    messages = [
+        {"role": "user", "content": "Now draft the public candidate."},
+        {
+            "role": "assistant",
+            "content": private_explanation,
+            "tournament_response_part": "PRIVATE_EXPLANATION",
+        },
+        {
+            "role": "assistant",
+            "content": public_candidate,
+            "tournament_response_part": "PUBLIC_CANDIDATE",
+        },
+    ]
+    contract = TournamentIntentContract(
+        state=TournamentIntentState.PUBLIC_FACING_DRAFT,
+        task_id="typed-public-candidate",
+        session_id="sess-1",
+        destination="telegram:private",
+        entrypoint="telegram",
+        actor_identity="authenticated-user",
+    )
+    response, telemetry, failed = finalize_tournament_output(
+        agent,
+        candidate=public_candidate,
+        messages=messages,
+        contract=contract,
+    )
+
+    assert failed is True
+    assert telemetry is not None
+    assert telemetry["code"] == "receipt_missing_or_consumed"
+    assert private_explanation in response
+    assert messages[-1]["content"] == response
+    assert "DRAFT_VALIDATION_HOLD" in response
+    assert public_candidate not in response
+    assert "release approval" not in response.lower()
+
+
 def test_artifact_max_iteration_does_not_mutate_kanban_state():
     agent = _StubAgent(raise_in=())
     agent._task_execution_contract = build_task_execution_contract(

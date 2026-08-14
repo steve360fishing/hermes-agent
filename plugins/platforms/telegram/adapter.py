@@ -99,13 +99,58 @@ def _record_document_transport_attempt(file_path: str) -> None:
 
 
 def _record_document_preflight_failure(file_path: str, error_code: str) -> None:
-    """Terminalize registered artifacts rejected before Telegram is called."""
+    """Record a retryable local failure before Telegram was invoked."""
     from agent.task_execution_contract import record_artifact_dispatch
 
     record_artifact_dispatch(
         file_path,
-        state="failed_preflight",
+        state="failed_pre_dispatch",
         error_code=error_code,
+    )
+
+
+def _record_document_ambiguous(file_path: str, error_code: str) -> None:
+    """Quarantine a provider-bound attempt whose effect is not proven."""
+    from agent.task_execution_contract import record_artifact_dispatch
+
+    record_artifact_dispatch(
+        file_path,
+        state="ambiguous",
+        error_code=error_code,
+    )
+
+
+def _document_failure_result(
+    code: str,
+    *,
+    phase: str,
+    exception: BaseException | None = None,
+    retryable: bool = False,
+) -> "SendResult":
+    """Build a stable, redacted document failure result.
+
+    Provider response bodies and exception strings are intentionally excluded
+    from this structure.  Operators still get a deterministic phase, code,
+    and exception class for diagnosis without leaking bot tokens or payloads.
+    """
+    raw_status = getattr(exception, "status_code", None) if exception else None
+    provider_status = (
+        str(raw_status)
+        if isinstance(raw_status, int) and not isinstance(raw_status, bool)
+        else ""
+    )
+    diagnostic = {
+        "phase": phase,
+        "code": code,
+        "provider_status": provider_status,
+        "exception_class": type(exception).__name__ if exception else "",
+    }
+    return SendResult(
+        success=False,
+        error=code,
+        raw_response={"document_diagnostic": diagnostic},
+        retryable=retryable,
+        error_kind="unknown",
     )
 
 
@@ -328,6 +373,7 @@ from gateway.platforms.base import (
     MessageType,
     ProcessingOutcome,
     SendResult,
+    confirmed_platform_message_id,
     classify_send_error,
     cache_image_from_bytes,
     cache_audio_from_bytes,
@@ -1428,10 +1474,11 @@ class TelegramAdapter(BasePlatformAdapter):
                 raise
             logger.warning(
                 "[%s] Reply target deleted for Telegram %s, "
-                "retrying without reply/topic anchor: %s",
+                "retrying without reply/topic anchor: phase=provider_ack "
+                "code=reply_anchor_not_found exception_class=%s",
                 self.name,
                 media_label,
-                _redact_telegram_error_text(send_err),
+                type(send_err).__name__,
             )
             if reset_media is not None:
                 reset_media()
@@ -6966,10 +7013,10 @@ class TelegramAdapter(BasePlatformAdapter):
             except Exception as doc_err:
                 logger.error(
                     "[%s] Failed to send Telegram local image as document, "
-                    "falling back to base adapter: %s",
+                    "falling back to base adapter: phase=provider_dispatch "
+                    "code=document_dispatch_exception exception_class=%s",
                     self.name,
-                    doc_err,
-                    exc_info=True,
+                    type(doc_err).__name__,
                 )
                 return await super().send_image_file(chat_id, image_path, caption, reply_to, metadata=metadata)
 
@@ -6986,12 +7033,20 @@ class TelegramAdapter(BasePlatformAdapter):
         """Send a document/file natively as a Telegram file attachment."""
         if not self._bot:
             _record_document_preflight_failure(file_path, "telegram_not_connected")
-            return SendResult(success=False, error="Not connected")
+            return SendResult(
+                success=False,
+                error="Not connected",
+                retryable=True,
+            )
 
         try:
             if not os.path.exists(file_path):
                 _record_document_preflight_failure(file_path, "document_path_missing")
-                return SendResult(success=False, error=self._missing_media_path_error("File", file_path))
+                return SendResult(
+                    success=False,
+                    error=self._missing_media_path_error("File", file_path),
+                    retryable=True,
+                )
 
             display_name = file_name or os.path.basename(file_path)
             _thread = self._metadata_thread_id(metadata)
@@ -7028,16 +7083,59 @@ class TelegramAdapter(BasePlatformAdapter):
             finally:
                 if fd is not None:
                     os.close(fd)
-            return SendResult(success=True, message_id=str(msg.message_id))
-        except _UnsafeDocumentPath as e:
-            _record_document_preflight_failure(file_path, str(e) or "document_path_changed")
-            return SendResult(success=False, error=str(e) or "document_path_changed")
-        except Exception as e:
-            logger.warning(
-                "[%s] Failed to send document: %s",
-                self.name, _redact_telegram_error_text(e),
+            raw_message_id = getattr(msg, "message_id", None)
+            confirmed_message_id = confirmed_platform_message_id(
+                "telegram", raw_message_id
             )
-            return SendResult(success=False, error="document_dispatch_exception")
+            if confirmed_message_id is None:
+                code = (
+                    "document_message_id_missing"
+                    if raw_message_id is None or not str(raw_message_id).strip()
+                    else "document_message_id_invalid"
+                )
+                _record_document_ambiguous(file_path, code)
+                logger.warning(
+                    "[%s] Telegram document delivery unconfirmed "
+                    "phase=provider_ack code=%s provider_status= exception_class=",
+                    self.name,
+                    code,
+                )
+                return _document_failure_result(code, phase="provider_ack")
+            return SendResult(success=True, message_id=confirmed_message_id)
+        except (FileNotFoundError, _UnsafeDocumentPath) as e:
+            code = (
+                "document_path_missing"
+                if isinstance(e, FileNotFoundError)
+                else str(e) or "document_path_changed"
+            )
+            _record_document_preflight_failure(file_path, code)
+            return _document_failure_result(
+                code,
+                phase="local_pre_dispatch",
+                exception=e,
+                retryable=True,
+            )
+        except Exception as e:
+            code = "document_dispatch_exception"
+            _record_document_ambiguous(file_path, code)
+            logger.warning(
+                "[%s] Failed to send document: phase=provider_dispatch "
+                "code=%s provider_status=%s exception_class=%s",
+                self.name,
+                code,
+                (
+                    str(getattr(e, "status_code"))
+                    if isinstance(getattr(e, "status_code", None), int)
+                    and not isinstance(getattr(e, "status_code", None), bool)
+                    else ""
+                ),
+                type(e).__name__,
+            )
+            return _document_failure_result(
+                code,
+                phase="provider_dispatch",
+                exception=e,
+            )
 
     async def send_video(
         self,

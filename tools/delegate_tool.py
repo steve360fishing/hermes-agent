@@ -33,6 +33,7 @@ from concurrent.futures import (
 from typing import Any, Dict, List, Optional
 
 from toolsets import TOOLSETS
+from agent.turn_origin import TurnOrigin, TurnProvenance
 
 # Sentinel value used by the runtime provider system for providers that are
 # not natively known (named custom providers, third-party aggregators, etc.).
@@ -2112,6 +2113,7 @@ def _run_single_child(
                 user_message=goal,
                 task_id=child_task_id,
                 stream_callback=_relay_child_text,
+                turn_provenance=TurnProvenance.internal(TurnOrigin.DELEGATED_AGENT),
             )
 
         _child_future = _timeout_executor.submit(_run_with_thread_capture)

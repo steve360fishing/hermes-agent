@@ -1077,7 +1077,7 @@ def test_oneshot_subprocess_exits_without_teardown_abort():
     )
 
     assert result.returncode == 0
-    assert result.stdout == b"ok\n"
+    assert result.stdout.replace(b"\r\n", b"\n") == b"ok\n"
     # Don't demand byte-empty stderr — an import-time warning from the heavy
     # CLI import chain shouldn't fail this. What matters is no crash traceback.
     assert b"Traceback" not in result.stderr
@@ -1106,7 +1106,7 @@ def test_exit_after_oneshot_bypasses_late_atexit_abort():
     )
 
     assert result.returncode == 0
-    assert result.stdout == b"done\n"
+    assert result.stdout.replace(b"\r\n", b"\n") == b"done\n"
 
 
 def test_run_and_exit_oneshot_passes_through_nonzero_return(monkeypatch, main_mod):
@@ -1163,25 +1163,29 @@ def test_main_oneshot_path_bypasses_late_atexit_abort():
     )
 
     assert result.returncode == 0
-    assert result.stdout == b"ok\n"
+    assert result.stdout.replace(b"\r\n", b"\n") == b"ok\n"
     assert b"Traceback" not in result.stderr
 
 
 def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
     import hermes_cli.oneshot as oneshot_mod
+    from agent.turn_origin import TurnOrigin
 
     closed = []
     shutdown_messages = []
+    captured = {}
 
     class FakeAgent:
-        def __init__(self, **_kwargs):
+        def __init__(self, **kwargs):
+            captured["init"] = kwargs
             self.suppress_status_output = False
             self.stream_delta_callback = object()
             self.tool_gen_callback = object()
             self._session_messages = [{"role": "user", "content": "hello"}]
 
-        def run_conversation(self, prompt, **_kwargs):
-            assert prompt == "hello"
+        def run_conversation(self, prompt, **kwargs):
+            assert prompt == "Prepare tournament publication release approval notes."
+            captured["turn_provenance"] = kwargs["turn_provenance"]
             return {"final_response": "done"}
 
         def shutdown_memory_provider(self, messages=None):
@@ -1211,10 +1215,16 @@ def test_oneshot_run_agent_closes_agent_after_chat(monkeypatch):
 
     assert (
         oneshot_mod._run_agent(
-            "hello", model="gpt-test", provider="openai", use_config_toolsets=False
+            "Prepare tournament publication release approval notes.",
+            model="gpt-test",
+            provider="openai",
+            use_config_toolsets=False,
         )
         == ("done", {"final_response": "done"})
     )
+    provenance = captured["turn_provenance"]
+    assert provenance.origin is TurnOrigin.UNKNOWN
+    assert not provenance.is_authenticated_direct_user
     assert closed == [True]
     assert shutdown_messages == [[{"role": "user", "content": "hello"}]]
 

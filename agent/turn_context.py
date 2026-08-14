@@ -518,6 +518,12 @@ def build_turn_context(
     if turn_provenance.origin.value != "unknown":
         user_msg["turn_origin"] = turn_provenance.origin.value
         user_msg["turn_actor_identity"] = turn_provenance.actor_identity
+        for key in (
+            "platform", "profile", "chat_id", "thread_id", "message_id",
+            "event_id", "session_scope", "authority_text_sha256",
+            "captured_at_unix_ms", "binding_sha256",
+        ):
+            user_msg[f"turn_{key}"] = getattr(turn_provenance, key)
 
     # Hydrate todo store from conversation history.
     if conversation_history and not agent._todo_store.has_items():

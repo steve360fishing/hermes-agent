@@ -92,20 +92,40 @@ async def test_send_document_failure_redacts_token_in_log(monkeypatch, caplog, t
     file_path = tmp_path / "report.pdf"
     file_path.write_bytes(b"%PDF-1.4 fake")
 
+    provider_body = "UNIQUE_PROVIDER_BODY_DO_NOT_LOG_7f31"
     monkeypatch.setattr(
         adapter,
         "_send_with_dm_topic_reply_anchor_retry",
-        AsyncMock(side_effect=RuntimeError(f"upload failed: {_SECRET_URL}")),
+        AsyncMock(
+            side_effect=RuntimeError(
+                f"upload failed: {provider_body}: {_SECRET_URL}"
+            )
+        ),
     )
     fallback = AsyncMock(return_value=SimpleNamespace(success=False, error="fallback"))
     monkeypatch.setattr(BasePlatformAdapter, "send_document", fallback)
 
     with caplog.at_level("WARNING"):
-        await adapter.send_document("123", str(file_path))
+        result = await adapter.send_document("123", str(file_path))
 
     logged = "\n".join(r.getMessage() for r in caplog.records)
     assert _SECRET_TOKEN not in logged
+    assert provider_body not in logged
     assert "Failed to send document" in logged
+    assert "phase=provider_dispatch" in logged
+    assert "code=document_dispatch_exception" in logged
+    assert "provider_status=" in logged
+    assert "exception_class=RuntimeError" in logged
+    assert result.error == "document_dispatch_exception"
+    assert result.raw_response == {
+        "document_diagnostic": {
+            "phase": "provider_dispatch",
+            "code": "document_dispatch_exception",
+            "provider_status": "",
+            "exception_class": "RuntimeError",
+        }
+    }
+    assert _SECRET_TOKEN not in str(result.raw_response)
 
 
 @pytest.mark.asyncio

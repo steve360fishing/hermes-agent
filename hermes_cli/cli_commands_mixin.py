@@ -29,6 +29,7 @@ from rich.panel import Panel
 
 from hermes_constants import display_hermes_home, is_termux as _is_termux_environment
 from agent.turn_context import extract_api_content_sidecar
+from agent.turn_origin import TurnOrigin, TurnProvenance
 from hermes_cli.browser_connect import (
     DEFAULT_BROWSER_CDP_URL,
     discover_local_cdp_url,
@@ -1698,6 +1699,7 @@ class CLICommandsMixin:
                 result = bg_agent.run_conversation(
                     user_message=prompt,
                     task_id=task_id,
+                    turn_provenance=TurnProvenance.internal(TurnOrigin.MODEL_GENERATED),
                 )
 
                 response = result.get("final_response", "") if result else ""

@@ -39,12 +39,18 @@ _TERMINAL_RECEIPT_STATES = frozenset({"delivered", "failed_preflight", "ambiguou
 _ALLOWED_RECEIPT_TRANSITIONS = {
     "": frozenset({"allocated"}),
     "allocated": frozenset({"allocated", "written", "failed_preflight", "ambiguous"}),
-    "written": frozenset({"written", "dispatching", "failed_preflight", "ambiguous"}),
+    "written": frozenset({
+        "written", "failed_pre_dispatch", "dispatching", "failed_preflight", "ambiguous"
+    }),
+    "failed_pre_dispatch": frozenset({
+        "failed_pre_dispatch", "dispatching", "failed_preflight"
+    }),
     "dispatching": frozenset({"dispatching", "delivered", "ambiguous"}),
 }
 _LIFECYCLE_STATE = {
     "allocated": "REQUESTED",
     "written": "READ_BACK_VERIFIED",
+    "failed_pre_dispatch": "FAILED_PREFLIGHT",
     "dispatching": "DELIVERY_REFERENCED",
     "delivered": "COMPLETE",
     "failed_preflight": "FAILED",
@@ -53,6 +59,9 @@ _LIFECYCLE_STATE = {
 _LIFECYCLE_STEPS = {
     "allocated": ("REQUESTED",),
     "written": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED"),
+    "failed_pre_dispatch": (
+        "REQUESTED", "CREATED", "READ_BACK_VERIFIED", "FAILED_PREFLIGHT"
+    ),
     "dispatching": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "DELIVERY_REFERENCED"),
     "delivered": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "DELIVERY_REFERENCED", "COMPLETE"),
     "failed_preflight": ("REQUESTED", "FAILED"),
@@ -1278,7 +1287,11 @@ def open_registered_artifact_descriptor(path: str) -> int | None:
             receipt.get("id") != contract.artifact_id
             or receipt.get("path") != contract.artifact_output_path
             or receipt.get("mime") != contract.artifact_mime_type
-            or receipt.get("state") not in {"written", "dispatching"}
+            or receipt.get("state") not in {
+                "written",
+                "failed_pre_dispatch",
+                "dispatching",
+            }
         ):
             raise ArtifactPathSecurityError("artifact_receipt_mismatch")
         with _hold_parent_chain(contract._artifact_parent_chain) as parent_fd:
@@ -1489,6 +1502,20 @@ def _write_artifact_receipt_locked(
         "bytes": size if size is not None else prior.get("bytes", 0),
         "mime": contract.artifact_mime_type,
         "state": state,
+        # Text and attachment delivery are independent obligations.  This
+        # receipt describes only the requested artifact, and must never infer
+        # its success from a streamed text bubble.
+        "attachment_dispatch_attempted": bool(
+            prior.get("attachment_dispatch_attempted", False)
+            or state == "dispatching"
+            or int(prior.get("attempt_count", 0)) > 0
+            or transport_attempt
+        ),
+        "attachment_delivered": state == "delivered",
+        "attachment_message_id_confirmed": bool(
+            state == "delivered" and message_id is not None and str(message_id).strip()
+        ),
+        "retryable": state == "failed_pre_dispatch",
         "lifecycle_state": _LIFECYCLE_STATE[state],
         "lifecycle": list(_LIFECYCLE_STEPS[state]),
         "attempt_count": int(prior.get("attempt_count", 0))
@@ -1629,6 +1656,7 @@ def _reconcile_artifact_store(artifact_base: str) -> None:
         if not isinstance(receipt, dict) or receipt.get("state") not in {
             "allocated",
             "written",
+            "failed_pre_dispatch",
             "dispatching",
         }:
             continue

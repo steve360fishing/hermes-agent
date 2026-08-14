@@ -8,6 +8,7 @@ external publication additionally requires an exact, one-use release approval.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
+from contextvars import ContextVar
 from datetime import datetime, timedelta, timezone
 from enum import Enum
 import hashlib
@@ -16,7 +17,6 @@ import logging
 from pathlib import Path
 import re
 import secrets
-import threading
 from typing import Any, Callable, Mapping
 
 
@@ -56,6 +56,24 @@ class TournamentIntentState(str, Enum):
     RELEASE_APPROVAL = "release_approval_discussion_or_grant"
 
 
+class TournamentResponsePartKind(str, Enum):
+    PRIVATE_EXPLANATION = "PRIVATE_EXPLANATION"
+    PUBLIC_CANDIDATE = "PUBLIC_CANDIDATE"
+    HOLD = "HOLD"
+
+
+@dataclass(frozen=True)
+class TournamentResponsePart:
+    kind: TournamentResponsePartKind
+    text: str
+
+
+@dataclass(frozen=True)
+class TournamentResponseEnvelope:
+    private_explanation: TournamentResponsePart
+    public_candidate: TournamentResponsePart
+
+
 @dataclass(frozen=True)
 class ContractDecision:
     allowed: bool
@@ -74,9 +92,134 @@ class TournamentReleaseApproval:
     state: str = "available"
 
 
-_CONTRACTS: dict[tuple[str, str], "TournamentIntentContract"] = {}
-_CONTRACTS_LOCK = threading.RLock()
 _PENDING_PUBLICATIONS = TournamentReleaseStore()
+
+
+@dataclass(frozen=True)
+class TournamentTurnExecutionContext:
+    """Immutable request-local policy state propagated into tool workers."""
+
+    contract: "TournamentIntentContract | None" = None
+
+
+_ACTIVE_TOURNAMENT_CONTEXT: ContextVar[TournamentTurnExecutionContext] = (
+    ContextVar(
+        "active_tournament_execution_context",
+        default=TournamentTurnExecutionContext(),
+    )
+)
+
+
+class _StableTournamentCallbackMux:
+    """One stable callback that buffers only while a tournament turn is active."""
+
+    __slots__ = ("fallback",)
+
+    def __init__(self, fallback: Callable[[str | None], None] | None):
+        self.fallback = fallback
+
+    def __call__(self, value: str | None) -> None:
+        contract = current_tournament_contract()
+        if contract is not None:
+            contract.buffer(value)
+            return
+        if callable(self.fallback):
+            self.fallback(value)
+
+
+class _StableTournamentPersistenceMux:
+    """One stable persistence seam that defers only the active public turn."""
+
+    __slots__ = ("fallback",)
+
+    def __init__(self, fallback: Callable[..., None] | None):
+        self.fallback = fallback
+
+    def __call__(self, messages, conversation_history=None) -> None:
+        contract = current_tournament_contract()
+        if contract is not None:
+            contract.pending_persistence = (messages, conversation_history)
+            return
+        if callable(self.fallback):
+            self.fallback(messages, conversation_history)
+
+
+def current_tournament_contract() -> "TournamentIntentContract | None":
+    contract = _ACTIVE_TOURNAMENT_CONTEXT.get().contract
+    if isinstance(contract, TournamentIntentContract) and not contract.closed:
+        return contract
+    return None
+
+
+def bind_tournament_contract(contract: "TournamentIntentContract | None") -> None:
+    """Bind request authority to the current execution context, never the agent."""
+    _ACTIVE_TOURNAMENT_CONTEXT.set(TournamentTurnExecutionContext(contract=contract))
+
+
+def _install_stable_runtime_muxes(
+    agent: Any,
+) -> tuple[Callable[..., None] | None, Callable[..., None] | None]:
+    callback = getattr(agent, "stream_delta_callback", None)
+    if not isinstance(callback, _StableTournamentCallbackMux):
+        callback = _StableTournamentCallbackMux(callback if callable(callback) else None)
+        agent.stream_delta_callback = callback
+
+    persistence = getattr(agent, "_persist_session", None)
+    if not isinstance(persistence, _StableTournamentPersistenceMux):
+        persistence = _StableTournamentPersistenceMux(
+            persistence if callable(persistence) else None
+        )
+        agent._persist_session = persistence
+    return callback.fallback, persistence.fallback
+
+
+def _matches_current_request_binding(agent: Any, provenance: Any) -> bool:
+    """Bind a sealed ingress envelope to this agent's immutable route identity."""
+    raw_platform = getattr(agent, "platform", "")
+    platform = str(getattr(raw_platform, "value", raw_platform) or "").strip()
+    chat_id = str(getattr(agent, "_chat_id", "") or "")
+    thread_id = str(getattr(agent, "_thread_id", "") or "")
+    if not platform or not chat_id:
+        return False
+    if provenance.platform != platform or provenance.chat_id != chat_id:
+        return False
+    if provenance.thread_id != thread_id:
+        return False
+
+    gateway_session_key = str(
+        getattr(agent, "_gateway_session_key", "") or ""
+    )
+    if not gateway_session_key:
+        return False
+    namespace = (
+        "agent:main"
+        if provenance.profile in ("", "default")
+        else f"agent:{provenance.profile}"
+    )
+    if not gateway_session_key.startswith(f"{namespace}:{platform}:"):
+        return False
+
+    def _has_session_component(value: str) -> bool:
+        return bool(value) and (
+            f":{value}:" in gateway_session_key
+            or gateway_session_key.endswith(f":{value}")
+        )
+
+    if not _has_session_component(chat_id):
+        return False
+    if thread_id and not _has_session_component(thread_id):
+        return False
+
+    return provenance.matches_bound_request(
+        platform=platform,
+        profile=provenance.profile,
+        chat_id=chat_id,
+        thread_id=thread_id,
+        message_id=provenance.message_id,
+        event_id=provenance.event_id,
+        session_scope=provenance.session_scope,
+        authority_text=provenance.authority_text,
+    )
 
 _TOURNAMENT_CUE = re.compile(
     r"\b(?:tournaments?|catchstat|reel\s*time|leaderboards?|standings?|"
@@ -759,80 +902,17 @@ class TournamentIntentContract:
         return delivered
 
     def cleanup(self, agent: Any) -> bool:
+        """Close only this request's authority; stable runtime seams stay installed."""
         if self.closed:
             return True
-        active = getattr(agent, "_tournament_intent_contract", None)
+        active = current_tournament_contract()
         if isinstance(active, TournamentIntentContract) and not self.owns_turn(active):
             return False
-        unresolved: list[str] = []
-
-        for attribute, original in (
-            ("stream_delta_callback", self.original_stream_delta_callback),
-            ("_stream_callback", self.original_stream_callback),
-            ("_persist_session", self.original_persist_session),
-        ):
-            current = getattr(agent, attribute, None)
-            owned = (
-                _same_callback(current, self._defer_persistence)
-                if attribute == "_persist_session"
-                else _same_callback(current, self.buffer_callback)
-            )
-            if owned:
-                try:
-                    setattr(agent, attribute, original)
-                except Exception:
-                    unresolved.append(attribute)
-
-        guardrails = getattr(agent, "_tool_guardrails", None)
-        if guardrails is not None and self.owns_turn(
-            getattr(guardrails, "_tournament_contract", None)
-        ):
-            try:
-                guardrails.set_tournament_contract(None)
-            except Exception:
-                try:
-                    if self.owns_turn(getattr(guardrails, "_tournament_contract", None)):
-                        guardrails._tournament_contract = None
-                except Exception:
-                    unresolved.append("tool_guardrails")
-        if self.added_tool_schema:
-            try:
-                tools = getattr(agent, "tools", None)
-                if isinstance(tools, list):
-                    agent.tools = [
-                        tool for tool in tools
-                        if not isinstance(tool, Mapping)
-                        or tool.get("function", {}).get("name") not in self.added_tool_schemas
-                    ]
-            except Exception:
-                unresolved.append("tool_schemas")
-        if self.added_valid_tool_name:
-            try:
-                valid_names = getattr(agent, "valid_tool_names", None)
-                if isinstance(valid_names, set):
-                    valid_names.difference_update(self.added_valid_tool_names)
-                elif isinstance(valid_names, list):
-                    agent.valid_tool_names = [
-                        name for name in valid_names
-                        if name not in self.added_valid_tool_names
-                    ]
-            except Exception:
-                unresolved.append("valid_tool_names")
-        try:
-            with _CONTRACTS_LOCK:
-                if self.owns_turn(_CONTRACTS.get((self.task_id, self.session_id))):
-                    _CONTRACTS.pop((self.task_id, self.session_id), None)
-        except Exception:
-            unresolved.append("contract_registry")
-
-        self.closed = not unresolved
-        if unresolved:
-            logger.warning(
-                "Tournament contract cleanup incomplete for turn token %s: %s",
-                self.turn_token[:8],
-                ",".join(unresolved),
-            )
-        return self.closed
+        owns_active = self.owns_turn(active)
+        self.closed = True
+        if owns_active:
+            bind_tournament_contract(None)
+        return True
 
 
 def begin_tournament_intent_contract(
@@ -849,11 +929,16 @@ def begin_tournament_intent_contract(
     from agent.turn_origin import coerce_turn_provenance
 
     provenance = coerce_turn_provenance(turn_provenance)
-    if not provenance.is_authenticated_direct_user:
+    if not provenance.is_authenticated_direct_user or not _matches_current_request_binding(
+        agent, provenance
+    ):
         return None
+    # Only the adapter-sealed original command is authority-bearing.  The
+    # caller's effective/persist text may contain plugin, replay, or model data.
+    authority_message = provenance.authority_text
     authenticated_identity = provenance.actor_identity
     intake_state, packet = classify_bound_release_approval_intake(
-        message,
+        authority_message,
         session_id=str(getattr(agent, "session_id", "") or ""),
         authenticated_identity=authenticated_identity,
         turn_provenance=provenance,
@@ -875,13 +960,13 @@ def begin_tournament_intent_contract(
     )
     trusted_context = pending_context is not None
     intents = _classify_tournament_intents(
-        message, trusted_publication_context=trusted_context
+        authority_message, trusted_publication_context=trusted_context
     )
     state = classify_tournament_intent(
-        message, trusted_publication_context=trusted_context
+        authority_message, trusted_publication_context=trusted_context
     )
     if state is TournamentIntentState.RELEASE_REVOCATION_OR_QUESTION:
-        directed = _mask_non_authoritative_data(message) if isinstance(message, str) else ""
+        directed = _mask_non_authoritative_data(authority_message)
         if re.search(r"\b(?:revoke|withdraw|cancel)\b", directed, re.IGNORECASE):
             _PENDING_PUBLICATIONS.revoke_session(
                 session_id=session_id,
@@ -890,7 +975,7 @@ def begin_tournament_intent_contract(
             )
         return None
     if not _installs_tournament_contract(
-        state, message, trusted_publication_context=trusted_context
+        state, authority_message, trusted_publication_context=trusted_context
     ):
         return None
     contract = TournamentIntentContract(
@@ -906,7 +991,7 @@ def begin_tournament_intent_contract(
         actor_identity=authenticated_identity,
         turn_provenance=provenance,
         intents=intents,
-        external_publication_sink=_publication_sink_from_message(message),
+        external_publication_sink=_publication_sink_from_message(authority_message),
     )
     contract.pending_publication = pending_context
     try:
@@ -928,29 +1013,24 @@ def begin_tournament_intent_contract(
             name = schema.get("name") if isinstance(schema, Mapping) else ""
             if name and not any(tool.get("function", {}).get("name") == name for tool in tools):
                 tools.append({"type": "function", "function": schema})
-                contract.added_tool_schema = True
-                contract.added_tool_schemas.add(name)
         if isinstance(valid_names, set):
             for name in ("tournament_truth_gate", "tournament_source_capture"):
                 if name not in valid_names:
                     valid_names.add(name)
-                    contract.added_valid_tool_name = True
-                    contract.added_valid_tool_names.add(name)
         else:
             for name in ("tournament_truth_gate", "tournament_source_capture"):
                 if name not in valid_names:
                     valid_names.append(name)
-                    contract.added_valid_tool_name = True
-                    contract.added_valid_tool_names.add(name)
         if not any(
             tool.get("function", {}).get("name") == "tournament_truth_gate"
             for tool in tools
         ) or "tournament_truth_gate" not in valid_names:
             contract.preflight_error = "truth_gate_not_in_model_request"
     contract.buffer_callback = contract.buffer
-    contract.original_stream_delta_callback = getattr(agent, "stream_delta_callback", None)
+    base_stream_delta, base_persistence = _install_stable_runtime_muxes(agent)
+    contract.original_stream_delta_callback = base_stream_delta
     contract.original_stream_callback = getattr(agent, "_stream_callback", None)
-    contract.original_persist_session = getattr(agent, "_persist_session", None)
+    contract.original_persist_session = base_persistence
     for callback in (
         contract.original_stream_delta_callback,
         contract.original_stream_callback,
@@ -958,22 +1038,19 @@ def begin_tournament_intent_contract(
     ):
         if callable(callback) and not any(_same_callback(callback, current) for current in contract.callbacks):
             contract.callbacks.append(callback)
-    agent.stream_delta_callback = contract.buffer_callback
-    agent._stream_callback = contract.buffer_callback
-    if callable(contract.original_persist_session):
-        agent._persist_session = contract._defer_persistence
-    agent._tournament_intent_contract = contract
-    guardrails = getattr(agent, "_tool_guardrails", None)
-    if guardrails is not None:
-        guardrails.set_tournament_contract(contract)
-    with _CONTRACTS_LOCK:
-        _CONTRACTS[(contract.task_id, contract.session_id)] = contract
+    bind_tournament_contract(contract)
     return contract
 
 
 def active_contract(task_id: str, session_id: str) -> TournamentIntentContract | None:
-    with _CONTRACTS_LOCK:
-        return _CONTRACTS.get((str(task_id), str(session_id)))
+    contract = current_tournament_contract()
+    if (
+        contract is not None
+        and contract.task_id == str(task_id)
+        and contract.session_id == str(session_id)
+    ):
+        return contract
+    return None
 
 
 def prepare_tournament_publication(
@@ -1076,21 +1153,17 @@ def intake_authenticated_tournament_release_approval(
 def clear_tournament_intent_contract(
     agent: Any, *, expected_contract: TournamentIntentContract | None = None
 ) -> bool:
-    contract = getattr(agent, "_tournament_intent_contract", None)
+    contract = current_tournament_contract()
     if expected_contract is not None and not expected_contract.owns_turn(contract):
         return False
     if not isinstance(contract, TournamentIntentContract):
+        bind_tournament_contract(None)
         return True
-    cleaned = contract.cleanup(agent) if isinstance(contract, TournamentIntentContract) else False
-    if cleaned and isinstance(contract, TournamentIntentContract) and contract.owns_turn(
-        getattr(agent, "_tournament_intent_contract", None)
-    ):
-        agent._tournament_intent_contract = None
-    return bool(cleaned)
+    return bool(contract.cleanup(agent))
 
 
 def effective_request_system_prompt(agent: Any, base_prompt: str) -> str:
-    contract = getattr(agent, "_tournament_intent_contract", None)
+    contract = current_tournament_contract()
     guidance = contract.system_guidance if isinstance(contract, TournamentIntentContract) else ""
     return (base_prompt + "\n\n" + guidance).strip() if guidance else base_prompt
 
@@ -1120,7 +1193,9 @@ def _receipt_failure_recovery(code: str) -> str:
     }.get(code, "repair the trusted validation path and obtain a fresh exact receipt")
 
 
-def parse_mixed_publication_envelope(candidate: str) -> tuple[str, str] | None:
+def parse_mixed_publication_envelope(
+    candidate: str,
+) -> TournamentResponseEnvelope | None:
     try:
         payload = json.loads(candidate)
     except (TypeError, ValueError):
@@ -1131,7 +1206,47 @@ def parse_mixed_publication_envelope(candidate: str) -> tuple[str, str] | None:
     public_candidate = payload.get("public_candidate")
     if not isinstance(private_response, str) or not isinstance(public_candidate, str):
         return None
-    return private_response, public_candidate
+    return TournamentResponseEnvelope(
+        private_explanation=TournamentResponsePart(
+            TournamentResponsePartKind.PRIVATE_EXPLANATION,
+            private_response,
+        ),
+        public_candidate=TournamentResponsePart(
+            TournamentResponsePartKind.PUBLIC_CANDIDATE,
+            public_candidate,
+        ),
+    )
+
+
+def _render_response_parts(*parts: TournamentResponsePart) -> str:
+    return "\n\n".join(part.text for part in parts if part.text).strip()
+
+
+def _typed_private_parts(
+    messages: list[dict[str, Any]],
+) -> tuple[TournamentResponsePart, ...]:
+    turn_start = 0
+    for index in range(len(messages) - 1, -1, -1):
+        if messages[index].get("role") == "user":
+            turn_start = index + 1
+            break
+    parts: list[TournamentResponsePart] = []
+    for message in messages[turn_start:]:
+        kind = message.get("tournament_response_part") or message.get(
+            "response_part_kind"
+        )
+        content = message.get("content")
+        if (
+            kind == TournamentResponsePartKind.PRIVATE_EXPLANATION.value
+            and isinstance(content, str)
+            and content
+        ):
+            parts.append(
+                TournamentResponsePart(
+                    TournamentResponsePartKind.PRIVATE_EXPLANATION, content
+                )
+            )
+    return tuple(parts)
 
 
 def _finish_tournament_response(
@@ -1147,9 +1262,7 @@ def _finish_tournament_response(
     if release:
         agent._response_was_previewed = contract.release(response)
     contract.persist_final_bytes()
-    cleaned = contract.cleanup(agent)
-    if cleaned and contract.owns_turn(getattr(agent, "_tournament_intent_contract", None)):
-        agent._tournament_intent_contract = None
+    contract.cleanup(agent)
 
 
 def abort_tournament_output(
@@ -1161,7 +1274,7 @@ def abort_tournament_output(
     response: str,
     contract: TournamentIntentContract | None = None,
 ) -> tuple[str, dict[str, object] | None, bool]:
-    contract = contract or getattr(agent, "_tournament_intent_contract", None)
+    contract = contract or current_tournament_contract()
     if not isinstance(contract, TournamentIntentContract):
         return response, None, True
     telemetry = contract.telemetry(
@@ -1182,7 +1295,7 @@ def finalize_tournament_output(
     messages: list[dict[str, Any]],
     contract: TournamentIntentContract | None = None,
 ) -> tuple[str | None, dict[str, object] | None, bool]:
-    contract = contract or getattr(agent, "_tournament_intent_contract", None)
+    contract = contract or current_tournament_contract()
     if not isinstance(contract, TournamentIntentContract):
         return candidate, None, False
     candidate_text = candidate or ""
@@ -1202,8 +1315,13 @@ def finalize_tournament_output(
             _finish_tournament_response(agent, contract, messages, response=response, telemetry=telemetry)
             return response, telemetry, True
 
-        private_response, public_candidate = envelope
-        private_output = delivery_response or private_response
+        private_response = envelope.private_explanation.text
+        public_candidate = envelope.public_candidate.text
+        private_part = TournamentResponsePart(
+            TournamentResponsePartKind.PRIVATE_EXPLANATION,
+            delivery_response or private_response,
+        )
+        private_output = private_part.text
         if contract.release_state == "consumed":
             response = (
                 f"{private_output}\n\n"
@@ -1237,7 +1355,13 @@ def finalize_tournament_output(
 
         decision = contract.verify_receipt(public_candidate)
         if decision.allowed:
-            response = f"{private_output}\n\nPREPARED_NOT_RELEASED\n\n{public_candidate}".strip()
+            response = _render_response_parts(
+                private_part,
+                TournamentResponsePart(
+                    TournamentResponsePartKind.HOLD, "PREPARED_NOT_RELEASED"
+                ),
+                envelope.public_candidate,
+            )
             telemetry = contract.telemetry(
                 accepted=False,
                 code="release_approval_required",
@@ -1245,10 +1369,13 @@ def finalize_tournament_output(
                 turn_status="partial",
             )
         else:
-            response = (
-                f"{private_output}\n\n"
-                "Public action was not taken; exact verification and release approval are still required."
-            ).strip()
+            response = _render_response_parts(
+                private_part,
+                TournamentResponsePart(
+                    TournamentResponsePartKind.HOLD,
+                    "Public action was not taken; exact verification and release approval are still required.",
+                ),
+            )
             telemetry = contract.telemetry(
                 accepted=False,
                 code=decision.code,
@@ -1322,7 +1449,18 @@ def finalize_tournament_output(
             and not delivery_response.startswith("MEDIA:")
             and contract.candidate_sha256(delivery_response) != contract.candidate_sha256(candidate_text)
         ):
-            response = "Public tournament copy was not released because final delivery bytes changed after verification. No external action was taken."
+            if contract.state is TournamentIntentState.PUBLIC_FACING_DRAFT:
+                response = (
+                    "DRAFT_VALIDATION_HOLD\n\n"
+                    "Code: candidate_bytes_mismatch\n"
+                    "Only the changed claim-bearing draft was withheld. Safe recovery: "
+                    "freeze and verify the final delivery bytes before private delivery."
+                )
+            else:
+                response = (
+                    "Publication was not attempted because final candidate bytes changed "
+                    "after verification. Code: candidate_bytes_mismatch."
+                )
             _replace_current_turn(messages, response)
             telemetry = contract.telemetry(accepted=False, code="candidate_bytes_mismatch", candidate=candidate_text)
             contract.persist_final_bytes()
@@ -1347,11 +1485,16 @@ def finalize_tournament_output(
         decision = ContractDecision(False, "receipt_and_release_approval_required")
     recovery = _receipt_failure_recovery(decision.code)
     if contract.state is TournamentIntentState.PUBLIC_FACING_DRAFT:
-        response = (
-            "DRAFT_VALIDATION_HOLD\n\n"
-            f"Code: {decision.code}\n"
-            f"Only the unsupported claim-bearing draft was withheld. Safe recovery: {recovery}."
+        hold_part = TournamentResponsePart(
+            TournamentResponsePartKind.HOLD,
+            (
+                "DRAFT_VALIDATION_HOLD\n\n"
+                f"Code: {decision.code}\n"
+                "Only the unsupported claim-bearing draft was withheld. "
+                f"Safe recovery: {recovery}."
+            ),
         )
+        response = _render_response_parts(*_typed_private_parts(messages), hold_part)
     else:
         response = (
             "Publication was not attempted because its required truth authority is invalid. "

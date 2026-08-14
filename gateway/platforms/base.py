@@ -36,10 +36,58 @@ _TELEGRAM_VOICE_EXTS = frozenset({'.ogg', '.opus'})
 _POST_DELIVERY_CALLBACK_TIMEOUT_SECONDS = 30.0
 
 
-def _artifact_dispatch_delivered(path: str, message_id) -> None:
+def confirmed_platform_message_id(platform, message_id) -> str | None:
+    """Return a normalized provider message id only when it is proof-worthy.
+
+    Telegram's Bot API contract is an integer message id.  Accepting ``None``,
+    whitespace, booleans, floats, or arbitrary provider objects as a successful
+    attachment acknowledgement makes a stripped ``MEDIA:`` response look
+    complete even though no document can be identified in the chat.
+
+    Other adapters have historically used opaque non-empty ids (for example a
+    Slack timestamp), so their existing contract remains unchanged.
+    """
+    if message_id is None or isinstance(message_id, bool):
+        return None
+    value = str(message_id).strip()
+    if not value:
+        return None
+    if _platform_name(platform) == "telegram":
+        if re.fullmatch(r"[1-9][0-9]*", value) is None:
+            return None
+    return value
+
+
+def document_dispatch_error_code(platform, result) -> str:
+    """Return a stable, payload-free failure code for document accounting."""
+    if getattr(result, "success", False):
+        raw_id = getattr(result, "message_id", None)
+        if raw_id is None or not str(raw_id).strip():
+            return "document_message_id_missing"
+        return "document_message_id_invalid"
+    code = str(getattr(result, "error", "") or "document_dispatch_failed")
+    if re.fullmatch(r"[a-z][a-z0-9_]{0,95}", code):
+        return code
+    return "document_dispatch_failed"
+
+
+def _artifact_dispatch_delivered(path: str, message_id, *, platform=None) -> bool:
     from agent.task_execution_contract import record_artifact_dispatch
 
-    record_artifact_dispatch(path, state="delivered", message_id=message_id)
+    confirmed = confirmed_platform_message_id(platform, message_id)
+    if confirmed is None:
+        record_artifact_dispatch(
+            path,
+            state="ambiguous",
+            error_code=(
+                "document_message_id_missing"
+                if message_id is None or not str(message_id).strip()
+                else "document_message_id_invalid"
+            ),
+        )
+        return False
+    record_artifact_dispatch(path, state="delivered", message_id=confirmed)
+    return True
 
 
 def _artifact_dispatch_failed(path: str, error_code: str) -> str | None:
@@ -74,6 +122,51 @@ async def _send_artifact_failure_notice(adapter, *, chat_id: str, correlation_id
     except Exception:
         return False
     return getattr(result, "success", False) is True
+
+
+async def _settle_document_dispatch(
+    adapter,
+    *,
+    platform,
+    chat_id: str,
+    path: str,
+    result,
+    correlation_id: str | None,
+    metadata,
+) -> bool:
+    """Commit document delivery only with a proof-worthy provider id."""
+    confirmed_id = confirmed_platform_message_id(
+        platform, getattr(result, "message_id", None)
+    )
+    if getattr(result, "success", False) and confirmed_id:
+        return _artifact_dispatch_delivered(
+            path,
+            confirmed_id,
+            platform=platform,
+        )
+
+    error_code = document_dispatch_error_code(platform, result)
+    notice_ok = await _send_artifact_failure_notice(
+        adapter,
+        chat_id=chat_id,
+        correlation_id=correlation_id,
+        metadata=metadata,
+    )
+    if getattr(result, "retryable", False) is True:
+        # The adapter proved no provider invocation occurred and already
+        # recorded FAILED_PREFLIGHT.  Preserve the exact artifact binding for
+        # a later explicit retry; never upgrade a local failure to ambiguity.
+        return False
+    _artifact_dispatch_failed(
+        path,
+        error_code if notice_ok else "failure_notice_undelivered",
+    )
+    if not notice_ok:
+        logger.error(
+            "[%s] Artifact and failure-notice delivery both failed",
+            adapter.name,
+        )
+    return False
 
 
 def _platform_name(platform) -> str:
@@ -5046,6 +5139,8 @@ class BasePlatformAdapter(ABC):
         # Track delivery outcomes for the processing-complete hook
         delivery_attempted = False
         delivery_succeeded = False
+        attachment_obligations = 0
+        attachment_confirmed = 0
 
         def _record_delivery(result):
             nonlocal delivery_attempted, delivery_succeeded
@@ -5054,6 +5149,12 @@ class BasePlatformAdapter(ABC):
             delivery_attempted = True
             if getattr(result, "success", False):
                 delivery_succeeded = True
+
+        def _record_attachment_delivery(confirmed: bool) -> None:
+            nonlocal attachment_obligations, attachment_confirmed
+            attachment_obligations += 1
+            if confirmed:
+                attachment_confirmed += 1
 
         # Reuse the interrupt event set by handle_message() (which marks
         # the session active before spawning this task to prevent races).
@@ -5094,6 +5195,16 @@ class BasePlatformAdapter(ABC):
 
             # Call the handler (this can take a while with tool calls)
             response = await self._message_handler(event)
+            # Gateway streaming delivers text inside the handler and attaches
+            # typed document outcomes to the same request event.  Consume them
+            # here, at the real processing-complete boundary, rather than
+            # treating a ``None`` handler response as automatic success.
+            for outcome in tuple(
+                getattr(event, "_attachment_delivery_outcomes", ()) or ()
+            ):
+                _record_attachment_delivery(
+                    bool(getattr(outcome, "message_id_confirmed", False))
+                )
             is_ephemeral_response = isinstance(response, EphemeralReply)
 
             # Slash-command handlers may return an EphemeralReply sentinel to
@@ -5447,30 +5558,48 @@ class BasePlatformAdapter(ABC):
                         if not media_result.success:
                             logger.warning("[%s] Failed to send media (%s): %s", self.name, ext, media_result.error)
                             if ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                                notice_ok = await _send_artifact_failure_notice(
+                                document_confirmed = await _settle_document_dispatch(
                                     self,
+                                    platform=self.platform,
                                     chat_id=event.source.chat_id,
+                                    path=media_path,
+                                    result=media_result,
                                     correlation_id=_artifact_correlation,
                                     metadata=_final_thread_metadata,
                                 )
-                                _artifact_dispatch_failed(
-                                    media_path,
-                                    (
-                                        str(getattr(media_result, "error", "") or "document_dispatch_failed")
-                                        if notice_ok
-                                        else "failure_notice_undelivered"
-                                    ),
-                                )
-                                if not notice_ok:
-                                    logger.error(
-                                        "[%s] Artifact and failure-notice delivery both failed",
-                                        self.name,
-                                    )
                         elif ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
-                            _artifact_dispatch_delivered(media_path, getattr(media_result, "message_id", None))
+                            document_confirmed = await _settle_document_dispatch(
+                                self,
+                                platform=self.platform,
+                                chat_id=event.source.chat_id,
+                                path=media_path,
+                                result=media_result,
+                                correlation_id=_artifact_correlation,
+                                metadata=_final_thread_metadata,
+                            )
+                        if ext not in _VIDEO_EXTS and not should_send_media_as_audio(
+                            self.platform, ext, is_voice=is_voice
+                        ):
+                            _record_attachment_delivery(document_confirmed)
+                        else:
+                            _record_delivery(media_result)
                     except Exception as media_err:
-                        logger.warning("[%s] Error sending media: %s", self.name, media_err)
-                        if ext not in _VIDEO_EXTS and not should_send_media_as_audio(self.platform, ext, is_voice=is_voice):
+                        _is_document = (
+                            ext not in _VIDEO_EXTS
+                            and not should_send_media_as_audio(
+                                self.platform, ext, is_voice=is_voice
+                            )
+                        )
+                        if _is_document:
+                            logger.warning(
+                                "[%s] Error sending media: phase=provider_dispatch "
+                                "code=document_dispatch_exception exception_class=%s",
+                                self.name,
+                                type(media_err).__name__,
+                            )
+                        else:
+                            logger.warning("[%s] Error sending media: %s", self.name, media_err)
+                        if _is_document:
                             notice_ok = await _send_artifact_failure_notice(
                                 self,
                                 chat_id=event.source.chat_id,
@@ -5486,6 +5615,7 @@ class BasePlatformAdapter(ABC):
                                     "[%s] Artifact and failure-notice delivery both failed",
                                     self.name,
                                 )
+                            _record_attachment_delivery(False)
 
                 # Send auto-detected local non-image files as native attachments
                 for file_path in _non_image_local:
@@ -5499,26 +5629,62 @@ class BasePlatformAdapter(ABC):
                             else {}
                         )
                         if ext in _VIDEO_EXTS:
-                            await self.send_video(
+                            file_result = await self.send_video(
                                 chat_id=event.source.chat_id,
                                 video_path=file_path,
                                 metadata=_final_thread_metadata,
                                 **_caption_kw,
                             )
                         else:
-                            await self.send_document(
+                            _artifact_correlation = _artifact_correlation_for_path(file_path)
+                            file_result = await self.send_document(
                                 chat_id=event.source.chat_id,
                                 file_path=file_path,
                                 metadata=_final_thread_metadata,
                                 **_caption_kw,
                             )
+                            document_confirmed = await _settle_document_dispatch(
+                                self,
+                                platform=self.platform,
+                                chat_id=event.source.chat_id,
+                                path=file_path,
+                                result=file_result,
+                                correlation_id=_artifact_correlation,
+                                metadata=_final_thread_metadata,
+                            )
+                            _record_attachment_delivery(document_confirmed)
+                        if ext in _VIDEO_EXTS:
+                            _record_delivery(file_result)
                     except Exception as file_err:
-                        logger.error("[%s] Error sending local file %s: %s", self.name, file_path, file_err)
+                        logger.error(
+                            "[%s] Error sending local file: phase=provider_dispatch "
+                            "code=document_dispatch_exception exception_class=%s",
+                            self.name,
+                            type(file_err).__name__,
+                        )
+                        if ext not in _VIDEO_EXTS:
+                            correlation_id = _artifact_correlation_for_path(file_path)
+                            notice_ok = await _send_artifact_failure_notice(
+                                self,
+                                chat_id=event.source.chat_id,
+                                correlation_id=correlation_id,
+                                metadata=_final_thread_metadata,
+                            )
+                            _artifact_dispatch_failed(
+                                file_path,
+                                (
+                                    "document_dispatch_exception"
+                                    if notice_ok
+                                    else "failure_notice_undelivered"
+                                ),
+                            )
+                            _record_attachment_delivery(False)
 
                 # A3 (#29346): if a non-empty response produced nothing
                 # deliverable, fail loudly rather than dropping it in silence.
                 _anything_delivered = (
                     delivery_attempted or _tts_caption_delivered
+                    or attachment_obligations
                     or images or local_files or media_files
                 )
                 if not _anything_delivered and _response_pre_extract.strip():
@@ -5530,7 +5696,16 @@ class BasePlatformAdapter(ABC):
                     )
 
             # Determine overall success for the processing hook
-            processing_ok = delivery_succeeded if delivery_attempted else not bool(response)
+            if attachment_obligations:
+                attachments_ok = attachment_confirmed == attachment_obligations
+                other_delivery_ok = (
+                    delivery_succeeded if delivery_attempted else True
+                )
+                processing_ok = attachments_ok and other_delivery_ok
+            else:
+                processing_ok = (
+                    delivery_succeeded if delivery_attempted else not bool(response)
+                )
             await self._run_processing_hook(
                 "on_processing_complete",
                 event,

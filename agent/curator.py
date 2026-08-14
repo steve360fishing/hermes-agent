@@ -31,6 +31,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, List, NamedTuple, Optional, Set
 
 from hermes_constants import get_hermes_home
+from agent.turn_origin import TurnOrigin, TurnProvenance
 from tools import skill_usage
 from utils import atomic_json_write
 
@@ -2051,7 +2052,10 @@ def _run_llm_review(prompt: str) -> Dict[str, Any]:
         with open(os.devnull, "w", encoding="utf-8") as _devnull, \
              contextlib.redirect_stdout(_devnull), \
              contextlib.redirect_stderr(_devnull):
-            conv_result = review_agent.run_conversation(user_message=prompt)
+            conv_result = review_agent.run_conversation(
+                user_message=prompt,
+                turn_provenance=TurnProvenance.internal(TurnOrigin.MODEL_GENERATED),
+            )
 
         final = ""
         if isinstance(conv_result, dict):
