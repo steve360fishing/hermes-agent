@@ -119,11 +119,12 @@ def test_runtime_async_completion_preserves_useful_output_without_tournament_fin
         Path(__file__).parents[1]
         / "fixtures"
         / "tournament"
-        / "async_completion_origin_incident.json"
+        / "async_completion_origin_incident_reconstructed.json"
     )
     payload = json.loads(fixture_path.read_text(encoding="utf-8"))[
-        "canonical_redacted_payload"
+        "canonical_reconstructed_payload"
     ]
+    assert len(payload.encode("utf-8")) == 4996
     useful_response = (
         "I preserved the private engineering report. Draft review never needs "
         "publication approval, and blanket permanent approval grants no authority."
