@@ -388,8 +388,8 @@ async def test_post_stream_document_requires_integer_telegram_message_id(
 
 
 @pytest.mark.asyncio
-async def test_post_stream_document_records_confirmed_integer_id(monkeypatch, tmp_path):
-    attachment = str(tmp_path / "evidence.txt")
+async def test_post_stream_document_records_confirmed_integer_id(monkeypatch):
+    attachment = str(_reconstructed_txt_fixture())
     attempted_dispatches = []
     monkeypatch.setattr(
         "agent.task_execution_contract.record_artifact_dispatch",
@@ -428,6 +428,7 @@ async def test_post_stream_document_records_confirmed_integer_id(monkeypatch, tm
     assert outcomes[0].delivered is True
     assert outcomes[0].message_id_confirmed is True
     assert outcomes[0].message_id == "8123"
+    adapter.send_document.assert_awaited_once()
     adapter.send.assert_not_awaited()
 
 
