@@ -175,6 +175,21 @@ def test_claim_bearing_tournament_story_preserves_draft_with_unavailable_advisor
     _assert_no_automatic_truth_gate(agent)
 
 
+def test_claim_bearing_story_output_gets_an_advisory_even_when_request_has_no_fact_claim():
+    agent = _agent()
+    _prepare(agent)
+    draft = "Captain Reyes won the tournament."
+    agent.client.chat.completions.create.return_value = _response(draft)
+
+    result = agent.run_conversation("Create a tournament Story for Instagram.")
+
+    assert draft in result["final_response"]
+    assert "Fact check: verification unavailable" in result["final_response"]
+    assert "DRAFT_VALIDATION_HOLD" not in result["final_response"]
+    assert "tournament_intent" not in result
+    _assert_no_automatic_truth_gate(agent)
+
+
 def test_copied_story_instructions_do_not_add_an_advisory_or_contract():
     agent = _agent()
     _prepare(agent)
