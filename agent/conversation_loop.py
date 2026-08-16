@@ -614,8 +614,12 @@ def _clear_request_contract_after_turn(func):
                 logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
             from agent.task_execution_contract import clear_task_execution_contract
             clear_task_execution_contract(agent)
-            from agent.tournament_intent_contract import clear_tournament_intent_contract
+            from agent.tournament_intent_contract import (
+                clear_tournament_intent_contract,
+                clear_tournament_truth_advisory,
+            )
             clear_tournament_intent_contract(agent)
+            clear_tournament_truth_advisory()
 
     return wrapper
 
@@ -669,12 +673,13 @@ def run_conversation(
 
     # A stale ContextVar is candidate-local quarantine, never a turn refusal.
     from agent.tournament_intent_contract import (
-        begin_tournament_intent_contract,
+        begin_tournament_truth_advisory,
         clear_tournament_intent_contract,
-        preflight_failure_response,
+        clear_tournament_truth_advisory,
     )
 
     clear_tournament_intent_contract(agent)
+    clear_tournament_truth_advisory()
 
     # Resolve file-artifact policy before any context compression, plugin, or
     # provider work. A contradictory destination must fail without invoking a
@@ -694,40 +699,12 @@ def run_conversation(
         if turn_provenance.is_authenticated_direct_user
         else (persist_user_message if persist_user_message is not None else user_message)
     )
-    _tournament_contract = begin_tournament_intent_contract(
+    begin_tournament_truth_advisory(
         agent,
         message=_contract_message,
-        task_id=task_id,
-        stream_callback=stream_callback,
         turn_provenance=turn_provenance,
     )
-    if _tournament_contract is not None:
-        stream_callback = _tournament_contract.buffer_callback
-        if _tournament_contract.preflight_error:
-            response = preflight_failure_response(_tournament_contract.preflight_error)
-            safe_messages = [
-                {"role": "user", "content": str(_contract_message)},
-                {"role": "assistant", "content": response},
-            ]
-            _tournament_contract.pending_persistence = (safe_messages, None)
-            _tournament_contract.persist_final_bytes()
-            return {
-                "final_response": response,
-                "messages": safe_messages,
-                "api_calls": 0,
-                "completed": False,
-                "failed": True,
-                "partial": False,
-                "interrupted": False,
-                "turn_exit_reason": _tournament_contract.preflight_error,
-                "tournament_intent": _tournament_contract.telemetry(
-                    accepted=False,
-                    code=_tournament_contract.preflight_error,
-                    candidate="",
-                ),
-                "model": getattr(agent, "model", ""),
-                "provider": getattr(agent, "provider", ""),
-            }
+    _tournament_contract = None
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,
