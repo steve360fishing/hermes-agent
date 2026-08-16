@@ -89,15 +89,6 @@ def test_publication_request_fails_safely_and_next_turn_has_no_sticky_contract()
     first = agent.run_conversation(
         "Publish this exact verified tournament caption to the SportFish Hub Instagram account now."
     )
-
-
-def _direct_provenance(message: object, *, message_id="message-1"):
-    text = message if isinstance(message, str) else "test direct request"
-    return _mint_gateway_turn_provenance(
-        SimpleNamespace(text=text, message_id=message_id),
-        SimpleNamespace(user_id="steve", platform="telegram", profile="test", chat_id="chat-1", scope_id="telegram:test:chat-1:"),
-        is_internal=False,
-    )
     provider_tools = agent.client.chat.completions.create.call_args_list[0].kwargs["tools"]
     assert any(
         tool.get("function", {}).get("name") == "tournament_truth_gate"
@@ -112,6 +103,15 @@ def _direct_provenance(message: object, *, message_id="message-1"):
     normal = agent.run_conversation("show me search results")
     assert normal["final_response"] == "normal answer"
     assert agent._tool_guardrails.before_call("terminal", {}).action == "allow"
+
+
+def _direct_provenance(message: object, *, message_id="message-1"):
+    text = message if isinstance(message, str) else "test direct request"
+    return _mint_gateway_turn_provenance(
+        SimpleNamespace(text=text, message_id=message_id),
+        SimpleNamespace(user_id="steve", platform="telegram", profile="test", chat_id="chat-1", scope_id="telegram:test:chat-1:"),
+        is_internal=False,
+    )
 
 
 def test_runtime_async_completion_preserves_useful_output_without_tournament_finalizer():
@@ -179,6 +179,34 @@ def test_conversation_contract_uses_sealed_authority_not_effective_message():
     assert provenance_keys <= result["messages"][0].keys()
     wire_messages = agent.client.chat.completions.create.call_args.kwargs["messages"]
     assert all(provenance_keys.isdisjoint(message) for message in wire_messages)
+
+
+def test_private_workbook_incident_authority_reaches_finalizer_without_tournament_hold():
+    """The exact VPS lockout shape stays private through the full turn path."""
+    authority_text = (
+        "Please make a story about this week's tournament results and update "
+        "the Excel workbook."
+    )
+    agent = _agent()
+    agent.client.chat.completions.create.return_value = _response(
+        "Workbook updated for private review."
+    )
+    agent._persist_session = lambda *_args: None
+    agent._save_trajectory = lambda *_args: None
+    agent._cleanup_task_resources = lambda *_args: None
+
+    result = agent._raw_run_conversation(
+        "Create a tournament caption for Instagram.",
+        persist_user_message="Create a tournament caption for Instagram.",
+        turn_provenance=_direct_provenance(
+            authority_text, message_id="message-private-workbook-incident"
+        ),
+    )
+
+    assert result["final_response"] == "Workbook updated for private review."
+    assert "DRAFT_VALIDATION_HOLD" not in result["final_response"]
+    assert "tournament_intent" not in result
+    assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
 
 
 def test_effective_private_rewrite_cannot_remove_sealed_publication_gate():
@@ -252,7 +280,7 @@ def test_full_finalizer_clears_generic_turn_callback_after_tournament_hold():
     agent._cleanup_task_resources = lambda *_args: None
 
     result = agent.run_conversation(
-        "Create the public-facing tournament copy and give it to me here for review."
+        "Create the public-facing tournament copy for Instagram review."
     )
 
     assert result["tournament_intent"]["code"] == "receipt_missing_or_consumed"
@@ -274,7 +302,9 @@ def test_missing_truth_gate_persists_one_safe_recoverable_response(monkeypatch):
         lambda name: None if name == "tournament_truth_gate" else original_get_entry(name),
     )
 
-    result = agent.run_conversation("Create a public tournament Story naming winners.")
+    result = agent.run_conversation(
+        "Create a public tournament Story for Instagram naming winners."
+    )
 
     assert result["turn_exit_reason"] == "truth_gate_unavailable"
     assert result["api_calls"] == 0

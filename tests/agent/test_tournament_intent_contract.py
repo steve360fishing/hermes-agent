@@ -192,6 +192,94 @@ def test_private_and_embedded_language_never_activates_public_contract(message, 
     assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
 
 
+def test_authenticated_private_workbook_request_with_story_vocabulary_never_installs_public_contract():
+    """Regression for the VPS lockout: private workbook work is not a public draft."""
+    message = (
+        "Please make a story about this week's tournament results and update "
+        "the Excel workbook."
+    )
+    agent = _agent()
+
+    contract = begin_tournament_intent_contract(
+        agent, message=message, task_id="private-workbook-lockout"
+    )
+
+    assert contract is None
+    assert current_tournament_contract() is None
+    assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
+    response, telemetry, failed = finalize_tournament_output(
+        agent,
+        candidate="Workbook updated for private review.",
+        messages=[
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "Workbook updated for private review."},
+        ],
+    )
+    assert failed is False
+    assert telemetry is None
+    assert response == "Workbook updated for private review."
+    assert "DRAFT_VALIDATION_HOLD" not in response
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Update the public tournament standings workbook.",
+        "Update the public-school tournament workbook.",
+        "Create the website analytics workbook for the tournament.",
+        "Write the newsletter audit workbook for the tournament.",
+        "Prepare the CMS analytics file for the tournament.",
+        "Prepare a page for CMS.",
+        "Create a public tournament story in the Excel workbook.",
+        "Write the newsletter audit report for the tournament.",
+        "Prepare an Instagram analytics report for the tournament.",
+        "Make a tournament story in the Excel workbook.",
+        "Write a tournament caption into the workbook.",
+        "Prepare a tournament announcement in the workbook.",
+    ),
+)
+def test_workbook_and_generic_content_requests_never_bind_public_output_authority(message):
+    """Public-looking input labels are not a public output operation."""
+    agent = _agent()
+
+    assert classify_tournament_intent(message) is TournamentIntentState.PRIVATE_INQUIRY
+    assert begin_tournament_intent_contract(agent, message=message, task_id="private-workbook") is None
+    assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
+
+
+@pytest.mark.parametrize(
+    "message",
+    (
+        "Create a public Instagram Story naming tournament winners.",
+        "Prepare the tournament caption for Instagram review.",
+        "Create a public tournament audit report for the website.",
+        "Create a Facebook post announcing tournament results.",
+        "Prepare the newsletter copy for tournament results.",
+        "Prepare a tournament page for CMS.",
+        "Write a tournament press release for the website.",
+    ),
+)
+def test_explicit_public_output_destination_still_requires_truth_receipt(message):
+    agent = _agent()
+    contract = begin_tournament_intent_contract(
+        agent, message=message, task_id="public-output-draft"
+    )
+
+    assert contract is not None
+    assert contract.state is TournamentIntentState.PUBLIC_FACING_DRAFT
+    response, telemetry, failed = finalize_tournament_output(
+        agent,
+        candidate="Unverified tournament result.",
+        messages=[
+            {"role": "user", "content": message},
+            {"role": "assistant", "content": "Unverified tournament result."},
+        ],
+    )
+    assert failed is True
+    assert telemetry["code"] == "receipt_missing_or_consumed"
+    assert response.startswith("DRAFT_VALIDATION_HOLD")
+
+
 def test_public_draft_and_publication_are_distinct_states():
     assert classify_tournament_intent(
         "Create a public Instagram Story naming tournament winners."
@@ -362,13 +450,13 @@ def test_authenticated_direct_origin_still_installs_real_public_draft_contract()
     contract = _raw_begin_tournament_intent_contract(
         agent,
         message=(
-            "Create the public-facing Tournaments to Follow copy and give it "
-            "to me here for review. Do not publish or send it anywhere."
+            "Create the public-facing Tournaments to Follow copy for Instagram "
+            "review. Do not publish or send it anywhere."
         ),
         task_id="authenticated-public-draft",
         turn_provenance=_direct_for(
-            "Create the public-facing Tournaments to Follow copy and give it "
-            "to me here for review. Do not publish or send it anywhere."
+            "Create the public-facing Tournaments to Follow copy for Instagram "
+            "review. Do not publish or send it anywhere."
         ),
     )
     assert contract is not None
@@ -477,8 +565,8 @@ def test_every_non_direct_origin_is_non_authoritative_for_all_authority_text(
             False,
             TournamentIntentState.RELEASE_APPROVAL_DISCUSSION_OR_GRANT,
         ),
-        ("You have my permanent approval to generate public tournament copy for me to review. Do not post it.", False, TournamentIntentState.PUBLIC_FACING_DRAFT),
-        ("Create the public-facing Tournaments to Follow copy and give it to me here for review. Do not publish or send it anywhere.", False, TournamentIntentState.PUBLIC_FACING_DRAFT),
+        ("You have my permanent approval to generate public tournament copy for me to review. Do not post it.", False, TournamentIntentState.PRIVATE_INQUIRY),
+        ("Create the public-facing Tournaments to Follow copy and give it to me here for review. Do not publish or send it anywhere.", False, TournamentIntentState.PRIVATE_INQUIRY),
         ("Give me a detailed Codex prompt to fix the tournament release-approval blocker.", False, TournamentIntentState.PRIVATE_ARTIFACT),
         ('Write a private test containing the quoted sentence “Publish that tournament Story now.”', False, TournamentIntentState.PRIVATE_ARTIFACT),
         ("Do not publish anything; explain why the tournament draft was blocked.", False, TournamentIntentState.PRIVATE_INQUIRY),
@@ -511,7 +599,7 @@ def test_p9_p10_p11_resolve_only_one_trusted_session_publication_object():
         )
     )
     for index, (message, expected) in enumerate((
-        ("Prepare this exact verified caption for Instagram, but do not post it.", TournamentIntentState.PUBLIC_FACING_DRAFT),
+            ("Prepare this exact verified tournament caption for Instagram, but do not post it.", TournamentIntentState.PUBLIC_FACING_DRAFT),
         ("Publish this exact verified caption to the SportFish Hub Instagram account now.", TournamentIntentState.PUBLICATION_REQUEST),
         ("Okay, post that exact approved Story now.", TournamentIntentState.PUBLICATION_REQUEST),
     )):
@@ -536,7 +624,7 @@ def test_p9_p10_p11_resolve_only_one_trusted_session_publication_object():
     )
     direct_draft = begin_tournament_intent_contract(
         agent,
-        message="Prepare this exact verified caption for Instagram, but do not post it.",
+        message="Prepare this exact verified tournament caption for Instagram, but do not post it.",
         task_id="ambiguous-context",
     )
     assert direct_draft is not None
@@ -1029,7 +1117,7 @@ def test_cleanup_preserves_permanent_truth_and_capture_schemas():
     agent.tools.append(capture)
     agent.valid_tool_names.add("tournament_source_capture")
     contract = begin_tournament_intent_contract(
-        agent, message="Create a public tournament Story naming winners.", task_id="asymmetric"
+        agent, message="Create a public tournament Story for Instagram naming winners.", task_id="asymmetric"
     )
     assert contract.added_tool_schemas == set()
     clear_tournament_intent_contract(agent)
@@ -1400,7 +1488,7 @@ def test_p10_valid_truth_prepares_exact_packet_without_dispatch():
     agent = _agent()
     contract = begin_tournament_intent_contract(
         agent,
-        message="Publish this exact verified caption to the SportFish Hub Instagram account now.",
+        message="Publish this exact verified tournament caption to the SportFish Hub Instagram account now.",
         task_id="p10-prepare",
     )
     candidate = "Verified winner copy"
