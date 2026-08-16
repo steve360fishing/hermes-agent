@@ -9,6 +9,7 @@ We mock the telegram module at import time to avoid collection errors.
 """
 
 import asyncio
+import hashlib
 import json
 import os
 import sys
@@ -219,6 +220,38 @@ class TestDocumentDownloadBlock:
         event = adapter.handle_message.call_args[0][0]
         assert "Hello from a text file" in event.text
         assert "[Content of notes.txt]" in event.text
+
+    @pytest.mark.asyncio
+    async def test_reconstructed_vps_txt_fixture_injects_full_deterministic_content(
+        self, adapter
+    ):
+        fixture_path = (
+            Path(__file__).parents[1]
+            / "fixtures"
+            / "telegram"
+            / "vps_txt_delivery_acceptance.txt"
+        )
+        content = fixture_path.read_bytes()
+        assert len(content) == 16643
+        assert hashlib.sha256(content).hexdigest() == (
+            "e86bbce10cfbba20b7619e7b8dc9bfd892df01e5f6e0a35c972fb27afecfd111"
+        )
+        assert content.startswith(b"NON-ORIGINAL SYNTHETIC RECONSTRUCTION\n")
+        file_obj = _make_file_obj(content)
+        doc = _make_document(
+            file_name=fixture_path.name,
+            mime_type="text/plain",
+            file_size=len(content),
+            file_obj=file_obj,
+        )
+
+        await adapter._handle_media_message(
+            _make_update(_make_message(document=doc)), MagicMock()
+        )
+
+        event = adapter.handle_message.call_args[0][0]
+        assert event.text.endswith(content.decode("utf-8"))
+        assert "[Content of vps_txt_delivery_acceptance.txt]" in event.text
 
     @pytest.mark.asyncio
     async def test_supported_md_injects_content(self, adapter):

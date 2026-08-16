@@ -1,6 +1,8 @@
 """Regression coverage for Telegram final delivery after streamed edit failure."""
 
 from datetime import datetime
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
@@ -19,6 +21,22 @@ from gateway.run import AttachmentDeliveryOutcome, GatewayRunner
 from gateway.session import SessionEntry, SessionSource
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+def _reconstructed_txt_fixture() -> Path:
+    fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "telegram"
+        / "vps_txt_delivery_acceptance.txt"
+    )
+    content = fixture.read_bytes()
+    assert len(content) == 16643
+    assert hashlib.sha256(content).hexdigest() == (
+        "e86bbce10cfbba20b7619e7b8dc9bfd892df01e5f6e0a35c972fb27afecfd111"
+    )
+    assert content.startswith(b"NON-ORIGINAL SYNTHETIC RECONSTRUCTION\n")
+    return fixture
 
 
 def _adapter() -> MagicMock:
@@ -246,8 +264,7 @@ async def test_real_nonstream_text_success_cannot_mask_unconfirmed_document(
         user_id="steve",
     )
     event = MessageEvent(text="request", source=source, message_id="92")
-    attachment = tmp_path / "evidence.txt"
-    attachment.write_bytes(b"verified")
+    attachment = _reconstructed_txt_fixture()
     adapter._message_handler = AsyncMock(
         return_value=f"Visible explanation\nMEDIA:{attachment}"
     )
@@ -284,7 +301,7 @@ async def test_post_stream_document_without_message_id_is_not_recorded_delivered
     monkeypatch, tmp_path
 ):
     """Text streaming success cannot turn an unconfirmed attachment into delivery."""
-    attachment = str(tmp_path / "evidence.txt")
+    attachment = str(_reconstructed_txt_fixture())
     attempted_dispatches = []
     monkeypatch.setattr(
         "agent.task_execution_contract.record_artifact_dispatch",
@@ -371,8 +388,8 @@ async def test_post_stream_document_requires_integer_telegram_message_id(
 
 
 @pytest.mark.asyncio
-async def test_post_stream_document_records_confirmed_integer_id(monkeypatch, tmp_path):
-    attachment = str(tmp_path / "evidence.txt")
+async def test_post_stream_document_records_confirmed_integer_id(monkeypatch):
+    attachment = str(_reconstructed_txt_fixture())
     attempted_dispatches = []
     monkeypatch.setattr(
         "agent.task_execution_contract.record_artifact_dispatch",
@@ -411,6 +428,7 @@ async def test_post_stream_document_records_confirmed_integer_id(monkeypatch, tm
     assert outcomes[0].delivered is True
     assert outcomes[0].message_id_confirmed is True
     assert outcomes[0].message_id == "8123"
+    adapter.send_document.assert_awaited_once()
     adapter.send.assert_not_awaited()
 
 

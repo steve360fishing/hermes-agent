@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from datetime import datetime, timedelta, timezone
+import hashlib
 import json
 import os
 from pathlib import Path
@@ -315,14 +316,21 @@ def test_async_completion_incident_content_is_non_authoritative_before_classific
         Path(__file__).parents[1]
         / "fixtures"
         / "tournament"
-        / "async_completion_origin_incident.json"
+        / "async_completion_origin_incident_reconstructed.json"
     )
     fixture = json.loads(fixture_path.read_text(encoding="utf-8"))
-    message = fixture["canonical_redacted_payload"]
-    assert fixture["live_utf8_bytes"] == 4996
-    assert fixture["live_sha256"] == (
+    message = fixture["canonical_reconstructed_payload"]
+    assert fixture["fixture_kind"] == "non_original_synthetic_reconstruction"
+    assert fixture["reconstruction_status"] == "not_original_not_exact_not_recovered"
+    assert fixture["historical_metadata"]["unavailable_original_utf8_bytes"] == 4996
+    assert fixture["historical_metadata"]["unavailable_original_sha256"] == (
         "43300da77e1d094988acd60fba492a2c98c46fd44ea82e950619295969480520"
     )
+    assert fixture["canonical_reconstructed_payload_utf8_bytes"] == 4996
+    assert len(message.encode("utf-8")) == 4996
+    assert fixture["canonical_reconstructed_payload_sha256"] == hashlib.sha256(
+        message.encode("utf-8")
+    ).hexdigest()
     assert classify_tournament_intent(message) in {
         TournamentIntentState.MIXED_PUBLICATION,
         TournamentIntentState.PUBLICATION_REQUEST,
