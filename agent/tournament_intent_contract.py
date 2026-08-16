@@ -75,6 +75,14 @@ class TournamentResponseEnvelope:
 
 
 @dataclass(frozen=True)
+class TournamentTruthAdvisory:
+    """A non-blocking fact-check status attached only to the active turn."""
+
+    code: str
+    message: str
+
+
+@dataclass(frozen=True)
 class ContractDecision:
     allowed: bool
     code: str
@@ -107,6 +115,9 @@ _ACTIVE_TOURNAMENT_CONTEXT: ContextVar[TournamentTurnExecutionContext] = (
         "active_tournament_execution_context",
         default=TournamentTurnExecutionContext(),
     )
+)
+_ACTIVE_TOURNAMENT_TRUTH_ADVISORY: ContextVar[TournamentTruthAdvisory | None] = (
+    ContextVar("active_tournament_truth_advisory", default=None)
 )
 
 
@@ -154,6 +165,61 @@ def current_tournament_contract() -> "TournamentIntentContract | None":
 def bind_tournament_contract(contract: "TournamentIntentContract | None") -> None:
     """Bind request authority to the current execution context, never the agent."""
     _ACTIVE_TOURNAMENT_CONTEXT.set(TournamentTurnExecutionContext(contract=contract))
+
+
+_CLAIM_BEARING_TOURNAMENT_DRAFT = re.compile(
+    r"\b(?:winner|winners|won|result(?:s)?|standing(?:s)?|leaderboard|"
+    r"place|placing|score|payout|weigh[- ]?in)\b",
+    re.IGNORECASE,
+)
+
+
+def begin_tournament_truth_advisory(
+    agent: Any, *, message: object, turn_provenance=None
+) -> TournamentTruthAdvisory | None:
+    """Mark a direct claim-bearing draft for a non-blocking fact-check note.
+
+    This deliberately does not install a release contract, change tools, read
+    sources, or ask the model to use a tool. The current runtime has no
+    request-bound trusted snapshot seam, so the only honest automatic outcome
+    is an unavailable advisory while preserving the model's useful draft.
+    """
+    _ACTIVE_TOURNAMENT_TRUTH_ADVISORY.set(None)
+    from agent.turn_origin import coerce_turn_provenance
+
+    provenance = coerce_turn_provenance(turn_provenance)
+    if not provenance.is_authenticated_direct_user or not _matches_current_request_binding(
+        agent, provenance
+    ):
+        return None
+    directed = _authority_directed_text(provenance.authority_text)
+    if not (
+        _TOURNAMENT_CUE.search(directed)
+        and _has_explicit_public_draft_operation(directed)
+        and _CLAIM_BEARING_TOURNAMENT_DRAFT.search(directed)
+    ):
+        return None
+    advisory = TournamentTruthAdvisory(
+        code="trusted_snapshot_unavailable",
+        message=(
+            "Fact check: verification unavailable — no trusted tournament snapshot "
+            "was bound to this request."
+        ),
+    )
+    _ACTIVE_TOURNAMENT_TRUTH_ADVISORY.set(advisory)
+    return advisory
+
+
+def clear_tournament_truth_advisory() -> None:
+    _ACTIVE_TOURNAMENT_TRUTH_ADVISORY.set(None)
+
+
+def append_tournament_truth_advisory(response: str | None) -> str | None:
+    """Keep useful output intact while attaching a concise current-turn note."""
+    advisory = _ACTIVE_TOURNAMENT_TRUTH_ADVISORY.get()
+    if advisory is None or not isinstance(response, str) or not response.strip():
+        return response
+    return f"{response.rstrip()}\n\n{advisory.message}"
 
 
 def _install_stable_runtime_muxes(
@@ -1343,7 +1409,7 @@ def finalize_tournament_output(
 ) -> tuple[str | None, dict[str, object] | None, bool]:
     contract = contract or current_tournament_contract()
     if not isinstance(contract, TournamentIntentContract):
-        return candidate, None, False
+        return append_tournament_truth_advisory(candidate), None, False
     candidate_text = candidate or ""
     if contract.state is TournamentIntentState.MIXED_PUBLICATION:
         envelope = parse_mixed_publication_envelope(candidate_text)
