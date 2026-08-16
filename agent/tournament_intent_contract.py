@@ -196,7 +196,6 @@ def begin_tournament_truth_advisory(
     if not (
         _TOURNAMENT_CUE.search(directed)
         and _has_explicit_public_draft_operation(directed)
-        and _CLAIM_BEARING_TOURNAMENT_DRAFT.search(directed)
     ):
         return None
     advisory = TournamentTruthAdvisory(
@@ -215,9 +214,14 @@ def clear_tournament_truth_advisory() -> None:
 
 
 def append_tournament_truth_advisory(response: str | None) -> str | None:
-    """Keep useful output intact while attaching a concise current-turn note."""
+    """Attach a note only when the eligible draft actually makes a claim."""
     advisory = _ACTIVE_TOURNAMENT_TRUTH_ADVISORY.get()
-    if advisory is None or not isinstance(response, str) or not response.strip():
+    if (
+        advisory is None
+        or not isinstance(response, str)
+        or not response.strip()
+        or not _CLAIM_BEARING_TOURNAMENT_DRAFT.search(response)
+    ):
         return response
     return f"{response.rstrip()}\n\n{advisory.message}"
 
