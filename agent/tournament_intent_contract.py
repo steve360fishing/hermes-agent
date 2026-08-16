@@ -326,7 +326,10 @@ _META_DOCUMENT_START = re.compile(
     r"(?im)^\s*(?:#{1,6}\s+.*\b(?:plan|runbook|implementation|execution)\b|"
     r"(?:plan_ready|execution\s+guardrails|declared\s+(?:checks|skills))\b|"
     r"this\s+is\s+what\s+(?:codex|hermes)\s+is\s+going\s+to\s+do\s*:|"
-    r"this\s+is\s+(?:a\s+)?copy\s+of\s+my\s+previous\s+message\s*:?)",
+    r"this\s+is\s+(?:a\s+)?copy\s+of\s+(?:"
+    r"my\s+previous\s+message|"
+    r"the\s+message\s+i\s+sent\s+you\s+(?:last\s+night|yesterday|earlier)"
+    r")\s*:?)",
 )
 _EXPLICIT_BOUND_PUBLIC_SURFACE = re.compile(
     r"\b(?:instagram|facebook|newsletter|website|cms)\b.*\b(?:account|caption|story|post|page)\b|"
