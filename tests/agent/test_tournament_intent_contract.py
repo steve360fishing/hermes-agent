@@ -222,6 +222,20 @@ def test_authenticated_private_workbook_request_with_story_vocabulary_never_inst
     assert "DRAFT_VALIDATION_HOLD" not in response
 
 
+def test_copied_previous_story_request_never_grants_public_authority():
+    message = (
+        "This is a copy of my previous message:\n"
+        "Create a public tournament Story naming winners."
+    )
+    agent = _agent()
+
+    assert begin_tournament_intent_contract(
+        agent, message=message, task_id="copied-story"
+    ) is None
+    assert current_tournament_contract() is None
+    assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
+
+
 @pytest.mark.parametrize(
     "message",
     (
@@ -251,6 +265,7 @@ def test_workbook_and_generic_content_requests_never_bind_public_output_authorit
 @pytest.mark.parametrize(
     "message",
     (
+        "Create a public tournament Story naming winners.",
         "Create a public Instagram Story naming tournament winners.",
         "Prepare the tournament caption for Instagram review.",
         "Create a public tournament audit report for the website.",

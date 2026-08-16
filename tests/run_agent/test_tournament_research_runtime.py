@@ -281,9 +281,14 @@ def test_full_finalizer_clears_generic_turn_callback_after_tournament_hold():
     agent._cleanup_task_resources = lambda *_args: None
 
     result = agent.run_conversation(
-        "Create the public-facing tournament copy for Instagram review."
+        "Create a public tournament Story naming winners."
     )
 
+    provider_tools = agent.client.chat.completions.create.call_args.kwargs["tools"]
+    assert any(
+        tool.get("function", {}).get("name") == "tournament_truth_gate"
+        for tool in provider_tools
+    )
     assert result["tournament_intent"]["code"] == "receipt_missing_or_consumed"
     assert agent._stream_callback is None
 
@@ -304,7 +309,7 @@ def test_missing_truth_gate_persists_one_safe_recoverable_response(monkeypatch):
     )
 
     result = agent.run_conversation(
-        "Create a public tournament Story for Instagram naming winners."
+        "Create a public tournament Story naming winners."
     )
 
     assert result["turn_exit_reason"] == "truth_gate_unavailable"

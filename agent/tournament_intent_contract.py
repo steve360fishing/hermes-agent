@@ -257,6 +257,9 @@ _EXPLICIT_PUBLIC_OUTPUT = re.compile(
     rf"(?:for|to|on|in|via)\s+(?:the\s+)?(?:public\s+)?{_PUBLIC_DESTINATION}\b",
     re.IGNORECASE,
 )
+# In Steve's Telegram workflow, capitalized "Story" is the established shorthand
+# for an Instagram Story. Lowercase narrative "story" remains ordinary content.
+_IMPLICIT_INSTAGRAM_STORY_OUTPUT = re.compile(r"\bStor(?:y|ies)\b")
 _DRAFT_ACTION = re.compile(r"\b(?:create|write|draft|make|prepare|generate)\b", re.IGNORECASE)
 _PUBLICATION_ACTION = re.compile(
     r"\b(?:publish|send|upload|deploy|release)\b|"
@@ -322,7 +325,8 @@ _READ_ONLY_PUBLIC_TOOLS = frozenset(
 _META_DOCUMENT_START = re.compile(
     r"(?im)^\s*(?:#{1,6}\s+.*\b(?:plan|runbook|implementation|execution)\b|"
     r"(?:plan_ready|execution\s+guardrails|declared\s+(?:checks|skills))\b|"
-    r"this\s+is\s+what\s+(?:codex|hermes)\s+is\s+going\s+to\s+do\s*:)",
+    r"this\s+is\s+what\s+(?:codex|hermes)\s+is\s+going\s+to\s+do\s*:|"
+    r"this\s+is\s+(?:a\s+)?copy\s+of\s+my\s+previous\s+message\s*:?)",
 )
 _EXPLICIT_BOUND_PUBLIC_SURFACE = re.compile(
     r"\b(?:instagram|facebook|newsletter|website|cms)\b.*\b(?:account|caption|story|post|page)\b|"
@@ -383,7 +387,10 @@ def _has_explicit_public_draft_operation(message: str) -> bool:
         clause = message[clause_start:clause_end]
         if (
             _has_affirmative_action(clause, _DRAFT_ACTION)
-            and _EXPLICIT_PUBLIC_OUTPUT.search(clause)
+            and (
+                _EXPLICIT_PUBLIC_OUTPUT.search(clause)
+                or _IMPLICIT_INSTAGRAM_STORY_OUTPUT.search(clause)
+            )
         ):
             return True
     return False
