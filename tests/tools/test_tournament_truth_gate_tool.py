@@ -105,10 +105,10 @@ def test_validator_dispatch_binds_exact_receipt_to_active_contract(tmp_path, mon
     agent = _bound_agent("session-tool")
     contract = begin_tournament_intent_contract(
         agent,
-        message="Create a public tournament Story naming winners.",
+        message="Create a public tournament Story for Instagram naming winners.",
         task_id="tool-bind",
         turn_provenance=_bound_direct_provenance(
-            "Create a public tournament Story naming winners.", "session-tool"
+            "Create a public tournament Story for Instagram naming winners.", "session-tool"
         ),
     )
     result = json.loads(
@@ -166,10 +166,10 @@ def test_validator_rejects_a_hash_valid_blocked_receipt(tmp_path, monkeypatch):
     agent = _bound_agent("session-blocked")
     begin_tournament_intent_contract(
         agent,
-        message="Create a public tournament Story naming winners.",
+        message="Create a public tournament Story for Instagram naming winners.",
         task_id="tool-blocked",
         turn_provenance=_bound_direct_provenance(
-            "Create a public tournament Story naming winners.", "session-blocked"
+            "Create a public tournament Story for Instagram naming winners.", "session-blocked"
         ),
     )
     result = json.loads(
@@ -376,10 +376,10 @@ def test_capture_manifest_flows_to_truth_gate_without_model_authored_evidence(tm
     agent = _bound_agent("capture-gate")
     contract = begin_tournament_intent_contract(
         agent,
-        message="Create a public tournament Story.",
+        message="Create a public tournament Story for Instagram.",
         task_id="capture-gate",
         turn_provenance=_bound_direct_provenance(
-            "Create a public tournament Story.", "capture-gate"
+            "Create a public tournament Story for Instagram.", "capture-gate"
         ),
     )
     result = json.loads(tool.run_tournament_truth_gate(

@@ -240,9 +240,21 @@ _PRIVATE_INQUIRY_FRAME = re.compile(
     r"\b(?:analy[sz]e|review|research|investigate|verify|check|what|which|when|where|how)\b",
     re.IGNORECASE,
 )
-_PUBLIC_SURFACE = re.compile(
-    r"\b(?:public|instagram\s+stor(?:y|ies)|stor(?:y|ies)|facebook|newsletter|"
-    r"website|public\s+post|carousel|caption|announcement|press\s+release)\b",
+_PUBLIC_OUTPUT_ARTIFACT = (
+    r"(?:stor(?:y|ies)|caption|post|carousel|announcement|(?:audit\s+)?report|"
+    r"copy|page|press\s+release|[a-z0-9_-]+\.txt)"
+)
+_PUBLIC_PLATFORM_OUTPUT_ARTIFACT = (
+    r"(?:stor(?:y|ies)|caption|post|carousel|announcement|copy|page|press\s+release)"
+)
+_PUBLIC_DESTINATION = r"(?:instagram|facebook|newsletter|website|cms)"
+_EXPLICIT_PUBLIC_OUTPUT = re.compile(
+    # A public output must bind an artifact to an actual destination. Bare
+    # "public" and destination-first labels can describe private input data,
+    # so neither one is authority without the artifact-to-destination relation.
+    rf"\b{_PUBLIC_DESTINATION}\s+{_PUBLIC_PLATFORM_OUTPUT_ARTIFACT}\b|"
+    rf"\b{_PUBLIC_OUTPUT_ARTIFACT}\b(?:\s+\w+){{0,5}}\s+"
+    rf"(?:for|to|on|in|via)\s+(?:the\s+)?(?:public\s+)?{_PUBLIC_DESTINATION}\b",
     re.IGNORECASE,
 )
 _DRAFT_ACTION = re.compile(r"\b(?:create|write|draft|make|prepare|generate)\b", re.IGNORECASE)
@@ -257,7 +269,7 @@ _NEGATION_RESET = re.compile(
     r"[-\u2014]\s*(?:please\s+)?(?:create|make|publish|post|send|upload|release)\b",
     re.IGNORECASE,
 )
-_CLAUSE_BOUNDARIES = frozenset(".!?;\n")
+_CLAUSE_BOUNDARY = re.compile(r"[!?;\n]|\.(?=\s|$)")
 _RECEIPT_OPERATION = re.compile(
     r"\b(?:validate|verify|check)\b.{0,48}\b(?:truth\s+)?receipt\b|"
     r"\breceipt\s+validation\b",
@@ -336,10 +348,7 @@ _INTERNAL_PUBLIC_TOOLS = frozenset(
 
 def _has_affirmative_action(message: str, pattern: re.Pattern[str]) -> bool:
     for match in pattern.finditer(message):
-        clause_start = max(
-            (message.rfind(boundary, 0, match.start()) for boundary in _CLAUSE_BOUNDARIES),
-            default=-1,
-        ) + 1
+        clause_start, _ = _clause_bounds(message, match.start())
         prefix = message[clause_start : match.start()]
         negations = list(_NEGATION.finditer(prefix))
         if not negations:
@@ -367,6 +376,27 @@ def _authority_directed_text(message: object) -> str:
     return directed[: marker.start()] if marker is not None else directed
 
 
+def _has_explicit_public_draft_operation(message: str) -> bool:
+    """Require an affirmative draft action and its public output in one clause."""
+    for action in _DRAFT_ACTION.finditer(message):
+        clause_start, clause_end = _clause_bounds(message, action.start())
+        clause = message[clause_start:clause_end]
+        if (
+            _has_affirmative_action(clause, _DRAFT_ACTION)
+            and _EXPLICIT_PUBLIC_OUTPUT.search(clause)
+        ):
+            return True
+    return False
+
+
+def _clause_bounds(message: str, offset: int) -> tuple[int, int]:
+    """Return sentence-like bounds without splitting a filename extension."""
+    boundaries = [match.start() for match in _CLAUSE_BOUNDARY.finditer(message)]
+    start = max((position for position in boundaries if position < offset), default=-1) + 1
+    end = min((position for position in boundaries if position >= offset), default=len(message))
+    return start, end
+
+
 def _installs_tournament_contract(
     state: TournamentIntentState | None,
     message: object,
@@ -378,10 +408,7 @@ def _installs_tournament_contract(
     if not directed.strip():
         return False
     if state is TournamentIntentState.PUBLIC_FACING_DRAFT:
-        return bool(
-            _PUBLIC_SURFACE.search(directed)
-            and _has_affirmative_action(directed, _DRAFT_ACTION)
-        )
+        return _has_explicit_public_draft_operation(directed)
     if state in {
         TournamentIntentState.PUBLICATION_REQUEST,
         TournamentIntentState.MIXED_PUBLICATION,
@@ -391,6 +418,9 @@ def _installs_tournament_contract(
             " ",
             directed,
             flags=re.IGNORECASE,
+        )
+        publication_text = re.sub(
+            r"\bpress\s+release\b", " ", publication_text, flags=re.IGNORECASE
         )
         has_target = bool(_EXPLICIT_BOUND_PUBLIC_SURFACE.search(directed)) or bool(
             trusted_publication_context
@@ -411,10 +441,13 @@ def _classify_tournament_intents(
         _TOURNAMENT_CUE.search(message)
         or (trusted_publication_context and _TOURNAMENT_CONTINUATION_CUE.search(message))
         or _APPROVAL_OPERATION.search(message) or _REVOCATION_OR_QUESTION.search(message)
-        or _EXPLICIT_BOUND_PUBLIC_SURFACE.search(message)
     )
     if not raw_has_tournament_cue and not trusted_publication_context:
-        return frozenset()
+        return (
+            frozenset({TournamentIntentState.PRIVATE_INQUIRY})
+            if _EXPLICIT_PUBLIC_OUTPUT.search(directed)
+            else frozenset()
+        )
     directed_has_tournament_cue = bool(
         _TOURNAMENT_CUE.search(directed) or _TOURNAMENT_CONTINUATION_CUE.search(directed)
     )
@@ -431,9 +464,12 @@ def _classify_tournament_intents(
         states.add(TournamentIntentState.RELEASE_APPROVAL_DISCUSSION_OR_GRANT)
     # Approval is an authority noun, never a publication instruction itself.
     public_action_text = re.sub(r"\b(?:release|publication)[\s-]+approval(?:[\s-]+blocker)?\b", " ", directed, flags=re.IGNORECASE)
+    public_action_text = re.sub(
+        r"\bpress\s+release\b", " ", public_action_text, flags=re.IGNORECASE
+    )
     if _has_affirmative_action(public_action_text, _PUBLICATION_ACTION):
         states.add(TournamentIntentState.PUBLICATION_REQUEST)
-    if _PUBLIC_SURFACE.search(directed) and _has_affirmative_action(directed, _DRAFT_ACTION):
+    if _has_explicit_public_draft_operation(directed):
         states.add(TournamentIntentState.PUBLIC_FACING_DRAFT)
     return frozenset(states or {TournamentIntentState.PRIVATE_INQUIRY})
 
