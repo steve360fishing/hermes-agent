@@ -120,6 +120,43 @@ def test_background_review_fork_opts_out_of_session_finalization(monkeypatch):
     assert seen.get("at_run_time") is False
 
 
+def test_background_review_fork_is_model_generated_despite_tournament_words(monkeypatch):
+    """A review fork's prompt text must never acquire direct-user authority."""
+    from agent.turn_origin import TurnOrigin
+
+    captured = {}
+
+    class FakeReviewAgent:
+        def __init__(self, **_kwargs):
+            self._session_messages = []
+
+        def run_conversation(self, **kwargs):
+            captured["turn_provenance"] = kwargs["turn_provenance"]
+
+        def shutdown_memory_provider(self):
+            pass
+
+        def close(self):
+            pass
+
+    monkeypatch.setattr(run_agent_module, "AIAgent", FakeReviewAgent)
+    monkeypatch.setattr(run_agent_module.threading, "Thread", ImmediateThread)
+
+    agent = _bare_agent()
+    AIAgent._spawn_background_review(
+        agent,
+        messages_snapshot=[{
+            "role": "user",
+            "content": "Prepare tournament publication release approval notes.",
+        }],
+        review_memory=True,
+    )
+
+    provenance = captured["turn_provenance"]
+    assert provenance.origin is TurnOrigin.MODEL_GENERATED
+    assert not provenance.is_authenticated_direct_user
+
+
 def test_background_review_summarizer_receives_captured_messages_after_close(monkeypatch):
     """The action summarizer must see review messages even after close cleanup.
 

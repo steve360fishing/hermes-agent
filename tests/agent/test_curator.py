@@ -1280,11 +1280,14 @@ def test_review_fork_runs_under_background_review_origin(curator_env, monkeypatc
             # Capture the origin AT RUN TIME — i.e. after _run_llm_review has
             # finished configuring the fork, which is exactly when it matters.
             captured["write_origin"] = self._memory_write_origin
+            captured["turn_provenance"] = kwargs["turn_provenance"]
             return {"final_response": "no change"}
 
     monkeypatch.setattr("run_agent.AIAgent", _StubAgent)
 
-    meta = curator._run_llm_review("review prompt")
+    meta = curator._run_llm_review(
+        "Review this tournament public release approval planning text."
+    )
 
     assert meta.get("error") is None, meta.get("error")
     assert captured.get("write_origin") == "background_review", (
@@ -1292,6 +1295,11 @@ def test_review_fork_runs_under_background_review_origin(curator_env, monkeypatc
         "'background_review' — the skill_manage background-review write "
         "guard would not fire (GH-47688 regression)"
     )
+    from agent.turn_origin import TurnOrigin
+
+    provenance = captured["turn_provenance"]
+    assert provenance.origin is TurnOrigin.MODEL_GENERATED
+    assert not provenance.is_authenticated_direct_user
 
 
 def test_review_fork_forwards_runtime_pool_and_overrides(curator_env, monkeypatch):

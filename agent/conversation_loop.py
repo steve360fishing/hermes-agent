@@ -22,7 +22,6 @@ import os
 import random
 import re
 import ssl
-import threading
 import time
 import uuid
 from functools import wraps
@@ -587,8 +586,9 @@ def _sync_failover_system_message(agent, api_messages, active_system_prompt):
 def _effective_request_system_prompt(agent, base_prompt: str) -> str:
     """Append volatile operator guidance, then the request-local contract."""
     from agent.task_execution_contract import effective_request_system_prompt
+    from agent.tournament_intent_contract import effective_request_system_prompt as tournament_prompt
 
-    return effective_request_system_prompt(agent, base_prompt)
+    return tournament_prompt(agent, effective_request_system_prompt(agent, base_prompt))
 
 
 def _clear_request_contract_after_turn(func):
@@ -601,8 +601,6 @@ def _clear_request_contract_after_turn(func):
                 rescue_client = getattr(agent, "_rescue_telemetry_client", None)
                 turn_id = getattr(agent, "_current_turn_id", None)
                 if rescue_client is not None and turn_id:
-                    import uuid
-
                     rescue_client.emit(
                         {
                             "event": "turn_end",
@@ -616,6 +614,12 @@ def _clear_request_contract_after_turn(func):
                 logger.warning("rescue turn telemetry cleanup unavailable", exc_info=True)
             from agent.task_execution_contract import clear_task_execution_contract
             clear_task_execution_contract(agent)
+            from agent.tournament_intent_contract import (
+                clear_tournament_intent_contract,
+                clear_tournament_truth_advisory,
+            )
+            clear_tournament_intent_contract(agent)
+            clear_tournament_truth_advisory()
 
     return wrapper
 
@@ -631,6 +635,7 @@ def run_conversation(
     persist_user_message: Optional[Any] = None,
     persist_user_timestamp: Optional[float] = None,
     moa_config: Optional[dict[str, Any]] = None,
+    turn_provenance=None,
 ) -> Dict[str, Any]:
     """
     Run a complete conversation with tool calling until completion.
@@ -666,6 +671,16 @@ def run_conversation(
         except Exception:
             pass
 
+    # A stale ContextVar is candidate-local quarantine, never a turn refusal.
+    from agent.tournament_intent_contract import (
+        begin_tournament_truth_advisory,
+        clear_tournament_intent_contract,
+        clear_tournament_truth_advisory,
+    )
+
+    clear_tournament_intent_contract(agent)
+    clear_tournament_truth_advisory()
+
     # Resolve file-artifact policy before any context compression, plugin, or
     # provider work. A contradictory destination must fail without invoking a
     # model or leaving a reduced-capability contract attached to the session.
@@ -676,14 +691,27 @@ def run_conversation(
 
     clear_task_execution_contract(agent)
     task_id = task_id or str(uuid.uuid4())
+    from agent.turn_origin import coerce_turn_provenance
+
+    turn_provenance = coerce_turn_provenance(turn_provenance)
     _contract_message = (
-        persist_user_message if persist_user_message is not None else user_message
+        turn_provenance.authority_text
+        if turn_provenance.is_authenticated_direct_user
+        else (persist_user_message if persist_user_message is not None else user_message)
     )
+    begin_tournament_truth_advisory(
+        agent,
+        message=_contract_message,
+        turn_provenance=turn_provenance,
+    )
+    _tournament_contract = None
     _prebuilt_task_contract = build_task_execution_contract(
         _contract_message,
         task_id=task_id,
         platform=getattr(agent, "platform", None),
         conversation_history=conversation_history,
+        tournament_state=getattr(_tournament_contract, "state", None),
+        tournament_intents=getattr(_tournament_contract, "intents", None),
     )
     if _prebuilt_task_contract.preflight_error:
         _preflight_response = (
@@ -729,6 +757,7 @@ def run_conversation(
             stream_callback,
             persist_user_message,
             persist_user_timestamp,
+            turn_provenance,
             task_execution_contract=_prebuilt_task_contract,
             restore_or_build_system_prompt=_restore_or_build_system_prompt,
             install_safe_stdio=_install_safe_stdio,
@@ -989,6 +1018,23 @@ def run_conversation(
             # It is bookkeeping, never a provider field — pop it from EVERY
             # outgoing copy.
             _api_content = api_msg.pop("api_content", None)
+            # Durable turn provenance is internal authority metadata, never a
+            # provider message field.  Strict chat APIs reject unknown keys.
+            for _provenance_key in (
+                "turn_origin",
+                "turn_actor_identity",
+                "turn_platform",
+                "turn_profile",
+                "turn_chat_id",
+                "turn_thread_id",
+                "turn_message_id",
+                "turn_event_id",
+                "turn_session_scope",
+                "turn_authority_text_sha256",
+                "turn_captured_at_unix_ms",
+                "turn_binding_sha256",
+            ):
+                api_msg.pop(_provenance_key, None)
 
             # Inject ephemeral context into the current turn's user message.
             # Sources: memory manager prefetch + plugin pre_llm_call hooks

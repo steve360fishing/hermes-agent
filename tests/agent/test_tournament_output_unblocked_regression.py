@@ -20,7 +20,7 @@ def test_private_codex_handoff_never_installs_a_tournament_release_contract():
     assert agent._tool_guardrails.before_call("write_file", {}).action == "allow"
 
 
-def test_tournament_contract_cannot_restrict_normal_tools():
+def test_unknown_legacy_tournament_contract_fails_closed_without_old_deadlock_code():
     controller = ToolCallGuardrailController()
     contract = SimpleNamespace(has_valid_receipt=lambda: False)
     controller.set_tournament_contract(contract)
@@ -28,11 +28,11 @@ def test_tournament_contract_cannot_restrict_normal_tools():
         assert controller.before_call(tool_name, {}).code != "tournament_receipt_required"
 
 
-def test_explicit_validator_without_context_is_advisory_only():
+def test_explicit_validator_without_context_requires_request_local_public_contract():
     import json
     from tools.tournament_truth_gate_tool import run_tournament_truth_gate
     result = json.loads(run_tournament_truth_gate({"candidate": "draft", "request": {}, "artifact_metadata": {}}, task_id="no-context", session_id="none"))
-    assert result["code"] in {"trusted_runtime_roots_unavailable", "trusted_source_snapshot_required"}
+    assert result["code"] == "truth_gate_no_active_contract"
 
 
 def test_forbidden_runtime_literals_are_absent():

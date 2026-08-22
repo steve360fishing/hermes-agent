@@ -10082,6 +10082,9 @@ def _run_prompt_submit(rid, sid: str, session: dict, text: Any) -> None:
                 "conversation_history": list(history),
                 "stream_callback": _stream,
             }
+            from agent.turn_origin import TurnProvenance
+
+            run_kwargs["turn_provenance"] = TurnProvenance.unknown()
             try:
                 if "task_id" in inspect.signature(agent.run_conversation).parameters:
                     run_kwargs["task_id"] = session["session_key"]
@@ -11117,6 +11120,13 @@ def _(rid, params: dict) -> dict:
             ).run_conversation(
                 user_message=text,
                 task_id=task_id,
+                turn_provenance=__import__(
+                    "agent.turn_origin", fromlist=["TurnOrigin", "TurnProvenance"]
+                ).TurnProvenance.internal(
+                    __import__(
+                        "agent.turn_origin", fromlist=["TurnOrigin"]
+                    ).TurnOrigin.MODEL_GENERATED
+                ),
             )
             _emit(
                 "background.complete",
@@ -11230,6 +11240,13 @@ def _(rid, params: dict) -> dict:
                 user_message=prompt,
                 task_id=task_id,
                 conversation_history=parent_history or None,
+                turn_provenance=__import__(
+                    "agent.turn_origin", fromlist=["TurnOrigin", "TurnProvenance"]
+                ).TurnProvenance.internal(
+                    __import__(
+                        "agent.turn_origin", fromlist=["TurnOrigin"]
+                    ).TurnOrigin.MODEL_GENERATED
+                ),
             )
             text = (
                 result.get("final_response", str(result))

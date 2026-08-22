@@ -29,6 +29,7 @@ from pathlib import Path
 from typing import Optional
 
 from gateway.session_context import declare_stateless_channel
+from agent.turn_origin import TurnProvenance
 from hermes_cli.fallback_config import get_fallback_chain
 
 
@@ -439,7 +440,10 @@ def _run_agent(
         agent.stream_delta_callback = None
         agent.tool_gen_callback = None
 
-        result = agent.run_conversation(prompt)
+        result = agent.run_conversation(
+            prompt,
+            turn_provenance=TurnProvenance.unknown(),
+        )
         return (result.get("final_response") or "", result)
     finally:
         # Ordering deliberately mirrors gateway/run.py:_cleanup_agent_resources,

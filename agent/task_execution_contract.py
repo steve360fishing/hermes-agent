@@ -15,7 +15,6 @@ import stat
 import tempfile
 import threading
 import time
-import unicodedata
 import uuid
 from contextlib import contextmanager
 from dataclasses import dataclass, field
@@ -28,7 +27,7 @@ from agent.file_safety import get_safe_write_roots, is_write_denied
 
 NORMAL = "normal"
 ARTIFACT_ONLY = "artifact_only"
-POLICY_VERSION = "artifact-only-v4"
+POLICY_VERSION = "artifact-only-v5"
 MAX_ARTIFACT_BYTES = 49 * 1024 * 1024
 MAX_PENDING_ARTIFACTS = 16
 MAX_PENDING_ARTIFACT_BYTES = 128 * 1024 * 1024
@@ -40,12 +39,18 @@ _TERMINAL_RECEIPT_STATES = frozenset({"delivered", "failed_preflight", "ambiguou
 _ALLOWED_RECEIPT_TRANSITIONS = {
     "": frozenset({"allocated"}),
     "allocated": frozenset({"allocated", "written", "failed_preflight", "ambiguous"}),
-    "written": frozenset({"written", "dispatching", "failed_preflight", "ambiguous"}),
+    "written": frozenset({
+        "written", "failed_pre_dispatch", "dispatching", "failed_preflight", "ambiguous"
+    }),
+    "failed_pre_dispatch": frozenset({
+        "failed_pre_dispatch", "dispatching", "failed_preflight"
+    }),
     "dispatching": frozenset({"dispatching", "delivered", "ambiguous"}),
 }
 _LIFECYCLE_STATE = {
     "allocated": "REQUESTED",
     "written": "READ_BACK_VERIFIED",
+    "failed_pre_dispatch": "FAILED_PREFLIGHT",
     "dispatching": "DELIVERY_REFERENCED",
     "delivered": "COMPLETE",
     "failed_preflight": "FAILED",
@@ -54,6 +59,9 @@ _LIFECYCLE_STATE = {
 _LIFECYCLE_STEPS = {
     "allocated": ("REQUESTED",),
     "written": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED"),
+    "failed_pre_dispatch": (
+        "REQUESTED", "CREATED", "READ_BACK_VERIFIED", "FAILED_PREFLIGHT"
+    ),
     "dispatching": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "DELIVERY_REFERENCED"),
     "delivered": ("REQUESTED", "CREATED", "READ_BACK_VERIFIED", "DELIVERY_REFERENCED", "COMPLETE"),
     "failed_preflight": ("REQUESTED", "FAILED"),
@@ -79,7 +87,8 @@ _QUOTED_FILENAME = re.compile(
     re.IGNORECASE,
 )
 _BARE_FILENAME = re.compile(
-    r"(?<![\w.-])(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:txt|md|markdown))(?![\w.])",
+    r"(?<![\w.-])(?P<name>[A-Za-z0-9][A-Za-z0-9._-]{0,127}\.(?:txt|md|markdown))"
+    r"(?=$|[\s,;:!?)\]}]|\.(?:\s|$))",
     re.IGNORECASE,
 )
 _TEXT_FILE_REQUEST = re.compile(
@@ -144,9 +153,58 @@ _HANDOFF_ARTIFACT = re.compile(
     r"\b(?:prompt|brief|handoff|report|checklist|caption\s+package|copy)\b",
     re.IGNORECASE,
 )
-_INLINE_ONLY = re.compile(
-    r"\b(?:inline|in\s+(?:this\s+)?chat|do\s+not\s+(?:attach|create)\s+(?:a\s+)?file|"
-    r"don't\s+(?:attach|create)\s+(?:a\s+)?file|no\s+(?:file|attachment))\b",
+_DIRECT_HANDOFF_LEAD = re.compile(
+    r"^\s*"
+    r"(?:all\s+right[,:\s]+|alright[,:\s]+|ok(?:ay)?[,:\s]+)?"
+    r"(?:please\s+|(?:can|could|would)\s+you\s+(?:please\s+)?|"
+    r"i\s+(?:want|need)(?:\s+you)?\s+to\s+)?"
+    r"(?:return|give(?:\s+me)?|write|draft|create|produce|generate|"
+    r"make(?!\s+sure\b))\b",
+    re.IGNORECASE,
+)
+_HANDOFF_CLAUSE = re.compile(r"[^.!?;\n]+(?:[.!?;]|$)")
+_HANDOFF_SUBCLAUSE_BOUNDARY = re.compile(
+    r",\s*(?:(?:and|but)\s+)?|\b(?:and|but)\s+",
+    re.IGNORECASE,
+)
+_HANDOFF_OPERATIONAL_DELEGATION_TAIL = re.compile(
+    r"^(?:(?:then|first|next)\s+)?"
+    r"(?:ask|have|tell|instruct|let)\s+"
+    r"(?:codex|claude|opus|gemini|chatgpt|gpt(?:-\d+)?)\b",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT_CONTENT_FRAME = re.compile(
+    r"\b(?:"
+    r"with\s+(?:(?:(?:the\s+following|this|these)\s+)?"
+    r"(?:text|steps?|instructions?|content))|"
+    r"whose\s+(?:final\s+)?(?:text|steps?|instructions?|content)\s+"
+    r"(?:is|are|says?|reads?|states?)|"
+    r"that\s+(?:says?|reads?|states?)(?:\s+to)?|"
+    r"that\s+(?:asks?|tells?|instructs?)|"
+    r"that\s+mentions?\s+"
+    r"(?:codex|claude|another\s+(?:model|agent|person)|a\s+(?:model|person))\s+"
+    r"(?:and\s+)?(?:then\s+)?(?:asks?|tells?|instructs?)|"
+    r"(?:where\s+)?the\s+(?:final\s+)?"
+    r"(?:text|steps?|instructions?|content|handoff)\s+"
+    r"(?:should\s+)?(?:is|are|says?|reads?|states?)|"
+    r"containing\s+(?:(?:the\s+following|these)\s+)?"
+    r"(?:text|steps?|instructions?|content)"
+    r")\b\s*:?,?",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT_CONTENT_CONTINUATION = re.compile(
+    r";(?=\s*(?:the\s+)?(?:prompt|brief|handoff|report|checklist|copy)\s+"
+    r"(?:should\s+)?(?:say|read|state)\b)",
+    re.IGNORECASE,
+)
+_HANDOFF_ARTIFACT_CONTENT_EXIT = re.compile(
+    r"(?:"
+    r",\s*(?:(?:and|but)\s+)?outside\s+(?:the\s+)?"
+    r"(?:prompt|brief|handoff|report|checklist|copy)\b[:,]?|"
+    r",?\s*(?:(?:and|but)\s+)?after\s+(?:the\s+)?"
+    r"(?:prompt|brief|handoff|report|checklist|copy)"
+    r"(?:\s+(?:is\s+)?(?:complete|completed|done)\b[:,]?|\s*,)"
+    r")",
     re.IGNORECASE,
 )
 _FILE_CORRECTION = re.compile(
@@ -191,6 +249,10 @@ _ARTIFACT_ID = re.compile(r"^[0-9a-f]{32}$", re.IGNORECASE)
 _ARTIFACT_EXECUTION_CONTRACT_MARKER = "request execution contract (artifact_only"
 _MEDIA_PATH = re.compile(
     r"MEDIA:\s*(?P<path>(?:[A-Za-z]:[/\\]|/)[^\s\"'`]+)",
+    re.IGNORECASE,
+)
+_SYNTHETIC_BACKGROUND_NOTICE = re.compile(
+    r"^\s*\[(?:IMPORTANT|SYSTEM):\s*(?:Background process|Watch disabled for)\b",
     re.IGNORECASE,
 )
 _BARE_LOCAL_ARTIFACT_PATH = re.compile(
@@ -545,36 +607,188 @@ class TaskExecutionContract:
             self.active = False
 
 
+def _artifact_content_end(clause: str, content_frame: re.Match[str]) -> int:
+    """Return the exclusive end of explicitly framed artifact content."""
+    content_start = content_frame.end()
+    while content_start < len(clause) and clause[content_start].isspace():
+        content_start += 1
+
+    closing_quotes = {'"': '"', "'": "'", "\u201c": "\u201d", "\u2018": "\u2019"}
+    opening_quote = clause[content_start : content_start + 1]
+    closing_quote = closing_quotes.get(opening_quote)
+    if closing_quote:
+        search_start = content_start + 1
+        while True:
+            closing_index = clause.find(closing_quote, search_start)
+            if closing_index < 0:
+                break
+            previous = clause[closing_index - 1 : closing_index]
+            following = clause[closing_index + 1 : closing_index + 2]
+            following_word = re.match(
+                r"\s+([A-Za-z][A-Za-z0-9_-]*)",
+                clause[closing_index + 1 :],
+            )
+            apostrophe_inside_word = closing_quote in {"'", "\u2019"} and (
+                previous.isalnum() and following.isalnum()
+            )
+            plural_possessive = bool(
+                closing_quote in {"'", "\u2019"}
+                and previous.lower() == "s"
+                and following_word
+                and following_word.group(1).lower()
+                not in {"and", "but", "then", "outside", "after", "next", "first"}
+            )
+            if not (apostrophe_inside_word or plural_possessive):
+                return closing_index + 1
+            search_start = closing_index + 1
+
+    content_exit = _HANDOFF_ARTIFACT_CONTENT_EXIT.search(clause, content_start)
+    if content_exit:
+        return content_exit.start()
+    return len(clause)
+
+
+def _is_direct_handoff_artifact_request(text: str) -> bool:
+    """Return True only when one clause directly asks for a model handoff.
+
+    Operational verbs inside the requested handoff are content (for example,
+    ``a prompt for Claude to inspect logs``), while operational work in another
+    clause makes the overall request mixed and therefore keeps normal tools.
+    """
+    normalized_text = _HANDOFF_ARTIFACT_CONTENT_CONTINUATION.sub(",", text)
+    for match in _HANDOFF_CLAUSE.finditer(normalized_text):
+        clause = match.group(0).strip()
+        if not (
+            _DIRECT_HANDOFF_LEAD.search(clause)
+            and _HANDOFF_TARGET.search(clause)
+            and _HANDOFF_ARTIFACT.search(clause)
+        ):
+            continue
+        target_match = _HANDOFF_TARGET.search(clause)
+        target_action_content = bool(
+            target_match
+            and re.match(
+                r"\s+to\b",
+                clause[target_match.end() :],
+                re.IGNORECASE,
+            )
+            and _OPERATIONAL_REQUEST.search(clause[target_match.end() :])
+        )
+        content_frame = _HANDOFF_ARTIFACT_CONTENT_FRAME.search(clause)
+        content_end = (
+            _artifact_content_end(clause, content_frame) if content_frame else -1
+        )
+        for boundary in _HANDOFF_SUBCLAUSE_BOUNDARY.finditer(clause):
+            tail = clause[boundary.end() :].strip()
+            if content_frame and boundary.end() <= content_frame.start():
+                before_frame = clause[boundary.end() : content_frame.start()]
+                if not _OPERATIONAL_REQUEST.search(before_frame):
+                    continue
+            framed_artifact_content = bool(
+                content_frame
+                and content_frame.start() <= boundary.start() < content_end
+            )
+            if framed_artifact_content:
+                continue
+            operational_delegation = bool(
+                _HANDOFF_OPERATIONAL_DELEGATION_TAIL.match(tail)
+                and _OPERATIONAL_REQUEST.search(tail)
+            )
+            if target_match and boundary.start() < target_match.end():
+                if operational_delegation:
+                    return False
+                continue
+            explicit_current_agent = bool(
+                re.search(r"\b(?:you|yourself)\b", tail[:120], re.IGNORECASE)
+            )
+            explicit_sequence = bool(
+                re.match(r"(?:then|first|next|after\s+that)\b", tail, re.IGNORECASE)
+            )
+            boundary_text = clause[boundary.start() : boundary.end()].lstrip()
+            bare_comma_sequence = boundary_text.startswith(",") and not re.search(
+                r"\band\b", boundary_text, re.IGNORECASE
+            )
+            if (
+                _OPERATIONAL_REQUEST.search(tail)
+                and (
+                    explicit_current_agent
+                    or (
+                        explicit_sequence
+                        and (not target_action_content or bare_comma_sequence)
+                    )
+                    or (operational_delegation and not target_action_content)
+                    or content_frame is not None
+                    or not target_action_content
+                )
+            ):
+                return False
+        remaining = (
+            f"{normalized_text[:match.start()]} {normalized_text[match.end():]}"
+        )
+        if not _OPERATIONAL_REQUEST.search(remaining):
+            return True
+    return False
+
+
 def build_task_execution_contract(
     message: Any,
     *,
     task_id: str,
     platform: Any = None,
     conversation_history: Any = None,
+    tournament_state: Any = None,
+    tournament_intents: Any = None,
 ) -> TaskExecutionContract:
     text = message if isinstance(message, str) else str(message or "")
     correlation_id = hashlib.sha256(str(task_id).encode("utf-8")).hexdigest()[:16]
+    synthetic_background_event = bool(_SYNTHETIC_BACKGROUND_NOTICE.match(text))
     trusted_text = _trusted_request_text(text)
     affirmative_text = _NEGATED_CONSTRAINT.sub("", trusted_text)
     file_requested, requested_filename, requested_extension = _requested_artifact_file(
         affirmative_text
     )
-    handoff_artifact = bool(
-        _HANDOFF_TARGET.search(affirmative_text)
-        and _HANDOFF_ARTIFACT.search(affirmative_text)
-        and not _INLINE_ONLY.search(affirmative_text)
+    # The handoff shortcut must be a direct request for a textual handoff, not
+    # a broad co-occurrence check. Operational continuation prompts commonly
+    # mention Codex/Claude and a later report; forcing those into artifact-only
+    # prevents the requested work from running.
+    direct_handoff_artifact = _is_direct_handoff_artifact_request(affirmative_text)
+    inline_handoff_artifact = bool(
+        direct_handoff_artifact and not file_requested
     )
+    handoff_attachment = bool(direct_handoff_artifact and file_requested)
     recovery_content = ""
     correction_artifact = False
     if not file_requested and _FILE_CORRECTION.search(affirmative_text):
         recovery_content = _last_assistant_text(conversation_history)
         correction_artifact = bool(recovery_content)
-    if handoff_artifact or correction_artifact:
+    if correction_artifact:
         file_requested = True
         requested_extension = ".txt"
+    elif handoff_attachment and not requested_extension:
+        requested_extension = ".txt"
     lane, reason = _classify(trusted_text, file_requested=file_requested)
-    if handoff_artifact:
-        lane, reason = ARTIFACT_ONLY, "handoff_text_attachment"
+    tournament_state_value = str(
+        getattr(tournament_state, "value", tournament_state) or ""
+    )
+    tournament_intent_values = {
+        str(getattr(intent, "value", intent) or "")
+        for intent in (tournament_intents or ())
+    }
+    if synthetic_background_event:
+        lane = NORMAL
+        reason = "synthetic_background_event"
+    elif (
+        tournament_state_value == "mixed_publication"
+        and "private_artifact" in tournament_intent_values
+        and file_requested
+    ):
+        lane = ARTIFACT_ONLY
+        reason = "mixed_private_artifact"
+    elif direct_handoff_artifact:
+        lane = ARTIFACT_ONLY
+        reason = (
+            "handoff_text_inline" if inline_handoff_artifact else "handoff_text_attachment"
+        )
     elif correction_artifact:
         lane, reason = ARTIFACT_ONLY, "artifact_correction_attachment"
     if lane == ARTIFACT_ONLY:
@@ -684,7 +898,7 @@ def _last_assistant_text(history: Any) -> str:
 
 def platform_supports_document_delivery(platform: Any) -> bool:
     """Static capability gate used before an attachment-only turn is activated."""
-    return str(getattr(platform, "value", platform) or "").lower() == "telegram"
+    return str(getattr(platform, "value", platform) or "").lower() in {"telegram", "cron"}
 
 
 def artifact_content_fits(content: str) -> bool:
@@ -1073,7 +1287,11 @@ def open_registered_artifact_descriptor(path: str) -> int | None:
             receipt.get("id") != contract.artifact_id
             or receipt.get("path") != contract.artifact_output_path
             or receipt.get("mime") != contract.artifact_mime_type
-            or receipt.get("state") not in {"written", "dispatching"}
+            or receipt.get("state") not in {
+                "written",
+                "failed_pre_dispatch",
+                "dispatching",
+            }
         ):
             raise ArtifactPathSecurityError("artifact_receipt_mismatch")
         with _hold_parent_chain(contract._artifact_parent_chain) as parent_fd:
@@ -1130,6 +1348,21 @@ def record_artifact_written(contract: TaskExecutionContract) -> bool:
             error_code=_artifact_error_code(exc, "artifact_unreadable"),
         )
         return False
+
+
+def artifact_content_matches(contract: TaskExecutionContract, expected: str) -> bool:
+    """Verify the registered artifact contains exactly the authorized UTF-8 bytes."""
+    try:
+        payload, _identity = _verified_artifact_bytes(contract)
+    except OSError:
+        return False
+    return payload == expected.encode("utf-8")
+
+
+def read_registered_artifact_text(contract: TaskExecutionContract) -> str:
+    """Read the registered artifact through the same identity-safe verifier."""
+    payload, _identity = _verified_artifact_bytes(contract)
+    return payload.decode("utf-8", errors="strict")
 
 
 def record_artifact_dispatch(
@@ -1269,6 +1502,20 @@ def _write_artifact_receipt_locked(
         "bytes": size if size is not None else prior.get("bytes", 0),
         "mime": contract.artifact_mime_type,
         "state": state,
+        # Text and attachment delivery are independent obligations.  This
+        # receipt describes only the requested artifact, and must never infer
+        # its success from a streamed text bubble.
+        "attachment_dispatch_attempted": bool(
+            prior.get("attachment_dispatch_attempted", False)
+            or state == "dispatching"
+            or int(prior.get("attempt_count", 0)) > 0
+            or transport_attempt
+        ),
+        "attachment_delivered": state == "delivered",
+        "attachment_message_id_confirmed": bool(
+            state == "delivered" and message_id is not None and str(message_id).strip()
+        ),
+        "retryable": state == "failed_pre_dispatch",
         "lifecycle_state": _LIFECYCLE_STATE[state],
         "lifecycle": list(_LIFECYCLE_STEPS[state]),
         "attempt_count": int(prior.get("attempt_count", 0))
@@ -1409,6 +1656,7 @@ def _reconcile_artifact_store(artifact_base: str) -> None:
         if not isinstance(receipt, dict) or receipt.get("state") not in {
             "allocated",
             "written",
+            "failed_pre_dispatch",
             "dispatching",
         }:
             continue
@@ -1501,6 +1749,8 @@ def _cleanup_task_owned_artifact(contract: TaskExecutionContract) -> None:
 
 def _trusted_request_text(text: str) -> str:
     """Discard fenced, quoted, and inline-code examples before classification."""
+    if _SYNTHETIC_BACKGROUND_NOTICE.match(text):
+        return ""
     text = re.sub(r"```[\s\S]*?```", "", text)
     text = re.sub(r"(?m)^\s*>.*$", "", text)
     return re.sub(r"`[^`\r\n]*`", "", text)
@@ -1756,24 +2006,21 @@ def _has_direct_file_request_clause(text: str) -> bool:
         ]
         if not evidence_matches:
             continue
-        evidence = min(evidence_matches, key=lambda match: match.start())
-        between = text[verb_match.end() : evidence.start()]
-        after = text[evidence.end() :]
-        # This is an optimization, not a capability boundary. Ambiguous prose
-        # safely falls back to the full normal agent, which can still write and
-        # deliver files through the standard guarded tools.
-        if (
-            len(between) > 64
-            or any(character in _SPLITLINE_BOUNDARIES for character in between)
-            or any(
-            unicodedata.category(character).startswith("P") for character in between
-            )
-            or _DIRECT_FILE_BRIDGE.fullmatch(between) is None
-            or _MENTIONED_FILE_REFERENCE_SUFFIX.search(after) is not None
-            or _DIRECT_FILE_REQUEST_SUFFIX.fullmatch(after) is None
-        ):
-            continue
-        return True
+        for evidence in sorted(evidence_matches, key=lambda match: match.start()):
+            between = text[verb_match.end() : evidence.start()]
+            after = text[evidence.end() :]
+            # This is an optimization, not a capability boundary. Ambiguous prose
+            # safely falls back to the full normal agent, which can still write and
+            # deliver files through the standard guarded tools.
+            if (
+                len(between) > 64
+                or any(character in _SPLITLINE_BOUNDARIES for character in between)
+                or _DIRECT_FILE_BRIDGE.fullmatch(between) is None
+                or _MENTIONED_FILE_REFERENCE_SUFFIX.search(after) is not None
+                or _DIRECT_FILE_REQUEST_SUFFIX.fullmatch(after) is None
+            ):
+                continue
+            return True
     return False
 
 

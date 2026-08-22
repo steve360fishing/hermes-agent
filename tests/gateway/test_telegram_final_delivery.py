@@ -1,14 +1,42 @@
 """Regression coverage for Telegram final delivery after streamed edit failure."""
 
+from datetime import datetime
+import hashlib
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, MagicMock
 
 import pytest
 
-from gateway.config import PlatformConfig
-from gateway.platforms.base import SendResult
+import gateway.run as gateway_run
+from gateway.config import GatewayConfig, Platform, PlatformConfig
+from gateway.platforms.base import (
+    BasePlatformAdapter,
+    MessageEvent,
+    MessageType,
+    ProcessingOutcome,
+    SendResult,
+)
+from gateway.run import AttachmentDeliveryOutcome, GatewayRunner
+from gateway.session import SessionEntry, SessionSource
 from gateway.stream_consumer import GatewayStreamConsumer, StreamConsumerConfig
 from plugins.platforms.telegram.adapter import TelegramAdapter
+
+
+def _reconstructed_txt_fixture() -> Path:
+    fixture = (
+        Path(__file__).parents[1]
+        / "fixtures"
+        / "telegram"
+        / "vps_txt_delivery_acceptance.txt"
+    )
+    content = fixture.read_bytes()
+    assert len(content) == 16643
+    assert hashlib.sha256(content).hexdigest() == (
+        "e86bbce10cfbba20b7619e7b8dc9bfd892df01e5f6e0a35c972fb27afecfd111"
+    )
+    assert content.startswith(b"NON-ORIGINAL SYNTHETIC RECONSTRUCTION\n")
+    return fixture
 
 
 def _adapter() -> MagicMock:
@@ -21,6 +49,452 @@ def _adapter() -> MagicMock:
     adapter.send = AsyncMock()
     adapter.delete_message = AsyncMock(return_value=True)
     return adapter
+
+
+def _media_event() -> MessageEvent:
+    return MessageEvent(
+        text="",
+        message_type=MessageType.TEXT,
+        source=SimpleNamespace(
+            chat_id="chat-1", platform="telegram", thread_id=None, chat_type="dm"
+        ),
+    )
+
+
+def _media_runner() -> SimpleNamespace:
+    return SimpleNamespace(
+        _thread_metadata_for_source=lambda _source, _anchor=None: {"notify": True},
+        _reply_anchor_for_event=lambda _event: None,
+    )
+
+
+def _real_gateway_runner(monkeypatch, tmp_path):
+    runner = GatewayRunner(GatewayConfig())
+    runner.adapters = {}
+    runner._running_agents = {}
+    runner._running_agents_ts = {}
+    runner._pending_messages = {}
+    runner._pending_approvals = {}
+    runner._is_user_authorized = lambda _source: True
+    runner._set_session_env = lambda _context: None
+    runner._handle_active_session_busy_message = AsyncMock(return_value=False)
+    runner._session_db = MagicMock()
+    runner._recover_telegram_topic_thread_id = lambda _source: None
+    runner._cache_session_source = lambda _key, _source: None
+    runner._is_session_run_current = lambda _key, _gen: True
+    runner._reply_anchor_for_event = lambda _event: None
+    runner._get_guild_id = lambda _event: None
+    runner._should_send_voice_reply = lambda *_a, **_kw: False
+    runner.hooks = MagicMock()
+    runner.hooks.emit = AsyncMock()
+    runner.session_store = MagicMock()
+    runner.session_store.get_or_create_session.return_value = SessionEntry(
+        session_key="agent:main:telegram:dm:12345",
+        session_id="sess-attachment-outcome",
+        created_at=datetime.now(),
+        updated_at=datetime.now(),
+        platform=Platform.TELEGRAM,
+        chat_type="dm",
+    )
+    runner.session_store.load_transcript.return_value = []
+    runner.session_store.append_to_transcript = MagicMock()
+    runner.session_store.update_session = MagicMock()
+    monkeypatch.setattr(gateway_run, "_hermes_home", tmp_path)
+    monkeypatch.setattr(
+        gateway_run, "_resolve_runtime_agent_kwargs", lambda: {"api_key": "fake"}
+    )
+    monkeypatch.setattr(
+        "agent.model_metadata.get_model_context_length",
+        lambda *_args, **_kwargs: 100_000,
+    )
+    return runner
+
+
+@pytest.mark.asyncio
+async def test_real_already_streamed_caller_retains_ambiguous_attachment_outcome(
+    monkeypatch, tmp_path
+):
+    runner = _real_gateway_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="steve",
+    )
+    event = MessageEvent(
+        text="give me the file",
+        source=source,
+        message_id="91",
+    )
+    agent_result = {
+        "final_response": "MEDIA:/tmp/evidence.txt",
+        "messages": [
+            {"role": "user", "content": "give me the file"},
+            {"role": "assistant", "content": "MEDIA:/tmp/evidence.txt"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+        "already_sent": True,
+    }
+    runner._run_agent = AsyncMock(return_value=agent_result)
+    config = PlatformConfig(enabled=True, token="test-token")
+    config.typing_indicator = False
+    delivery_adapter = TelegramAdapter(config)
+    delivery_adapter._run_processing_hook = AsyncMock()
+    runner._adapter_for_source = lambda _source: delivery_adapter
+    ambiguous = AttachmentDeliveryOutcome(
+        path="/tmp/evidence.txt",
+        dispatch_attempted=True,
+        delivered=False,
+        message_id_confirmed=False,
+        state="ambiguous",
+        error_code="document_dispatch_exception",
+    )
+    runner._deliver_media_from_response = AsyncMock(return_value=(ambiguous,))
+
+    async def _gateway_handler(inbound_event):
+        return await runner._handle_message_with_agent(
+            inbound_event,
+            source,
+            "agent:main:telegram:dm:12345",
+            1,
+        )
+
+    delivery_adapter._message_handler = _gateway_handler
+
+    await delivery_adapter._process_message_background(
+        event,
+        "agent:main:telegram:dm:12345",
+    )
+
+    assert event._attachment_delivery_outcomes == (ambiguous,)
+    assert agent_result["attachment_delivery_state"] == "ambiguous"
+    runner._deliver_media_from_response.assert_awaited_once()
+    complete_calls = [
+        call
+        for call in delivery_adapter._run_processing_hook.await_args_list
+        if call.args and call.args[0] == "on_processing_complete"
+    ]
+    assert complete_calls[-1].args[-1] is ProcessingOutcome.FAILURE
+
+
+@pytest.mark.asyncio
+async def test_real_already_streamed_caller_retains_retryable_preflight_state(
+    monkeypatch, tmp_path
+):
+    runner = _real_gateway_runner(monkeypatch, tmp_path)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="steve",
+    )
+    event = MessageEvent(
+        text="give me the file",
+        source=source,
+        message_id="91-preflight",
+    )
+    agent_result = {
+        "final_response": "MEDIA:/tmp/evidence.txt",
+        "messages": [
+            {"role": "user", "content": "give me the file"},
+            {"role": "assistant", "content": "MEDIA:/tmp/evidence.txt"},
+        ],
+        "tools": [],
+        "history_offset": 0,
+        "last_prompt_tokens": 0,
+        "api_calls": 1,
+        "failed": False,
+        "already_sent": True,
+    }
+    runner._run_agent = AsyncMock(return_value=agent_result)
+    config = PlatformConfig(enabled=True, token="test-token")
+    config.typing_indicator = False
+    delivery_adapter = TelegramAdapter(config)
+    delivery_adapter._run_processing_hook = AsyncMock()
+    runner._adapter_for_source = lambda _source: delivery_adapter
+    preflight = AttachmentDeliveryOutcome(
+        path="/tmp/evidence.txt",
+        dispatch_attempted=False,
+        delivered=False,
+        message_id_confirmed=False,
+        state="failed_pre_dispatch",
+        error_code="telegram_not_connected",
+    )
+    runner._deliver_media_from_response = AsyncMock(return_value=(preflight,))
+
+    async def _gateway_handler(inbound_event):
+        return await runner._handle_message_with_agent(
+            inbound_event,
+            source,
+            "agent:main:telegram:dm:12345",
+            1,
+        )
+
+    delivery_adapter._message_handler = _gateway_handler
+    await delivery_adapter._process_message_background(
+        event,
+        "agent:main:telegram:dm:12345",
+    )
+
+    assert event._attachment_delivery_outcomes == (preflight,)
+    assert agent_result["attachment_delivery_state"] == "failed_pre_dispatch"
+    complete_calls = [
+        call
+        for call in delivery_adapter._run_processing_hook.await_args_list
+        if call.args and call.args[0] == "on_processing_complete"
+    ]
+    assert complete_calls[-1].args[-1] is ProcessingOutcome.FAILURE
+
+
+@pytest.mark.asyncio
+async def test_real_nonstream_text_success_cannot_mask_unconfirmed_document(
+    monkeypatch, tmp_path
+):
+    config = PlatformConfig(enabled=True, token="test-token")
+    config.typing_indicator = False
+    adapter = TelegramAdapter(config)
+    source = SessionSource(
+        platform=Platform.TELEGRAM,
+        chat_id="12345",
+        chat_type="dm",
+        user_id="steve",
+    )
+    event = MessageEvent(text="request", source=source, message_id="92")
+    attachment = _reconstructed_txt_fixture()
+    adapter._message_handler = AsyncMock(
+        return_value=f"Visible explanation\nMEDIA:{attachment}"
+    )
+    adapter._run_processing_hook = AsyncMock()
+    adapter._send_with_retry = AsyncMock(
+        return_value=SendResult(success=True, message_id="501")
+    )
+    adapter.send_document = AsyncMock(
+        return_value=SendResult(success=True, message_id="")
+    )
+    adapter.send = AsyncMock(return_value=SendResult(success=True, message_id="502"))
+    adapter._get_human_delay = lambda: 0
+    monkeypatch.setattr(
+        adapter,
+        "filter_media_delivery_paths",
+        lambda media: list(media),
+    )
+
+    await adapter._process_message_background(event, "telegram:test:12345")
+
+    complete_calls = [
+        call
+        for call in adapter._run_processing_hook.await_args_list
+        if call.args and call.args[0] == "on_processing_complete"
+    ]
+    assert complete_calls
+    assert complete_calls[-1].args[-1] is ProcessingOutcome.FAILURE
+    adapter._send_with_retry.assert_awaited_once()
+    adapter.send_document.assert_awaited_once()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_document_without_message_id_is_not_recorded_delivered(
+    monkeypatch, tmp_path
+):
+    """Text streaming success cannot turn an unconfirmed attachment into delivery."""
+    attachment = str(_reconstructed_txt_fixture())
+    attempted_dispatches = []
+    monkeypatch.setattr(
+        "agent.task_execution_contract.record_artifact_dispatch",
+        lambda _path, **kwargs: attempted_dispatches.append(kwargs),
+    )
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "filter_media_delivery_paths",
+        staticmethod(lambda media: list(media)),
+    )
+    adapter = SimpleNamespace(
+        name="telegram-test",
+        extract_media=lambda _response: ([(attachment, False)], ""),
+        extract_images=lambda text: ([], text),
+        extract_local_files=lambda text: ([], text),
+        send_document=AsyncMock(return_value=SendResult(success=True, message_id="")),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="notice-1")),
+        send_voice=AsyncMock(),
+        send_video=AsyncMock(),
+        send_multiple_images=AsyncMock(),
+    )
+
+    outcomes = await GatewayRunner._deliver_media_from_response(
+        _media_runner(),
+        f"MEDIA:{attachment}",
+        _media_event(),
+        adapter,
+    )
+
+    assert attempted_dispatches == [
+        {"state": "ambiguous", "error_code": "document_message_id_missing"}
+    ]
+    adapter.send.assert_awaited_once()
+    assert len(outcomes) == 1
+    assert outcomes[0].dispatch_attempted is True
+    assert outcomes[0].delivered is False
+    assert outcomes[0].message_id_confirmed is False
+    assert outcomes[0].state == "ambiguous"
+    assert outcomes[0].error_code == "document_message_id_missing"
+
+
+@pytest.mark.asyncio
+@pytest.mark.parametrize("message_id", ["abc", "12.5", "-1", "0", True])
+async def test_post_stream_document_requires_integer_telegram_message_id(
+    monkeypatch, tmp_path, message_id
+):
+    attachment = str(tmp_path / "evidence.txt")
+    attempted_dispatches = []
+    monkeypatch.setattr(
+        "agent.task_execution_contract.record_artifact_dispatch",
+        lambda _path, **kwargs: attempted_dispatches.append(kwargs),
+    )
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "filter_media_delivery_paths",
+        staticmethod(lambda media: list(media)),
+    )
+    adapter = SimpleNamespace(
+        name="telegram-test",
+        extract_media=lambda _response: ([(attachment, False)], ""),
+        extract_images=lambda text: ([], text),
+        extract_local_files=lambda text: ([], text),
+        send_document=AsyncMock(
+            return_value=SendResult(success=True, message_id=message_id)
+        ),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="91")),
+        send_voice=AsyncMock(),
+        send_video=AsyncMock(),
+        send_multiple_images=AsyncMock(),
+    )
+
+    outcomes = await GatewayRunner._deliver_media_from_response(
+        _media_runner(),
+        f"MEDIA:{attachment}",
+        _media_event(),
+        adapter,
+    )
+
+    assert attempted_dispatches == [
+        {"state": "ambiguous", "error_code": "document_message_id_invalid"}
+    ]
+    assert outcomes[0].state == "ambiguous"
+    assert outcomes[0].message_id_confirmed is False
+
+
+@pytest.mark.asyncio
+async def test_post_stream_document_records_confirmed_integer_id(monkeypatch):
+    attachment = str(_reconstructed_txt_fixture())
+    attempted_dispatches = []
+    monkeypatch.setattr(
+        "agent.task_execution_contract.record_artifact_dispatch",
+        lambda _path, **kwargs: attempted_dispatches.append(kwargs),
+    )
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "filter_media_delivery_paths",
+        staticmethod(lambda media: list(media)),
+    )
+    adapter = SimpleNamespace(
+        name="telegram-test",
+        extract_media=lambda _response: ([(attachment, False)], ""),
+        extract_images=lambda text: ([], text),
+        extract_local_files=lambda text: ([], text),
+        send_document=AsyncMock(
+            return_value=SendResult(success=True, message_id="8123")
+        ),
+        send=AsyncMock(),
+        send_voice=AsyncMock(),
+        send_video=AsyncMock(),
+        send_multiple_images=AsyncMock(),
+    )
+
+    outcomes = await GatewayRunner._deliver_media_from_response(
+        _media_runner(),
+        f"MEDIA:{attachment}",
+        _media_event(),
+        adapter,
+    )
+
+    assert attempted_dispatches == [
+        {"state": "delivered", "message_id": "8123"}
+    ]
+    assert outcomes[0].state == "delivered"
+    assert outcomes[0].delivered is True
+    assert outcomes[0].message_id_confirmed is True
+    assert outcomes[0].message_id == "8123"
+    adapter.send_document.assert_awaited_once()
+    adapter.send.assert_not_awaited()
+
+
+@pytest.mark.asyncio
+async def test_post_stream_local_preflight_failure_remains_retryable(
+    monkeypatch, tmp_path
+):
+    attachment = str(tmp_path / "evidence.txt")
+    attempted_dispatches = []
+    monkeypatch.setattr(
+        "agent.task_execution_contract.record_artifact_dispatch",
+        lambda _path, **kwargs: attempted_dispatches.append(kwargs),
+    )
+    monkeypatch.setattr(
+        BasePlatformAdapter,
+        "filter_media_delivery_paths",
+        staticmethod(lambda media: list(media)),
+    )
+    adapter = SimpleNamespace(
+        name="telegram-test",
+        extract_media=lambda _response: ([(attachment, False)], ""),
+        extract_images=lambda text: ([], text),
+        extract_local_files=lambda text: ([], text),
+        send_document=AsyncMock(
+            return_value=SendResult(
+                success=False,
+                error="telegram_not_connected",
+                retryable=True,
+            )
+        ),
+        send=AsyncMock(return_value=SendResult(success=True, message_id="93")),
+        send_voice=AsyncMock(),
+        send_video=AsyncMock(),
+        send_multiple_images=AsyncMock(),
+    )
+
+    outcomes = await GatewayRunner._deliver_media_from_response(
+        _media_runner(),
+        f"MEDIA:{attachment}",
+        _media_event(),
+        adapter,
+    )
+
+    assert attempted_dispatches == [
+        {
+            "state": "failed_pre_dispatch",
+            "error_code": "telegram_not_connected",
+        }
+    ]
+    assert outcomes[0].state == "failed_pre_dispatch"
+    assert outcomes[0].dispatch_attempted is False
+    assert outcomes[0].message_id_confirmed is False
+    assert outcomes[0].error_code == "telegram_not_connected"
+
+
+@pytest.mark.asyncio
+async def test_streamed_text_delivery_is_not_attachment_delivery():
+    """A clean streamed MEDIA directive never counts as document confirmation."""
+    adapter = _adapter()
+    adapter.send.return_value = SendResult(success=True, message_id="text-1")
+    consumer = GatewayStreamConsumer(adapter, "chat-1")
+
+    await consumer._send_or_edit("Visible explanation\nMEDIA:/tmp/evidence.txt")
+
+    assert consumer.final_response_sent is False
+    assert consumer.final_content_delivered is False
 
 
 @pytest.mark.asyncio

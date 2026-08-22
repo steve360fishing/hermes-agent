@@ -66,6 +66,103 @@ def _drop_verification_continuation_scaffolding(messages) -> None:
     ]
 
 
+def _finalize_artifact_obligation(
+    agent,
+    *,
+    task_contract,
+    final_response,
+    effective_task_id,
+    interrupted,
+    failed,
+    messages,
+    turn_exit_reason,
+    logger,
+    require_exact_content=False,
+):
+    """Materialize a request-local artifact only after all applicable gates pass."""
+    from agent.task_execution_contract import finalize_artifact_contract
+
+    if interrupted or failed:
+        finalize_artifact_contract(
+            task_contract,
+            state="failed_preflight",
+            error_code=("artifact_turn_cancelled" if interrupted else "artifact_turn_failed"),
+        )
+        return final_response, failed, turn_exit_reason
+
+    artifact_path = getattr(task_contract, "artifact_output_path", "")
+    landed_paths = getattr(agent, "_turn_file_mutation_paths", None) or set()
+    artifact_content = final_response or getattr(task_contract, "artifact_content_hint", "")
+    if isinstance(artifact_content, str) and artifact_content.startswith("MEDIA:"):
+        artifact_content = getattr(task_contract, "artifact_content_hint", "")
+    if not landed_paths and getattr(task_contract, "artifact_owed", False):
+        if isinstance(artifact_content, str) and artifact_content.strip():
+            try:
+                from tools.file_tools import write_file_tool
+                import json
+
+                write_result = json.loads(
+                    write_file_tool(
+                        artifact_path,
+                        artifact_content,
+                        task_id=effective_task_id,
+                        session_id=getattr(agent, "session_id", None),
+                    )
+                )
+                if not write_result.get("error"):
+                    landed_paths = {artifact_path}
+                    agent._turn_file_mutation_paths = landed_paths
+            except Exception:
+                logger.warning("Artifact obligation writer failed", exc_info=True)
+    try:
+        artifact_real = os.path.realpath(artifact_path)
+        landed_reals = {os.path.realpath(str(path)) for path in landed_paths}
+        from agent.task_execution_contract import (
+            artifact_content_matches,
+            validate_artifact_output_path,
+        )
+
+        artifact_ready = (
+            artifact_real in landed_reals
+            and os.path.isfile(artifact_real)
+            and validate_artifact_output_path(
+                artifact_real, getattr(task_contract, "artifact_root", "")
+            )
+            is None
+            and (
+                not require_exact_content
+                or artifact_content_matches(task_contract, artifact_content)
+            )
+        )
+        if artifact_ready:
+            from agent.task_execution_contract import record_artifact_written
+
+            artifact_ready = record_artifact_written(task_contract)
+    except (OSError, ValueError):
+        artifact_ready = False
+    if artifact_ready:
+        final_response = f"MEDIA:{artifact_real}"
+        for message in reversed(messages):
+            if message.get("role") == "user":
+                break
+            if message.get("role") == "assistant" and not message.get("tool_calls"):
+                message["content"] = final_response
+                break
+        return final_response, failed, turn_exit_reason
+
+    finalize_artifact_contract(
+        task_contract,
+        state="failed_preflight",
+        error_code="artifact_write_not_verified",
+    )
+    return (
+        "I could not create the requested attachment. No file was sent, "
+        "and normal capabilities remain available.",
+        True,
+        "artifact_obligation_unfulfilled",
+    )
+
+
 def _finalize_turn_impl(
     agent,
     *,
@@ -90,9 +187,17 @@ def _finalize_turn_impl(
     loop). See module docstring.
     """
     from agent.conversation_loop import logger
+    from agent.tournament_intent_contract import current_tournament_contract
 
     task_contract = getattr(agent, "_task_execution_contract", None)
+    tournament_contract = current_tournament_contract()
+    tournament_telemetry = None
     artifact_only = getattr(task_contract, "lane", None) == "artifact_only"
+    deferred_tournament_artifact = bool(
+        artifact_only
+        and getattr(task_contract, "artifact_file_requested", False)
+        and tournament_contract is not None
+    )
     stale_artifact_reference = (
         not artifact_only
         and bool(final_response)
@@ -116,90 +221,24 @@ def _finalize_turn_impl(
                 message["content"] = final_response
                 break
 
-    # A successful artifact write must deterministically produce the gateway
-    # attachment directive; do not depend on the model remembering to echo it.
+    # Non-public artifacts retain the existing early materialization path.
+    # Public tournament artifacts defer until exact receipt validation below.
     if (
         artifact_only
         and getattr(task_contract, "artifact_file_requested", False)
-        and (interrupted or failed)
+        and not deferred_tournament_artifact
     ):
-        from agent.task_execution_contract import finalize_artifact_contract
-
-        finalize_artifact_contract(
-            task_contract,
-            state="failed_preflight",
-            error_code=("artifact_turn_cancelled" if interrupted else "artifact_turn_failed"),
+        final_response, failed, _turn_exit_reason = _finalize_artifact_obligation(
+            agent,
+            task_contract=task_contract,
+            final_response=final_response,
+            effective_task_id=effective_task_id,
+            interrupted=interrupted,
+            failed=failed,
+            messages=messages,
+            turn_exit_reason=_turn_exit_reason,
+            logger=logger,
         )
-    elif artifact_only and getattr(task_contract, "artifact_file_requested", False):
-        artifact_path = getattr(task_contract, "artifact_output_path", "")
-        landed_paths = getattr(agent, "_turn_file_mutation_paths", None) or set()
-        # The obligation is finalized here, after model output but before any
-        # persistence or Telegram delivery. A handoff must become a verified
-        # document even when the model answered inline instead of calling the
-        # constrained writer itself.
-        if not landed_paths and getattr(task_contract, "artifact_owed", False):
-            artifact_content = final_response or getattr(task_contract, "artifact_content_hint", "")
-            if isinstance(artifact_content, str) and artifact_content.startswith("MEDIA:"):
-                artifact_content = getattr(task_contract, "artifact_content_hint", "")
-            if isinstance(artifact_content, str) and artifact_content.strip():
-                try:
-                    from tools.file_tools import write_file_tool
-                    import json
-
-                    write_result = json.loads(
-                        write_file_tool(
-                            artifact_path,
-                            artifact_content,
-                            task_id=effective_task_id,
-                            session_id=getattr(agent, "session_id", None),
-                        )
-                    )
-                    if not write_result.get("error"):
-                        landed_paths = {artifact_path}
-                        agent._turn_file_mutation_paths = landed_paths
-                except Exception:
-                    logger.warning("Artifact obligation writer failed", exc_info=True)
-        try:
-            artifact_real = os.path.realpath(artifact_path)
-            landed_reals = {os.path.realpath(str(path)) for path in landed_paths}
-            from agent.task_execution_contract import validate_artifact_output_path
-
-            artifact_ready = (
-                artifact_real in landed_reals
-                and os.path.isfile(artifact_real)
-                and validate_artifact_output_path(
-                    artifact_real, getattr(task_contract, "artifact_root", "")
-                )
-                is None
-            )
-            if artifact_ready:
-                from agent.task_execution_contract import record_artifact_written
-
-                artifact_ready = record_artifact_written(task_contract)
-        except (OSError, ValueError):
-            artifact_ready = False
-        if artifact_ready:
-            final_response = f"MEDIA:{artifact_real}"
-            for message in reversed(messages):
-                if message.get("role") == "user":
-                    break
-                if message.get("role") == "assistant" and not message.get("tool_calls"):
-                    message["content"] = final_response
-                    break
-        else:
-            from agent.task_execution_contract import finalize_artifact_contract
-
-            finalize_artifact_contract(
-                task_contract,
-                state="failed_preflight",
-                error_code="artifact_write_not_verified",
-            )
-            final_response = (
-                "I could not create the requested attachment. No file was sent, "
-                "and normal capabilities remain available."
-            )
-            failed = True
-            _turn_exit_reason = "artifact_obligation_unfulfilled"
 
 
     budget_exhausted = (
@@ -589,6 +628,110 @@ def _finalize_turn_impl(
         except Exception as exc:
             logger.warning("transform_llm_output hook failed: %s", exc)
 
+    # Public tournament bytes are gated after every response transform and
+    # before persistence, callbacks, post hooks, or the gateway return.
+    from agent.tournament_intent_contract import (
+        TournamentIntentState,
+        abort_tournament_output,
+        finalize_tournament_output,
+        parse_mixed_publication_envelope,
+    )
+
+    tournament_candidate = final_response
+    tournament_delivery_response = None
+    tournament_materialization_failed = False
+    if deferred_tournament_artifact and not interrupted and not failed:
+        if tournament_contract.state is TournamentIntentState.MIXED_PUBLICATION:
+            envelope = parse_mixed_publication_envelope(tournament_candidate or "")
+            if envelope is not None:
+                private_response = envelope.private_explanation.text
+                tournament_delivery_response, failed, _turn_exit_reason = _finalize_artifact_obligation(
+                    agent,
+                    task_contract=task_contract,
+                    final_response=private_response,
+                    effective_task_id=effective_task_id,
+                    interrupted=False,
+                    failed=False,
+                    messages=messages,
+                    turn_exit_reason=_turn_exit_reason,
+                    logger=logger,
+                    require_exact_content=True,
+                )
+                tournament_materialization_failed = failed
+        else:
+            landed_paths = getattr(agent, "_turn_file_mutation_paths", None) or set()
+            if landed_paths:
+                try:
+                    from agent.task_execution_contract import read_registered_artifact_text
+
+                    tournament_candidate = read_registered_artifact_text(task_contract)
+                except (OSError, UnicodeDecodeError, ValueError):
+                    tournament_materialization_failed = True
+            receipt_decision = tournament_contract.verify_receipt(tournament_candidate or "")
+            if receipt_decision.allowed and not tournament_materialization_failed:
+                tournament_delivery_response, failed, _turn_exit_reason = _finalize_artifact_obligation(
+                    agent,
+                    task_contract=task_contract,
+                    final_response=tournament_candidate,
+                    effective_task_id=effective_task_id,
+                    interrupted=False,
+                    failed=False,
+                    messages=messages,
+                    turn_exit_reason=_turn_exit_reason,
+                    logger=logger,
+                    require_exact_content=True,
+                )
+                tournament_materialization_failed = failed
+
+    if tournament_materialization_failed:
+        final_response, tournament_telemetry, tournament_failed = abort_tournament_output(
+            agent,
+            candidate=tournament_candidate,
+            messages=messages,
+            code="artifact_write_not_verified",
+            response=(
+                "I could not create the verified tournament attachment. No file was sent, "
+                "and no public action was taken."
+            ),
+            contract=tournament_contract,
+        )
+        completed = False
+    else:
+        final_response, tournament_telemetry, tournament_failed = finalize_tournament_output(
+            agent,
+            candidate=tournament_candidate,
+            delivery_response=tournament_delivery_response,
+            messages=messages,
+            contract=tournament_contract,
+        )
+    if tournament_failed:
+        failed = True
+        completed = False
+        _turn_exit_reason = str(
+            (tournament_telemetry or {}).get("code") or "tournament_truth_not_verified"
+        )
+    tournament_partial = bool(
+        tournament_telemetry
+        and tournament_telemetry.get("turn_status") == "partial"
+    )
+    if tournament_partial:
+        completed = False
+
+    if deferred_tournament_artifact and tournament_delivery_response is None:
+        final_response, failed, _turn_exit_reason = _finalize_artifact_obligation(
+            agent,
+            task_contract=task_contract,
+            final_response=final_response,
+            effective_task_id=effective_task_id,
+            interrupted=interrupted,
+            failed=(failed or tournament_failed),
+            messages=messages,
+            turn_exit_reason=_turn_exit_reason,
+            logger=logger,
+        )
+        if failed:
+            completed = False
+
     # Plugin hook: post_llm_call
     # Fired once per turn after the tool-calling loop completes.
     # Plugins can use this to persist conversation data (e.g. sync
@@ -636,7 +779,7 @@ def _finalize_turn_impl(
         "completed": completed,
         "turn_exit_reason": _turn_exit_reason,
         "failed": failed,
-        "partial": False,  # True only when stopped due to invalid tool calls
+        "partial": tournament_partial,
         "interrupted": interrupted,
         "response_transformed": _response_transformed,
         "response_previewed": getattr(agent, "_response_was_previewed", False),
@@ -676,6 +819,9 @@ def _finalize_turn_impl(
             decision_status=decision_status,
         )
         logger.info("task execution metadata: %s", result["task_execution"])
+    if tournament_telemetry is not None:
+        result["tournament_intent"] = tournament_telemetry
+        logger.info("tournament intent metadata: %s", tournament_telemetry)
     # Surface any post-loop cleanup failures so the caller can distinguish a
     # clean turn from one whose trajectory/session/resource teardown raised
     # (the response is still returned either way — #8049).
@@ -696,7 +842,8 @@ def _finalize_turn_impl(
     # Clear interrupt state after handling
     agent.clear_interrupt()
 
-    # Clear stream callback so it doesn't leak into future calls
+    # ``_stream_callback`` is the generic per-turn callback installed by the
+    # turn builder. Tournament buffering is request-local and needs no restore.
     agent._stream_callback = None
 
     # Check skill trigger NOW — based on how many tool iterations THIS turn used.

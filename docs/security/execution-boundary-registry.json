@@ -419,6 +419,15 @@
       "rationale": "recovery boundary for the artifact delivery contract."
     },
     {
+      "id": "agent/turn_finalizer.py:_finalize_artifact_obligation",
+      "contract": "artifact_delivery",
+      "role": "validation",
+      "path": "agent/turn_finalizer.py",
+      "symbol": "_finalize_artifact_obligation",
+      "disposition": "covered",
+      "rationale": "Validates the registered artifact path and, for tournament-gated delivery, the exact authorized UTF-8 bytes before final delivery."
+    },
+    {
       "id": "cron/scheduler.py:_send_media_via_adapter",
       "contract": "artifact_delivery",
       "role": "delivery",
@@ -1425,6 +1434,15 @@
       "symbol": "effective_request_system_prompt",
       "disposition": "covered",
       "rationale": "propagation boundary for the artifact request contract."
+    },
+    {
+      "id": "agent/tool_guardrails.py:classify_tournament_tool_action",
+      "contract": "artifact_delivery",
+      "role": "decision",
+      "path": "agent/tool_guardrails.py",
+      "symbol": "classify_tournament_tool_action",
+      "disposition": "covered",
+      "rationale": "Classifies tournament tool effects and destination kinds before artifact-delivery enforcement."
     },
     {
       "id": "agent/tool_guardrails.py:ToolCallGuardrailController",

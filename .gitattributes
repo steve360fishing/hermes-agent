@@ -9,3 +9,6 @@ Dockerfile  text eol=lf
 *.dockerfile text eol=lf
 docker/entrypoint.sh text eol=lf
 docker/** text eol=lf
+
+# This acceptance fixture has a packet-bound byte length and SHA-256.
+tests/fixtures/telegram/vps_txt_delivery_acceptance.txt -text

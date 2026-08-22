@@ -3,7 +3,12 @@
 import sqlite3
 import time
 import json
+import os
+import tempfile
 import pytest
+
+os.environ.setdefault("LOCALAPPDATA", tempfile.gettempdir())
+os.environ.setdefault("USERPROFILE", tempfile.gettempdir())
 
 import hermes_state
 from hermes_state import SCHEMA_SQL, SCHEMA_VERSION, SessionDB
@@ -862,6 +867,123 @@ class TestSessionLifecycle:
 # =========================================================================
 # Message storage
 # =========================================================================
+
+class TestTurnOriginPersistence:
+    def test_assistant_projection_keeps_legacy_message_shape(self, db):
+        db.create_session("origin-session", source="telegram")
+        db.append_message(
+            "origin-session",
+            role="assistant",
+            content="useful response",
+        )
+
+        projected = db.get_messages_as_conversation("origin-session")
+        assert isinstance(projected[0].pop("timestamp", None), (int, float))
+        assert projected == [
+            {"role": "assistant", "content": "useful response"}
+        ]
+
+    def test_persisted_direct_origin_round_trips_only_as_non_authoritative_replay(self, db):
+        metadata = {
+            "platform": "telegram", "profile": "vps", "chat_id": "chat-1",
+            "thread_id": "", "message_id": "message-1", "event_id": "",
+            "session_scope": "telegram:vps:chat-1:",
+            "authority_text_sha256": "a" * 64, "captured_at_unix_ms": 1,
+        }
+        from agent.turn_origin import _binding_digest
+        metadata["binding_sha256"] = _binding_digest(
+            actor="steve", text_sha256=metadata["authority_text_sha256"],
+            platform=metadata["platform"], profile=metadata["profile"],
+            chat_id=metadata["chat_id"], thread_id=metadata["thread_id"],
+            message_id=metadata["message_id"], event_id=metadata["event_id"],
+            session_scope=metadata["session_scope"], captured_at_unix_ms=1,
+        )
+        db.create_session("origin-session", source="telegram")
+        db.append_message(
+            "origin-session",
+            role="user",
+            content="publish exact tournament copy",
+            turn_origin="authenticated_direct_user",
+            turn_actor_identity="steve",
+            turn_provenance_json=json.dumps(metadata),
+        )
+        loaded = db.get_messages_as_conversation("origin-session")
+        assert loaded[0]["turn_origin"] == "replayed_persisted_content"
+        assert loaded[0]["turn_actor_identity"] == "steve"
+        assert json.loads(loaded[0]["turn_provenance_json"]) == metadata
+
+        db.replace_messages("origin-session", loaded)
+        replayed = db.get_messages_as_conversation("origin-session")
+        assert replayed[0]["turn_origin"] == "replayed_persisted_content"
+        assert replayed[0]["turn_actor_identity"] == "steve"
+        assert json.loads(replayed[0]["turn_provenance_json"]) == metadata
+
+    @pytest.mark.parametrize(
+        ("origin", "actor"),
+        (
+            (None, None),
+            ("", "steve"),
+            ("client_invented_direct", "steve"),
+        ),
+    )
+    def test_legacy_or_malformed_origin_loads_as_unknown(self, db, origin, actor):
+        db.create_session("origin-session", source="telegram")
+        db.append_message(
+            "origin-session",
+            role="user",
+            content="legacy text",
+            turn_origin=origin,
+            turn_actor_identity=actor,
+        )
+        loaded = db.get_messages_as_conversation("origin-session")
+        assert "turn_origin" not in loaded[0]
+        assert "turn_actor_identity" not in loaded[0]
+        from agent.turn_origin import TurnOrigin, TurnProvenance
+
+        coerced = TurnProvenance.from_storage(
+            loaded[0].get("turn_origin"), loaded[0].get("turn_actor_identity")
+        )
+        assert coerced.origin is TurnOrigin.UNKNOWN
+        assert coerced.actor_identity == ""
+
+    def test_persisted_direct_origin_without_complete_metadata_is_unknown(self, db):
+        db.create_session("origin-session", source="telegram")
+        db.append_message(
+            "origin-session",
+            role="user",
+            content="legacy text",
+            turn_origin="authenticated_direct_user",
+            turn_actor_identity="",
+        )
+
+        loaded = db.get_messages_as_conversation("origin-session")
+        assert "turn_origin" not in loaded[0]
+        assert "turn_actor_identity" not in loaded[0]
+
+    def test_origin_survives_restart_and_resume_projection(self, tmp_path):
+        db_path = tmp_path / "origin-restart.db"
+        first = SessionDB(db_path=db_path)
+        first.create_session("origin-session", source="telegram")
+        first.append_message(
+            "origin-session",
+            role="user",
+            content="verified tournament draft",
+            turn_origin="runtime_async_completion",
+            turn_actor_identity="",
+        )
+        first.close()
+
+        restarted = SessionDB(db_path=db_path)
+        try:
+            model_history, display_history = restarted.get_resume_conversations(
+                "origin-session"
+            )
+            for history in (model_history, display_history):
+                assert history[0]["turn_origin"] == "runtime_async_completion"
+                assert history[0]["turn_actor_identity"] == ""
+        finally:
+            restarted.close()
+
 
 class TestMessageStorage:
     def test_append_and_get_messages(self, db):

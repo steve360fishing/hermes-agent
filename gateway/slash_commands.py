@@ -2358,6 +2358,11 @@ class GatewaySlashCommandsMixin:
             raw_message=event.raw_message,
             channel_prompt=event.channel_prompt,
         )
+        from agent.turn_origin import TurnOrigin, TurnProvenance
+
+        retry_event._trusted_turn_provenance = TurnProvenance.internal(
+            TurnOrigin.REPLAYED_PERSISTED_CONTENT
+        )
         
         # Let the normal message handler process it
         return await self._handle_message(retry_event)

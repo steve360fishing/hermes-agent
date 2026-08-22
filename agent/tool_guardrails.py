@@ -11,6 +11,8 @@ from __future__ import annotations
 import hashlib
 import json
 from dataclasses import dataclass, field
+from enum import Enum
+from pathlib import Path
 from typing import TYPE_CHECKING, Any, Mapping
 
 from utils import safe_json_loads
@@ -56,11 +58,244 @@ MUTATING_TOOL_NAMES = frozenset(
         "browser_scroll",
         "browser_navigate",
         "send_message",
+        "tournament_source_capture",
         "cronjob",
         "delegate_task",
         "process",
     }
 )
+
+
+class TournamentToolEffect(str, Enum):
+    READ_RESEARCH = "read_research"
+    TRUSTED_CAPTURE = "trusted_capture"
+    PRIVATE_MEMORY = "private_memory"
+    INTERNAL_DIAGNOSTIC = "internal_diagnostic"
+    PRIVATE_HANDOFF = "private_handoff"
+    PRIVATE_DELIVERY = "private_delivery"
+    PUBLIC_CANDIDATE_WRITE = "public_candidate_write"
+    EXTERNAL_PUBLICATION = "external_publication"
+    TRUSTED_SNAPSHOT_WRITE = "trusted_snapshot_write"
+    UNKNOWN_MUTATION = "unknown_mutation"
+
+
+class TournamentDestinationKind(str, Enum):
+    NONE = "none"
+    LOCAL_PRIVATE = "local_private"
+    TRUSTED_SNAPSHOT_ROOT = "trusted_snapshot_root"
+    PRIVATE_SURFACE = "private_surface"
+    PUBLIC_SINK = "public_sink"
+    UNKNOWN = "unknown"
+
+
+@dataclass(frozen=True)
+class TournamentToolAction:
+    effect: TournamentToolEffect
+    destination_kind: TournamentDestinationKind
+    destination: str = ""
+
+
+_PUBLIC_DESTINATION_PREFIXES = (
+    "instagram",
+    "facebook",
+    "cms",
+    "website",
+    "newsletter",
+    "email",
+    "twitter",
+    "x:",
+)
+
+
+def _declared_destination(args: Mapping[str, Any]) -> str:
+    for key in (
+        "external_publication_sink",
+        "publication_sink",
+        "target",
+        "destination",
+        "chat_id",
+        "channel",
+        "url",
+        "path",
+        "file_path",
+    ):
+        value = args.get(key)
+        if isinstance(value, (str, int)) and str(value).strip():
+            return str(value).strip()
+    return ""
+
+
+def _is_public_destination(destination: str, args: Mapping[str, Any]) -> bool:
+    lowered = destination.strip().casefold()
+    visibility = str(args.get("visibility") or "").strip().casefold()
+    declared_effect = str(args.get("effect") or "").strip().casefold()
+    if visibility in {"public", "external_publication"}:
+        return True
+    if declared_effect in {"publish", "publication", "external_publication"}:
+        return True
+    if lowered.startswith(_PUBLIC_DESTINATION_PREFIXES):
+        return True
+    if "@" in lowered and not lowered.startswith(("matrix:", "telegram:")):
+        return True
+    return (
+        ":channel" in lowered
+        or ":#" in lowered
+        or lowered.startswith("telegram:-")
+    )
+
+
+def _declares_external_publication(args: Mapping[str, Any]) -> bool:
+    if any(
+        isinstance(args.get(key), (str, int)) and str(args.get(key)).strip()
+        for key in ("external_publication_sink", "publication_sink")
+    ):
+        return True
+    visibility = str(args.get("visibility") or "").strip().casefold()
+    declared_effect = str(args.get("effect") or "").strip().casefold()
+    return visibility in {"public", "external_publication"} or declared_effect in {
+        "publish", "publication", "external_publication"
+    }
+
+
+def _is_private_messaging_destination(destination: str) -> bool:
+    lowered = destination.strip().casefold()
+    if not lowered:
+        return False
+    if ":private" in lowered or ":dm" in lowered:
+        return True
+    if lowered in {
+        "telegram", "discord", "slack", "signal", "matrix", "whatsapp",
+        "imessage", "photon", "feishu", "weixin", "yuanbao",
+    }:
+        return True
+    if lowered.startswith("telegram:"):
+        target = lowered.split(":", 1)[1].split(":", 1)[0]
+        return target.isdigit()
+    return False
+
+
+def _is_trusted_snapshot_target(destination: str) -> bool:
+    if not destination:
+        return False
+    try:
+        from agent.tournament_truth_support import configured_runtime_roots
+
+        roots = configured_runtime_roots()
+        if roots is None:
+            return False
+        candidate = Path(destination).resolve(strict=False)
+        candidate.relative_to(roots.source_snapshot_root.resolve(strict=True))
+        return True
+    except (OSError, ValueError, TypeError):
+        return False
+
+
+def classify_tournament_tool_action(
+    tool_name: str,
+    args: Mapping[str, Any] | None,
+    *,
+    execution_contract: Any = None,
+    tournament_contract: Any = None,
+) -> TournamentToolAction:
+    """Classify observable effect and sink without deriving authority from text."""
+    args = _coerce_args(args)
+    destination = _declared_destination(args)
+    if tool_name in IDEMPOTENT_TOOL_NAMES or tool_name in {
+        "sportfish_tournament_research", "tournament_truth_gate",
+    }:
+        return TournamentToolAction(
+            TournamentToolEffect.READ_RESEARCH, TournamentDestinationKind.NONE
+        )
+    if tool_name == "tournament_source_capture":
+        return TournamentToolAction(
+            TournamentToolEffect.TRUSTED_CAPTURE,
+            TournamentDestinationKind.TRUSTED_SNAPSHOT_ROOT,
+        )
+    if tool_name == "memory":
+        return TournamentToolAction(
+            TournamentToolEffect.PRIVATE_MEMORY,
+            TournamentDestinationKind.LOCAL_PRIVATE,
+        )
+
+    declared_effect = str(args.get("effect") or args.get("purpose") or "").casefold()
+    if declared_effect in {"internal_diagnostic", "diagnostic", "private_diagnostic"}:
+        return TournamentToolAction(
+            TournamentToolEffect.INTERNAL_DIAGNOSTIC,
+            TournamentDestinationKind.LOCAL_PRIVATE,
+            destination,
+        )
+    if declared_effect in {"private_handoff", "codex_handoff"}:
+        return TournamentToolAction(
+            TournamentToolEffect.PRIVATE_HANDOFF,
+            TournamentDestinationKind.LOCAL_PRIVATE,
+            destination,
+        )
+
+    if tool_name in {"write_file", "patch"}:
+        if _is_trusted_snapshot_target(destination):
+            return TournamentToolAction(
+                TournamentToolEffect.TRUSTED_SNAPSHOT_WRITE,
+                TournamentDestinationKind.TRUSTED_SNAPSHOT_ROOT,
+                destination,
+            )
+        expected_path = str(
+            getattr(execution_contract, "artifact_output_path", "") or ""
+        )
+        if expected_path and destination == expected_path:
+            state = str(getattr(getattr(tournament_contract, "state", None), "value", ""))
+            if state == "mixed_publication":
+                return TournamentToolAction(
+                    TournamentToolEffect.PRIVATE_HANDOFF,
+                    TournamentDestinationKind.LOCAL_PRIVATE,
+                    destination,
+                )
+            if tournament_contract is not None:
+                return TournamentToolAction(
+                    TournamentToolEffect.PUBLIC_CANDIDATE_WRITE,
+                    TournamentDestinationKind.LOCAL_PRIVATE,
+                    destination,
+                )
+        if str(args.get("visibility") or "").casefold() == "public" or declared_effect in {
+            "public_candidate", "claim_bearing_public_candidate",
+        }:
+            return TournamentToolAction(
+                TournamentToolEffect.PUBLIC_CANDIDATE_WRITE,
+                TournamentDestinationKind.LOCAL_PRIVATE,
+                destination,
+            )
+
+    if tool_name == "send_message":
+        action = str(args.get("action") or "send").casefold()
+        if action in {"list", "react", "unreact"}:
+            return TournamentToolAction(
+                TournamentToolEffect.READ_RESEARCH,
+                TournamentDestinationKind.NONE,
+                destination,
+            )
+        if _is_public_destination(destination, args):
+            return TournamentToolAction(
+                TournamentToolEffect.EXTERNAL_PUBLICATION,
+                TournamentDestinationKind.PUBLIC_SINK,
+                destination,
+            )
+        if _is_private_messaging_destination(destination):
+            return TournamentToolAction(
+                TournamentToolEffect.PRIVATE_DELIVERY,
+                TournamentDestinationKind.PRIVATE_SURFACE,
+                destination,
+            )
+
+    if _declares_external_publication(args):
+        return TournamentToolAction(
+            TournamentToolEffect.EXTERNAL_PUBLICATION,
+            TournamentDestinationKind.PUBLIC_SINK,
+            destination,
+        )
+    return TournamentToolAction(
+        TournamentToolEffect.UNKNOWN_MUTATION,
+        TournamentDestinationKind.UNKNOWN,
+        destination,
+    )
 
 
 @dataclass(frozen=True)
@@ -230,34 +465,172 @@ class ToolCallGuardrailController:
     def __init__(self, config: ToolCallGuardrailConfig | None = None):
         self.config = config or ToolCallGuardrailConfig()
         self._execution_contract: TaskExecutionContract | None = None
-        self._tournament_contract: Any | None = None
         self.reset_for_turn()
+
+    @property
+    def _tournament_contract(self) -> Any | None:
+        """Resolve tournament authority from the propagated request context."""
+        from agent.tournament_intent_contract import current_tournament_contract
+
+        return current_tournament_contract()
 
     def set_execution_contract(self, contract: TaskExecutionContract | None) -> None:
         """Bind the request-local policy evaluated before loop guardrails."""
         self._execution_contract = contract
 
     def set_tournament_contract(self, contract: Any | None) -> None:
-        """Bind the active request-local tournament safety contract."""
-        self._tournament_contract = contract
+        """Compatibility seam backed by request-local context, not controller state."""
+        from agent.tournament_intent_contract import bind_tournament_contract
 
-    def _tournament_preflight(self, tool_name: str, signature: ToolCallSignature) -> ToolGuardrailDecision | None:
+        bind_tournament_contract(contract)
+
+    def _tournament_preflight_args(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+        signature: ToolCallSignature,
+    ) -> ToolGuardrailDecision | None:
         contract = self._tournament_contract
-        # Tournament verification never changes the ordinary tool policy.
-        return None
-        try:
-            authorized = bool(contract.has_valid_receipt())
-        except Exception:
-            authorized = False
-        # A receipt only authorizes final text release. It never opens a
-        # mutable/provider/public tool lane during a protected turn.
-        if tool_name in {"tournament_truth_gate", "read_file", "search_files", "mcp_filesystem_read_file", "mcp_filesystem_read_text_file", "mcp_filesystem_read_multiple_files", "mcp_filesystem_search_files"}:
-            return None
-        return ToolGuardrailDecision(
-            action="deny", code="tournament_verification_advisory",
-            message="Tournament verification is advisory-only and does not restrict this tool.",
-            tool_name=tool_name, signature=signature,
+        action_model = classify_tournament_tool_action(
+            tool_name,
+            args,
+            execution_contract=self._execution_contract,
+            tournament_contract=contract,
         )
+        if action_model.effect is TournamentToolEffect.TRUSTED_SNAPSHOT_WRITE:
+            return ToolGuardrailDecision(
+                action="deny",
+                code="trusted_snapshot_write_requires_capture_tool",
+                message=(
+                    "Trusted tournament snapshots may be created only by the "
+                    "runtime-owned tournament_source_capture capability."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
+        if contract is None:
+            if action_model.effect is TournamentToolEffect.EXTERNAL_PUBLICATION:
+                return ToolGuardrailDecision(
+                    action="deny",
+                    code="external_publication_contract_required",
+                    message=(
+                        "External publication requires an active exact tournament truth "
+                        "and one-use destination approval contract."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            if action_model.effect is TournamentToolEffect.PUBLIC_CANDIDATE_WRITE:
+                return ToolGuardrailDecision(
+                    action="deny",
+                    code="public_candidate_contract_required",
+                    message=(
+                        "Claim-bearing public candidate writes require an active exact "
+                        "tournament truth contract."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            return None
+        if action_model.effect in {
+            TournamentToolEffect.READ_RESEARCH,
+            TournamentToolEffect.TRUSTED_CAPTURE,
+            TournamentToolEffect.PRIVATE_MEMORY,
+            TournamentToolEffect.INTERNAL_DIAGNOSTIC,
+            TournamentToolEffect.PRIVATE_HANDOFF,
+        }:
+            return None
+        if action_model.effect is TournamentToolEffect.PRIVATE_DELIVERY:
+            expected_surface = str(getattr(contract, "destination", "") or "")
+            expected_parts = expected_surface.split(":", 2)
+            expected_platform = expected_parts[1] if len(expected_parts) == 3 else ""
+            expected_chat = expected_parts[2] if len(expected_parts) == 3 else ""
+            normalized_private_targets = {
+                f"{expected_platform}:{expected_chat}",
+                f"{expected_platform}:private:{expected_chat}",
+                f"{expected_platform}:dm:{expected_chat}",
+            }
+            if (
+                not expected_platform
+                or not expected_chat
+                or action_model.destination not in normalized_private_targets
+            ):
+                return ToolGuardrailDecision(
+                    action="deny",
+                    code="private_delivery_destination_mismatch",
+                    message=(
+                        "Truth authority for private draft delivery is bound to the exact "
+                        "authenticated private conversation."
+                    ),
+                    tool_name=tool_name,
+                    signature=signature,
+                )
+            candidate = str(
+                (args or {}).get("message")
+                or (args or {}).get("content")
+                or (args or {}).get("candidate")
+                or ""
+            )
+            try:
+                authorization = contract.verify_receipt(candidate)
+            except Exception:
+                authorization = None
+            if authorization is not None and authorization.allowed:
+                return None
+            return ToolGuardrailDecision(
+                action="deny",
+                code=getattr(authorization, "code", "receipt_missing_or_consumed"),
+                message=(
+                    "Private delivery of the claim-bearing tournament candidate requires "
+                    "truth authority for those exact bytes; release approval is not consumed."
+                ),
+                tool_name=tool_name,
+                signature=signature,
+            )
+        try:
+            authorization = contract.authorize_tool(tool_name, _coerce_args(args))
+        except Exception:
+            authorization = None
+        if authorization is not None and authorization.allowed:
+            return None
+        action = "block" if getattr(authorization, "halt", False) else "deny"
+        return ToolGuardrailDecision(
+            action=action,
+            code=getattr(authorization, "code", "tournament_contract_unavailable"),
+            message=getattr(
+                authorization,
+                "message",
+                "The request-local tournament authority contract could not authorize this tool.",
+            ),
+            tool_name=tool_name,
+            signature=signature,
+        )
+
+    def _tournament_bypasses_task_contract(
+        self,
+        tool_name: str,
+        args: Mapping[str, Any] | None,
+    ) -> bool:
+        contract = self._tournament_contract
+        if contract is None:
+            return False
+        action_model = classify_tournament_tool_action(
+            tool_name,
+            args,
+            execution_contract=self._execution_contract,
+            tournament_contract=contract,
+        )
+        if action_model.effect in {
+            TournamentToolEffect.READ_RESEARCH,
+            TournamentToolEffect.TRUSTED_CAPTURE,
+            TournamentToolEffect.PRIVATE_MEMORY,
+            TournamentToolEffect.INTERNAL_DIAGNOSTIC,
+        }:
+            return True
+        try:
+            return bool(contract.bypasses_task_contract(tool_name, _coerce_args(args)))
+        except Exception:
+            return False
 
     def bound_result(self, result: str | None) -> str:
         if self._execution_contract is None:
@@ -271,9 +644,11 @@ class ToolCallGuardrailController:
     ) -> ToolGuardrailDecision:
         """Apply request-local shape checks before tool middleware."""
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        tournament_decision = self._tournament_preflight(tool_name, signature)
+        tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
+        if self._tournament_bypasses_task_contract(tool_name, args):
+            return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         if self._execution_contract is None:
             return ToolGuardrailDecision(tool_name=tool_name, signature=signature)
         authorization = self._execution_contract.preflight_tool(tool_name, _coerce_args(args))
@@ -304,10 +679,11 @@ class ToolCallGuardrailController:
 
     def before_call(self, tool_name: str, args: Mapping[str, Any] | None) -> ToolGuardrailDecision:
         signature = ToolCallSignature.from_call(tool_name, _coerce_args(args))
-        tournament_decision = self._tournament_preflight(tool_name, signature)
+        tournament_decision = self._tournament_preflight_args(tool_name, args, signature)
         if tournament_decision is not None:
             return tournament_decision
-        if self._execution_contract is not None:
+        bypasses_task_contract = self._tournament_bypasses_task_contract(tool_name, args)
+        if self._execution_contract is not None and not bypasses_task_contract:
             authorization = self._execution_contract.before_tool(tool_name, _coerce_args(args))
             if not authorization.allowed:
                 action = "block" if authorization.halt else "deny"
@@ -371,11 +747,25 @@ class ToolCallGuardrailController:
         result: str | None,
         *,
         failed: bool | None = None,
+        no_dispatch_proven: bool = False,
     ) -> ToolGuardrailDecision:
         args = _coerce_args(args)
         signature = ToolCallSignature.from_call(tool_name, args)
         if failed is None:
             failed, _ = classify_tool_failure(tool_name, result)
+
+        contract = self._tournament_contract
+        if contract is not None and getattr(contract, "release_state", "") == "in_flight":
+            # Once a provider-facing call entered the in-flight state, any
+            # reported failure is ambiguous unless a caller proves no dispatch.
+            ambiguous = bool(failed and not no_dispatch_proven)
+            try:
+                contract.record_external_result(success=not failed, ambiguous=ambiguous)
+            except Exception:
+                contract.release_state = "ambiguous"
+                approval = getattr(contract, "release_approval", None)
+                if approval is not None:
+                    approval.state = "ambiguous"
 
         if failed:
             exact_count = self._exact_failure_counts.get(signature, 0) + 1

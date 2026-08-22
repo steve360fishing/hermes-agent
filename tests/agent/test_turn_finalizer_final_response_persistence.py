@@ -1,5 +1,3 @@
-import json
-from pathlib import Path
 from types import SimpleNamespace
 from typing import Any
 
@@ -83,13 +81,11 @@ class FakeAgent:
         pass
 
 
-def test_inline_handoff_is_written_and_referenced_before_persistence(monkeypatch, tmp_path):
-    """The final gate cannot let an owed handoff remain inline chat text."""
+def test_inline_handoff_is_persisted_inline_without_an_artifact(monkeypatch):
+    """An ordinary model handoff remains chat text unless a file is requested."""
     from agent.task_execution_contract import build_task_execution_contract
 
     monkeypatch.setattr("hermes_cli.plugins.invoke_hook", lambda *_a, **_kw: [])
-    monkeypatch.setenv("HERMES_WRITE_SAFE_ROOT", str(tmp_path))
-    monkeypatch.setenv("HERMES_ARTIFACT_ROOT", str(tmp_path / "artifacts"))
     agent = FakeAgent()
     agent._turn_file_mutation_paths = set()
     agent._task_execution_contract = build_task_execution_contract(
@@ -98,11 +94,6 @@ def test_inline_handoff_is_written_and_referenced_before_persistence(monkeypatch
         platform="telegram",
     )
 
-    def write_registered(path, content, **_kwargs):
-        Path(path).write_text(content, encoding="utf-8")
-        return json.dumps({"bytes_written": len(content.encode("utf-8"))})
-
-    monkeypatch.setattr("tools.file_tools.write_file_tool", write_registered)
     messages = [
         {"role": "user", "content": "Give me a prompt for Claude."},
         {"role": "assistant", "content": "Review the deployment carefully."},
@@ -125,13 +116,13 @@ def test_inline_handoff_is_written_and_referenced_before_persistence(monkeypatch
         _turn_exit_reason="text_response(stop)",
     )
 
-    assert result["final_response"] == f"MEDIA:{contract.artifact_output_path}"
-    assert Path(contract.artifact_output_path).read_text(encoding="utf-8") == "Review the deployment carefully."
-    receipt = json.loads(Path(contract.artifact_receipt_path).read_text(encoding="utf-8"))
-    assert receipt["state"] == "written"
-    assert receipt["lifecycle_state"] == "READ_BACK_VERIFIED"
-    assert receipt["lifecycle"] == ["REQUESTED", "CREATED", "READ_BACK_VERIFIED"]
+    assert contract.artifact_file_requested is False
+    assert contract.artifact_owed is False
+    assert contract.artifact_output_path == ""
+    assert contract.artifact_receipt_path == ""
+    assert result["final_response"] == "Review the deployment carefully."
     assert result["messages"][-1]["content"] == result["final_response"]
+    assert agent._task_execution_contract is None
 
 
 def test_finalizer_restores_clean_api_local_text_before_return(monkeypatch):

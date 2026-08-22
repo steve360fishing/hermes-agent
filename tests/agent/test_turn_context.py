@@ -10,6 +10,10 @@ from __future__ import annotations
 
 import logging
 import os
+import tempfile
+
+os.environ.setdefault("LOCALAPPDATA", tempfile.gettempdir())
+os.environ.setdefault("USERPROFILE", tempfile.gettempdir())
 import threading
 import types
 from unittest.mock import MagicMock, patch
@@ -277,7 +281,10 @@ def test_subsequent_normal_turn_filters_expired_artifact_history(
             conversation_history=history,
         )
 
-    assert ctx.messages == [{"role": "user", "content": "Continue the normal work."}]
+    assert ctx.messages == [{
+        "role": "user",
+        "content": "Continue the normal work.",
+    }]
     assert "normal capabilities" in ctx.task_execution_contract.system_guidance
     assert (
         "artifact history elided: session=sess-1"
