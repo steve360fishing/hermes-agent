@@ -13,6 +13,7 @@ import secrets
 import socket
 import stat
 import struct
+import sys
 import threading
 import time
 from typing import Any, Callable, Mapping
@@ -40,6 +41,20 @@ _CONTINUITY_INITIALIZED = b"hermes-rescue-continuity-initialized-v1"
 _RECOVERY_STABLE_EMISSIONS = 3
 _RECOVERY_MAX_TTL_SECONDS = 300.0
 _RECOVERY_ID_CAPACITY = 256
+# Fix A: bound how long one peer may stall the single-threaded serve loop. The
+# client budget is 1.0s per blocking operation; any legitimate local exchange
+# completes in microseconds, so this only ever fires on a stalled peer.
+_CONNECTION_TIMEOUT_SECONDS = 0.25
+# Prevents a tight spin if accept() fails persistently (EMFILE, ENFILE).
+_ACCEPT_ERROR_BACKOFF_SECONDS = 0.05
+# Dropped connections are counted and reported in aggregate, never per event.
+_DROP_REPORT_INTERVAL_SECONDS = 60.0
+_PEER_LOSS_ERRORS = (
+    BrokenPipeError,
+    ConnectionResetError,
+    ConnectionAbortedError,
+    TimeoutError,
+)
 _RECOVERABLE_DEGRADATION_REASONS = frozenset(
     {"continuity_gap", "gateway_unknown", "legacy_unattributed"}
 )
@@ -57,6 +72,48 @@ _DEGRADATION_REASONS = frozenset({
     "sequence_exhausted",
     "worker_crash",
 })
+
+
+def _note_drop(
+    counts: dict[str, int],
+    site: str,
+    exc: BaseException,
+    peer_uid: int | None,
+) -> None:
+    """Count one dropped connection by failure site. Must never raise."""
+    try:
+        key = "|".join(
+            (
+                site,
+                type(exc).__name__,
+                str(getattr(exc, "errno", None)),
+                "uid=" + ("?" if peer_uid is None else str(peer_uid)),
+            )
+        )
+        counts[key] = counts.get(key, 0) + 1
+    except Exception:
+        pass
+
+
+def _flush_drops(counts: dict[str, int]) -> None:
+    """Emit one aggregated stderr line for dropped connections. Must never raise.
+
+    stderr is the reporter's only diagnostic channel: it is unbuffered here and
+    captured by the container runtime. Nothing is added to the signed snapshot,
+    whose key set is validated for exact equality by the consumer.
+    """
+    if not counts:
+        return
+    try:
+        sys.stderr.write(
+            "rescue-reporter drops "
+            + json.dumps(counts, sort_keys=True, separators=(",", ":"))
+            + "\n"
+        )
+        sys.stderr.flush()
+    except Exception:
+        pass
+    counts.clear()
 
 
 def _posix_uid() -> int:
@@ -1416,6 +1473,7 @@ class QuiescenceReporter:
         except FileNotFoundError:
             pass
         server = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        drop_counts: dict[str, int] = {}
         try:
             server.bind(str(self.socket_path))
             os.chmod(self.socket_path, 0o620)
@@ -1423,44 +1481,103 @@ class QuiescenceReporter:
             server.listen(128)
             server.settimeout(0.5)
             next_snapshot = time.monotonic()
+            next_drop_report = time.monotonic() + _DROP_REPORT_INTERVAL_SECONDS
             while stop_event is None or not stop_event.is_set():
                 timeout = max(0.05, min(0.5, next_snapshot - time.monotonic()))
                 server.settimeout(timeout)
+                connection = None
                 try:
                     connection, _ = server.accept()
                 except socket.timeout:
                     connection = None
+                except OSError as exc:
+                    # accept() can fail transiently (ECONNABORTED) or under
+                    # resource pressure (EMFILE). Neither justifies killing the
+                    # reporter for every other client. Back off so a persistent
+                    # error cannot become a tight spin.
+                    connection = None
+                    _note_drop(drop_counts, "accept", exc, None)
+                    time.sleep(_ACCEPT_ERROR_BACKOFF_SECONDS)
                 if connection is not None:
-                    with connection:
-                        credentials = connection.getsockopt(
-                            socket.SOL_SOCKET, socket.SO_PEERCRED, struct.calcsize("3i")
-                        )
-                        peer_pid, peer_uid, _peer_gid = struct.unpack("3i", credentials)
-                        payload = bytearray()
-                        while len(payload) <= 8192:
-                            chunk = connection.recv(4096)
-                            if not chunk:
-                                break
-                            payload.extend(chunk)
-                        try:
-                            self.process_event(
-                                bytes(payload),
-                                peer_pid=peer_pid,
-                                peer_uid=peer_uid,
+                    site = "settimeout"
+                    peer_uid = None
+                    try:
+                        with connection:
+                            connection.settimeout(_CONNECTION_TIMEOUT_SECONDS)
+                            site = "getsockopt"
+                            credentials = connection.getsockopt(
+                                socket.SOL_SOCKET,
+                                socket.SO_PEERCRED,
+                                struct.calcsize("3i"),
                             )
-                        except (
-                            ValueError,
-                            PermissionError,
-                            json.JSONDecodeError,
-                            OSError,
-                        ):
-                            connection.sendall(b"REJECT\n")
-                        else:
-                            connection.sendall(b"OK\n")
+                            peer_pid, peer_uid, _peer_gid = struct.unpack(
+                                "3i", credentials
+                            )
+                            payload = bytearray()
+                            site = "recv"
+                            # settimeout() bounds each blocking call, NOT the whole
+                            # request. Without an absolute deadline a peer that
+                            # drips one byte before each timeout could hold this
+                            # single-threaded loop for 8193 * timeout seconds.
+                            deadline = (
+                                time.monotonic() + _CONNECTION_TIMEOUT_SECONDS
+                            )
+                            while len(payload) <= 8192:
+                                remaining = deadline - time.monotonic()
+                                if remaining <= 0.0:
+                                    raise TimeoutError(
+                                        "rescue reporter receive deadline exceeded"
+                                    )
+                                connection.settimeout(remaining)
+                                chunk = connection.recv(4096)
+                                if not chunk:
+                                    break
+                                payload.extend(chunk)
+                            # Give the acknowledgement a full budget rather than
+                            # whatever the receive deadline had left over.
+                            connection.settimeout(_CONNECTION_TIMEOUT_SECONDS)
+                            try:
+                                self.process_event(
+                                    bytes(payload),
+                                    peer_pid=peer_pid,
+                                    peer_uid=peer_uid,
+                                )
+                            except (
+                                ValueError,
+                                PermissionError,
+                                json.JSONDecodeError,
+                                OSError,
+                            ):
+                                site = "sendall_reject"
+                                connection.sendall(b"REJECT\n")
+                            else:
+                                site = "sendall_ok"
+                                connection.sendall(b"OK\n")
+                    except _PEER_LOSS_ERRORS as exc:
+                        # The peer went away. Anything validated was already
+                        # recorded durably by process_event before the
+                        # acknowledgement was attempted; only the acknowledgement
+                        # is lost. The catch is deliberately narrow so that
+                        # PermissionError (the peer-credential rejection) and
+                        # resource errors such as ENOSPC/EMFILE stay loud.
+                        _note_drop(drop_counts, site, exc, peer_uid)
                 if time.monotonic() >= next_snapshot:
-                    self.emit_snapshot()
+                    try:
+                        self.emit_snapshot()
+                    except (OSError, ReporterCapacityExhausted) as exc:
+                        # Same treatment the identical exception already gets on
+                        # the process_event path; leaving it fatal here was an
+                        # inconsistency. OverflowError from sequence exhaustion
+                        # is deliberately NOT caught and stays fatal.
+                        _note_drop(drop_counts, "emit_snapshot", exc, None)
                     next_snapshot = time.monotonic() + interval
+                if time.monotonic() >= next_drop_report:
+                    _flush_drops(drop_counts)
+                    next_drop_report = (
+                        time.monotonic() + _DROP_REPORT_INTERVAL_SECONDS
+                    )
         finally:
+            _flush_drops(drop_counts)
             server.close()
             os.close(lock_fd)
             try:
