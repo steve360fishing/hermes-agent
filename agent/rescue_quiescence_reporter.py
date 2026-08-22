@@ -25,6 +25,7 @@ from agent.rescue_plane_core import (
     KeyRing,
     KeySlot,
     QUIESCENCE_SCHEMA_VERSION,
+    _canonical_json,
     atomic_write_secure,
     _secure_read,
     read_hmac_key,
@@ -38,6 +39,9 @@ _EVENT_WORK = _EVENT_BASE | {"work_id"}
 _EVENT_TURN_START = _EVENT_BASE | {"lane", "artifact_requested"}
 _POLICY_RETENTION_SECONDS = 120.0
 _CONTINUITY_INITIALIZED = b"hermes-rescue-continuity-initialized-v1"
+_SPOOL_SCHEMA_VERSION = "hermes-rescue-spooled-event-v1"
+_SPOOL_MAX_FILES = 4096
+_SPOOL_MAX_EVENT_BYTES = 10 * 1024
 _RECOVERY_STABLE_EMISSIONS = 3
 _RECOVERY_MAX_TTL_SECONDS = 300.0
 _RECOVERY_ID_CAPACITY = 256
@@ -62,6 +66,7 @@ _STALE_RECOVERY_REASONS = frozenset(
     {"background_unknown", "gateway_unknown", "worker_crash"}
 )
 _DEGRADATION_REASONS = frozenset({
+    "accounting_gap",
     "active_work_bound",
     "background_unknown",
     "capacity_exhausted",
@@ -805,6 +810,7 @@ class QuiescenceReporter:
         source_sha: str,
         image_id: str,
         expected_hermes_uid: int,
+        spool_dir: Path | None = None,
         max_turns: int = 256,
         recovery_authorization_path: Path | None = Path(
             "/run/hermes-rescue-secrets/telemetry-recovery-v1.json"
@@ -822,6 +828,9 @@ class QuiescenceReporter:
         self.source_sha = source_sha
         self.image_id = image_id
         self.expected_hermes_uid = expected_hermes_uid
+        self.spool_dir = spool_dir
+        self.spool_pending_dir: Path | None = None
+        self.spool_quarantine_dir: Path | None = None
         self.recovery_authorization_path = recovery_authorization_path
         runtime_info = runtime_dir.lstat()
         if (
@@ -842,6 +851,32 @@ class QuiescenceReporter:
         ):
             raise PermissionError("insecure reporter continuity directory")
         self.continuity_gid = continuity_info.st_gid
+        if spool_dir is not None:
+            spool_info = spool_dir.lstat()
+            pending_dir = spool_dir / "pending"
+            quarantine_dir = spool_dir / "quarantine"
+            pending_info = pending_dir.lstat()
+            quarantine_info = quarantine_dir.lstat()
+            if (
+                spool_dir.is_symlink()
+                or not stat.S_ISDIR(spool_info.st_mode)
+                or spool_info.st_uid != _posix_uid()
+                or spool_info.st_gid != self.runtime_gid
+                or stat.S_IMODE(spool_info.st_mode) != 0o750
+                or pending_dir.is_symlink()
+                or not stat.S_ISDIR(pending_info.st_mode)
+                or pending_info.st_uid != expected_hermes_uid
+                or pending_info.st_gid != self.runtime_gid
+                or stat.S_IMODE(pending_info.st_mode) != 0o770
+                or quarantine_dir.is_symlink()
+                or not stat.S_ISDIR(quarantine_info.st_mode)
+                or quarantine_info.st_uid != _posix_uid()
+                or quarantine_info.st_gid != self.runtime_gid
+                or stat.S_IMODE(quarantine_info.st_mode) != 0o750
+            ):
+                raise PermissionError("insecure rescue telemetry spool")
+            self.spool_pending_dir = pending_dir
+            self.spool_quarantine_dir = quarantine_dir
         self.count_floor = {
             "turn": 0,
             "tool": 0,
@@ -1388,6 +1423,115 @@ class QuiescenceReporter:
                     self.state = prior
                 raise
 
+    def _mark_spool_accounting_gap(self, detail: str) -> None:
+        """Fail closed in the signed health state without changing its schema."""
+        with self._lock:
+            self.state.degrade("accounting_gap")
+            self._invalidate_snapshot()
+            self._persist_state()
+        try:
+            sys.stderr.write(f"rescue-reporter spool accounting_gap={detail}\n")
+            sys.stderr.flush()
+        except Exception:
+            pass
+
+    def _quarantine_spooled_event(self, path: Path, detail: str) -> None:
+        if self.spool_quarantine_dir is None:
+            raise RuntimeError("rescue telemetry quarantine is not configured")
+        destination = self.spool_quarantine_dir / (
+            f"{path.name}.{time.time_ns()}.invalid"
+        )
+        os.replace(path, destination)
+        directory_fd = os.open(
+            self.spool_quarantine_dir,
+            os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+        )
+        try:
+            os.fsync(directory_fd)
+        finally:
+            os.close(directory_fd)
+        self._mark_spool_accounting_gap(detail)
+
+    def drain_spool(self) -> int:
+        """Apply queued events in filename order and remove only durable results."""
+        if self.spool_pending_dir is None:
+            return 0
+        paths = sorted(
+            path
+            for path in self.spool_pending_dir.iterdir()
+            if path.name.endswith(".json")
+        )
+        if len(paths) > _SPOOL_MAX_FILES:
+            self._mark_spool_accounting_gap("capacity")
+            return 0
+        drained = 0
+        for path in paths:
+            try:
+                raw = _secure_read(
+                    path,
+                    expected_uid=self.expected_hermes_uid,
+                    expected_gid=self.runtime_gid,
+                    file_mode=0o640,
+                    parent_mode=0o770,
+                    max_bytes=_SPOOL_MAX_EVENT_BYTES,
+                )
+                envelope = _strict_json_object(raw)
+                if set(envelope) != {
+                    "schema_version",
+                    "producer_pid",
+                    "producer_uid",
+                    "created_ns",
+                    "event",
+                }:
+                    raise ValueError("invalid spool envelope fields")
+                if envelope["schema_version"] != _SPOOL_SCHEMA_VERSION:
+                    raise ValueError("invalid spool envelope schema")
+                peer_pid = envelope["producer_pid"]
+                peer_uid = envelope["producer_uid"]
+                created_ns = envelope["created_ns"]
+                event = envelope["event"]
+                if (
+                    type(peer_pid) is not int
+                    or peer_pid <= 0
+                    or peer_uid != self.expected_hermes_uid
+                    or type(created_ns) is not int
+                    or created_ns <= 0
+                    or not isinstance(event, dict)
+                ):
+                    raise ValueError("invalid spool envelope identity")
+                self.process_event(
+                    _canonical_json(event),
+                    peer_pid=peer_pid,
+                    peer_uid=peer_uid,
+                    now=created_ns / 1_000_000_000,
+                )
+                path.unlink()
+                drained += 1
+            except (ValueError, PermissionError, json.JSONDecodeError) as exc:
+                self._quarantine_spooled_event(path, type(exc).__name__)
+        if drained:
+            directory_fd = os.open(
+                self.spool_pending_dir,
+                os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0),
+            )
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+            try:
+                remaining = sum(
+                    1
+                    for path in self.spool_pending_dir.iterdir()
+                    if path.name.endswith(".json")
+                )
+                sys.stderr.write(
+                    f"rescue-reporter spool drained={drained} pending={remaining}\n"
+                )
+                sys.stderr.flush()
+            except Exception:
+                pass
+        return drained
+
     def emit_snapshot(self, *, now: float | None = None) -> dict[str, Any]:
         current = time.time() if now is None else now
         with self._lock:
@@ -1537,6 +1681,7 @@ class QuiescenceReporter:
                             # whatever the receive deadline had left over.
                             connection.settimeout(_CONNECTION_TIMEOUT_SECONDS)
                             try:
+                                self.drain_spool()
                                 self.process_event(
                                     bytes(payload),
                                     peer_pid=peer_pid,
@@ -1563,6 +1708,7 @@ class QuiescenceReporter:
                         _note_drop(drop_counts, site, exc, peer_uid)
                 if time.monotonic() >= next_snapshot:
                     try:
+                        self.drain_spool()
                         self.emit_snapshot()
                     except (OSError, ReporterCapacityExhausted) as exc:
                         # Same treatment the identical exception already gets on
@@ -1618,6 +1764,11 @@ def main() -> int:
     )
     parser.add_argument(
         "--continuity-dir", type=Path, default=Path("/var/lib/hermes-rescue")
+    )
+    parser.add_argument(
+        "--spool-dir",
+        type=Path,
+        default=Path("/var/lib/hermes-rescue/client-spool"),
     )
     parser.add_argument(
         "--recovery-authorization",
@@ -1746,6 +1897,7 @@ def main() -> int:
         source_sha=source_sha,
         image_id=image_id,
         expected_hermes_uid=args.expected_hermes_uid,
+        spool_dir=args.spool_dir,
         recovery_authorization_path=args.recovery_authorization,
     ).serve()
     return 0

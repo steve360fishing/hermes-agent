@@ -25,6 +25,7 @@ from typing import Any, Iterator, Mapping
 
 SAFE_MODE_OVERLAY_PATH = Path("/var/run/hermes-rescue/safe-mode-v1.json")
 RESCUE_EVENT_SOCKET_PATH = Path("/run/hermes-rescue-reporter/events.sock")
+RESCUE_EVENT_SPOOL_PATH = Path("/var/lib/hermes-rescue/client-spool")
 RESCUE_TELEMETRY_REQUIRED_PATH = Path(
     "/var/lib/hermes-rescue/telemetry-required-v1.json"
 )
@@ -66,6 +67,13 @@ _POLICY_KEYS = frozenset(
 _HEX_RE = re.compile(r"^[0-9a-f]+$")
 _REPLAY_LOCKS_GUARD = threading.Lock()
 _REPLAY_LOCKS: dict[str, threading.RLock] = {}
+_SPOOL_LOCK = threading.Lock()
+_SPOOL_SCHEMA_VERSION = "hermes-rescue-spooled-event-v1"
+_SPOOL_MAX_FILES = 4096
+_SPOOL_MAX_BYTES = 32 * 1024 * 1024
+_SPOOL_MIN_FREE_BYTES = 64 * 1024 * 1024
+_SPOOL_MIN_FREE_INODES = 128
+_SPOOL_MAX_PERSIST_SECONDS = 1.0
 
 
 @dataclass(frozen=True)
@@ -889,17 +897,169 @@ class RescueTelemetryUnavailable(RuntimeError):
     pass
 
 
+def _client_spool_pending_dir(spool_path: Path) -> tuple[Path, int]:
+    """Validate the two-identity spool boundary and return its pending dir."""
+    try:
+        root_info = spool_path.lstat()
+        pending = spool_path / "pending"
+        pending_info = pending.lstat()
+    except OSError as exc:
+        raise RescueTelemetryUnavailable("rescue telemetry spool unavailable") from exc
+    groups = os.getgroups()
+    if (
+        spool_path.is_symlink()
+        or not stat.S_ISDIR(root_info.st_mode)
+        or root_info.st_uid != RESCUE_REPORTER_UID
+        or root_info.st_gid not in groups
+        or stat.S_IMODE(root_info.st_mode) != 0o750
+        or pending.is_symlink()
+        or not stat.S_ISDIR(pending_info.st_mode)
+        or pending_info.st_uid != _posix_uid()
+        or pending_info.st_gid != root_info.st_gid
+        or stat.S_IMODE(pending_info.st_mode) != 0o770
+    ):
+        raise RescueTelemetryUnavailable("insecure rescue telemetry spool")
+    return pending, root_info.st_gid
+
+
+def _persist_spooled_event(
+    spool_path: Path,
+    event: Mapping[str, Any],
+) -> Path:
+    pending, spool_gid = _client_spool_pending_dir(spool_path)
+    kind = event.get("event")
+    base = {"schema_version", "event", "event_id", "turn_id"}
+    if kind == "turn_start":
+        expected = base | {"lane", "artifact_requested"}
+    elif kind == "turn_end":
+        expected = base
+    elif kind in {
+        "tool_start",
+        "tool_end",
+        "provider_start",
+        "provider_end",
+        "background_start",
+        "background_end",
+        "background_unknown",
+    }:
+        expected = base | {"work_id"}
+    else:
+        raise RescueTelemetryUnavailable("invalid rescue telemetry event")
+    if set(event) != expected or event.get("schema_version") != EVENT_SCHEMA_VERSION:
+        raise RescueTelemetryUnavailable("invalid rescue telemetry event")
+    event_id = str(event.get("event_id", ""))
+    if not re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", event_id):
+        raise RescueTelemetryUnavailable("invalid rescue telemetry event id")
+    turn_id = event.get("turn_id")
+    if not isinstance(turn_id, str) or not 1 <= len(turn_id) <= 256:
+        raise RescueTelemetryUnavailable("invalid rescue telemetry turn id")
+    if "work_id" in event and (
+        not isinstance(event["work_id"], str)
+        or not 1 <= len(event["work_id"]) <= 64
+    ):
+        raise RescueTelemetryUnavailable("invalid rescue telemetry work id")
+    if kind == "turn_start" and (
+        event.get("lane") not in {"normal", "artifact_only"}
+        or type(event.get("artifact_requested")) is not bool
+    ):
+        raise RescueTelemetryUnavailable("invalid rescue telemetry turn start")
+    envelope = _canonical_json(
+        {
+            "schema_version": _SPOOL_SCHEMA_VERSION,
+            "producer_pid": os.getpid(),
+            "producer_uid": _posix_uid(),
+            "created_ns": time.time_ns(),
+            "event": dict(event),
+        }
+    )
+    if len(envelope) > 10 * 1024:
+        raise RescueTelemetryUnavailable("rescue telemetry event too large")
+    with _SPOOL_LOCK:
+        try:
+            entries = list(os.scandir(pending))
+            queued_files = [entry for entry in entries if entry.name.endswith(".json")]
+            queued_bytes = sum(entry.stat(follow_symlinks=False).st_size for entry in queued_files)
+            filesystem = os.statvfs(pending)
+        except OSError as exc:
+            raise RescueTelemetryUnavailable("rescue telemetry spool unavailable") from exc
+        free_bytes = filesystem.f_bavail * filesystem.f_frsize
+        free_inodes = filesystem.f_favail
+        if (
+            len(queued_files) >= _SPOOL_MAX_FILES
+            or queued_bytes + len(envelope) > _SPOOL_MAX_BYTES
+            or free_bytes < _SPOOL_MIN_FREE_BYTES
+            or free_inodes < _SPOOL_MIN_FREE_INODES
+        ):
+            raise RescueTelemetryUnavailable("rescue telemetry spool capacity exhausted")
+        sequence = time.time_ns()
+        identity_hash = hashlib.sha256(event_id.encode("ascii")).hexdigest()[:16]
+        final_name = f"{sequence:020d}-{os.getpid():010d}-{identity_hash}.json"
+        temporary_name = f".{final_name}.{secrets.token_hex(8)}.tmp"
+        parent_flags = os.O_RDONLY | os.O_DIRECTORY | getattr(os, "O_NOFOLLOW", 0)
+        parent_fd = os.open(pending, parent_flags)
+        try:
+            parent_info = os.fstat(parent_fd)
+            if (
+                parent_info.st_uid != _posix_uid()
+                or parent_info.st_gid != spool_gid
+                or stat.S_IMODE(parent_info.st_mode) != 0o770
+            ):
+                raise RescueTelemetryUnavailable("insecure rescue telemetry spool")
+            flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | getattr(os, "O_NOFOLLOW", 0)
+            fd = os.open(temporary_name, flags, 0o640, dir_fd=parent_fd)
+            try:
+                os.fchmod(fd, 0o640)
+                os.fchown(fd, -1, spool_gid)
+                written = 0
+                while written < len(envelope):
+                    written += os.write(fd, envelope[written:])
+                os.fsync(fd)
+            finally:
+                os.close(fd)
+            os.replace(
+                temporary_name,
+                final_name,
+                src_dir_fd=parent_fd,
+                dst_dir_fd=parent_fd,
+            )
+            os.fsync(parent_fd)
+        except RescueTelemetryUnavailable:
+            raise
+        except OSError as exc:
+            raise RescueTelemetryUnavailable("rescue telemetry spool unavailable") from exc
+        finally:
+            try:
+                os.unlink(temporary_name, dir_fd=parent_fd)
+            except FileNotFoundError:
+                pass
+            os.close(parent_fd)
+        return pending / final_name
+
+
 class RescueTelemetryClient:
     """One-event-per-connection client; the reporter derives all aggregate state."""
 
-    def __init__(self, socket_path: Path = RESCUE_EVENT_SOCKET_PATH) -> None:
+    def __init__(
+        self,
+        socket_path: Path = RESCUE_EVENT_SOCKET_PATH,
+        *,
+        spool_path: Path | None = None,
+    ) -> None:
         self.socket_path = socket_path
+        self.spool_path = spool_path
 
     def emit(self, event: Mapping[str, Any]) -> None:
         payload = {"schema_version": EVENT_SCHEMA_VERSION, **dict(event)}
         raw = _canonical_json(payload)
         if len(raw) > 8192:
             raise RescueTelemetryUnavailable("rescue telemetry event too large")
+        if self.spool_path is not None:
+            persistence_started = time.monotonic()
+            _persist_spooled_event(self.spool_path, payload)
+            if time.monotonic() - persistence_started > _SPOOL_MAX_PERSIST_SECONDS:
+                raise RescueTelemetryUnavailable(
+                    "rescue telemetry spool persistence latency exceeded"
+                )
         try:
             with socket.socket(socket.AF_UNIX, socket.SOCK_STREAM) as client:
                 client.settimeout(1.0)
@@ -908,6 +1068,8 @@ class RescueTelemetryClient:
                 client.shutdown(socket.SHUT_WR)
                 acknowledgement = client.recv(16)
         except OSError as exc:
+            if self.spool_path is not None:
+                return
             raise RescueTelemetryUnavailable("rescue telemetry unavailable") from exc
         if acknowledgement != b"OK\n":
             raise RescueTelemetryUnavailable("rescue telemetry rejected")
@@ -1110,11 +1272,18 @@ def get_rescue_telemetry_client() -> RescueTelemetryClient | None:
     if os.name != "posix" or not hasattr(socket, "AF_UNIX"):
         return None
     required = _rescue_telemetry_is_required()
+    spool_path: Path | None = None
+    if required:
+        _client_spool_pending_dir(RESCUE_EVENT_SPOOL_PATH)
+        spool_path = RESCUE_EVENT_SPOOL_PATH
     try:
         info = RESCUE_EVENT_SOCKET_PATH.lstat()
     except OSError:
         if required:
-            raise RescueTelemetryUnavailable("required rescue telemetry unavailable")
+            return RescueTelemetryClient(
+                RESCUE_EVENT_SOCKET_PATH,
+                spool_path=spool_path,
+            )
         return None
     if (
         not stat.S_ISSOCK(info.st_mode)
@@ -1125,4 +1294,7 @@ def get_rescue_telemetry_client() -> RescueTelemetryClient | None:
         if required:
             raise RescueTelemetryUnavailable("required rescue telemetry socket is insecure")
         return None
-    return RescueTelemetryClient(RESCUE_EVENT_SOCKET_PATH)
+    return RescueTelemetryClient(
+        RESCUE_EVENT_SOCKET_PATH,
+        spool_path=spool_path,
+    )
